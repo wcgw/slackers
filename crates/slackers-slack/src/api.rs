@@ -7,11 +7,11 @@ use reqwest::StatusCode;
 use reqwest::header::{CONTENT_TYPE, COOKIE, RETRY_AFTER};
 use serde::de::DeserializeOwned;
 use serde_json::Value;
-use slackers_model::{ConversationId, CustomEmojiSet, Ts, UserId};
+use slackers_model::{ConversationId, CustomEmojiSet, Message, Ts, UserId};
 use tokio::sync::Semaphore;
 
 use crate::session::{HistoryPage, Snapshot, User};
-use crate::wire::{AuthTest, Counts, EmojiList, History, UserBoot, UserInfo};
+use crate::wire::{AuthTest, Counts, EmojiList, History, Posted, UserBoot, UserInfo};
 use crate::{Credentials, Error};
 
 const BASE: &str = "https://slack.com/api";
@@ -119,6 +119,38 @@ impl Api {
     pub(crate) async fn user(&self, id: &UserId) -> Result<User, Error> {
         let info: UserInfo = self.call("users.info", &[("user", id.as_str())]).await?;
         Ok(info.into_user())
+    }
+
+    /// Posts `text` (see [`Request::Post`](crate::Request::Post)) to `conversation`, and returns the Message as
+    /// Slack stored it.
+    pub(crate) async fn post(
+        &self,
+        conversation: &ConversationId,
+        text: &str,
+        me: &UserId,
+    ) -> Result<Message, Error> {
+        let text = crate::mrkdwn::escape(text);
+        let posted: Posted = self
+            .call(
+                "chat.postMessage",
+                &[("channel", conversation.as_str()), ("text", &text)],
+            )
+            .await?;
+        posted
+            .into_message(me)
+            .ok_or_else(|| Error::refused("chat.postMessage", "unreadable_message"))
+    }
+
+    /// Moves the Read Marker of `conversation` to `up_to`.
+    pub(crate) async fn mark(&self, conversation: &ConversationId, up_to: Ts) -> Result<(), Error> {
+        let up_to = up_to.to_string();
+        let _: serde::de::IgnoredAny = self
+            .call(
+                "conversations.mark",
+                &[("channel", conversation.as_str()), ("ts", &up_to)],
+            )
+            .await?;
+        Ok(())
     }
 
     pub(crate) async fn custom_emoji(&self) -> Result<CustomEmojiSet, Error> {

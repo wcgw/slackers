@@ -12,6 +12,7 @@ emojis.workspace = true
 futures-util.workspace = true
 jiff.workspace = true
 ratatui.workspace = true
+ratatui-textarea.workspace = true
 slackers-gfx.workspace = true
 slackers-model.workspace = true
 slackers-slack.workspace = true

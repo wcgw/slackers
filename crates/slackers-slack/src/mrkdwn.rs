@@ -186,6 +186,13 @@ fn closing_marker(text: &str, marker: char) -> Option<usize> {
     })
 }
 
+/// Escapes `&`, `<` and `>`, which `mrkdwn` reserves for its markup, so that text means what it says.
+pub(crate) fn escape(text: &str) -> String {
+    text.replace('&', "&amp;")
+        .replace('<', "&lt;")
+        .replace('>', "&gt;")
+}
+
 /// Undoes Slack's escaping of `&`, `<` and `>`.
 pub(crate) fn decode_entities(text: &str) -> String {
     text.replace("&lt;", "<")
@@ -278,6 +285,13 @@ mod tests {
                 Block::Paragraph(vec![text("after")]),
             ]
         );
+    }
+
+    #[test]
+    fn escaping_round_trips() {
+        let text = "a < b && c > d";
+        assert_eq!(escape(text), "a &lt; b &amp;&amp; c &gt; d");
+        assert_eq!(decode_entities(&escape(text)), text);
     }
 
     #[test]

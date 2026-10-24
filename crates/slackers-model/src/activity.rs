@@ -42,6 +42,11 @@ impl Activity {
         self.latest > self.read_up_to
     }
 
+    /// The Read Marker: everything posted up to and including it has been read.
+    pub fn read_up_to(&self) -> Ts {
+        self.read_up_to
+    }
+
     /// When the newest Message known was posted; zero when none is.
     pub fn latest(&self) -> Ts {
         self.latest

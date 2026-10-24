@@ -17,7 +17,7 @@ use slackers_model::{
 use slackers_slack::Connection;
 use unicode_width::UnicodeWidthStr as _;
 
-use crate::app::{App, Drawn, Focus, Phase, Workspace};
+use crate::app::{App, Drawn, Focus, Mode, Phase, Workspace};
 use crate::emoji::Drawable;
 use crate::icons;
 use crate::layout::{Piece, wrap};
@@ -210,6 +210,7 @@ fn draw_timeline(
         ]);
         frame.render_widget(Paragraph::new(title), header);
     }
+    let body = draw_composer(frame, body, app);
     let Some(timeline) = workspace.timelines.get(open) else {
         let loading = Line::from(vec![
             Span::styled(icons::LOADING, ACCENT),
@@ -243,6 +244,25 @@ fn draw_timeline(
         rendered.push((lines, renderer.wanted, renderer.next_change));
         previous = Some(message);
     }
+    // Messages on their way follow, dimmed, under the user's name.
+    for outgoing in app
+        .outbox
+        .iter()
+        .filter(|outgoing| &outgoing.conversation == open)
+    {
+        let mut lines = vec![Line::from(vec![
+            Span::styled(
+                app.user_name(&workspace.me).to_owned(),
+                Style::new().add_modifier(Modifier::BOLD),
+            ),
+            Span::raw("  "),
+            Span::styled(icons::SENDING, DIM),
+            Span::styled("sending", DIM),
+        ])];
+        let pieces = vec![Piece::Text(outgoing.text.clone(), DIM)];
+        lines.extend(wrap(pieces, body.width).into_iter().map(Line::from));
+        rendered.push((lines, Vec::new(), None));
+    }
 
     let height = usize::from(body.height);
     let total: usize = rendered.iter().map(|(lines, _, _)| lines.len()).sum();
@@ -274,6 +294,35 @@ fn draw_timeline(
         ..body
     };
     frame.render_widget(Paragraph::new(visible), area);
+}
+
+/// Draws the open Conversation's draft at the bottom of `area`: editable in Insert mode, dimmed otherwise, and not
+/// at all when there's none. Returns what's left of `area` above it.
+fn draw_composer(frame: &mut Frame<'_>, area: Rect, app: &App) -> Rect {
+    let inserting = app.mode == Mode::Insert;
+    let Some(draft) = app.draft().filter(|draft| inserting || !draft.is_empty()) else {
+        return area;
+    };
+    let lines = u16::try_from(draft.lines().len()).unwrap_or(u16::MAX);
+    let height = lines.saturating_add(1).clamp(2, (area.height / 3).max(2));
+    let [above, composer] =
+        Layout::vertical([Constraint::Fill(1), Constraint::Length(height)]).areas(area);
+    let block = Block::new()
+        .borders(Borders::TOP)
+        .border_style(if inserting { ACCENT } else { DIM });
+    let inner = block.inner(composer);
+    frame.render_widget(block, composer);
+    if inserting {
+        frame.render_widget(draft, inner);
+    } else {
+        let text: Vec<Line<'_>> = draft
+            .lines()
+            .iter()
+            .map(|line| Line::styled(line.as_str(), DIM))
+            .collect();
+        frame.render_widget(Paragraph::new(text), inner);
+    }
+    above
 }
 
 /// Lays out one Message, collecting the pictures it wants and when its animations next change.
@@ -468,6 +517,15 @@ impl<'a> Renderer<'a> {
 }
 
 fn draw_status(frame: &mut Frame<'_>, area: Rect, app: &App) {
+    // Command mode takes the whole line, as in vim.
+    if let Mode::Command(line) = &app.mode {
+        let command = Line::from(vec![
+            Span::raw(format!(":{line}")),
+            Span::styled(" ", Style::new().add_modifier(Modifier::REVERSED)),
+        ]);
+        frame.render_widget(Paragraph::new(command), area);
+        return;
+    }
     let (icon, state, style) = match (&app.phase, app.connection) {
         (Phase::SigningIn, _) | (Phase::Ready(_), None) => {
             (icons::LOADING, "connecting".to_owned(), ACCENT)
@@ -484,7 +542,15 @@ fn draw_status(frame: &mut Frame<'_>, area: Rect, app: &App) {
             Style::new().fg(Color::Yellow),
         ),
     };
-    let mut left = vec![Span::styled(icon, style), Span::styled(state, style)];
+    let mut left = Vec::new();
+    if app.mode == Mode::Insert {
+        let insert = ACCENT.add_modifier(Modifier::BOLD);
+        left.extend([
+            Span::styled(icons::INSERT, insert),
+            Span::styled("INSERT  ", insert),
+        ]);
+    }
+    left.extend([Span::styled(icon, style), Span::styled(state, style)]);
     if let Some(notice) = &app.notice {
         left.extend([
             Span::raw("  "),
@@ -492,9 +558,10 @@ fn draw_status(frame: &mut Frame<'_>, area: Rect, app: &App) {
             Span::styled(notice.clone(), ALERT),
         ]);
     }
-    let hints = match app.focus {
-        Focus::Sidebar => "j/k select · ⏎ open · tab messages · q quit",
-        Focus::Timeline => "k/j scroll · ^u/^d page · g/G oldest/newest · tab sidebar · q quit",
+    let hints = match (&app.mode, app.focus) {
+        (Mode::Insert, _) => "⏎ send · ⇧⏎ new line · ^x^e $EDITOR · esc normal",
+        (_, Focus::Sidebar) => "j/k select · ⏎ open · i write · tab messages · :q quit",
+        (_, Focus::Timeline) => "k/j scroll · ^u/^d page · g/G oldest/newest · i write · :q quit",
     };
     frame.render_widget(Paragraph::new(Line::from(left)), area);
     frame.render_widget(
@@ -562,5 +629,116 @@ fn earliest(a: Option<Duration>, b: Option<Duration>) -> Option<Duration> {
     match (a, b) {
         (Some(a), Some(b)) => Some(a.min(b)),
         (a, b) => a.or(b),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use crossterm::event::{Event as TerminalEvent, KeyCode, KeyEvent, KeyModifiers};
+    use ratatui::Terminal;
+    use ratatui::backend::TestBackend;
+    use slackers_model::{Activity, ConversationId, Message, RichText, Ts, UserId, WorkspaceId};
+    use slackers_slack::{HistoryPage, Snapshot, Update};
+
+    use super::*;
+    use crate::app::Event;
+
+    const WIDTH: u16 = 80;
+    const HEIGHT: u16 = 12;
+
+    fn press(app: &mut App, code: KeyCode, modifiers: KeyModifiers) {
+        app.update(Event::Terminal(TerminalEvent::Key(KeyEvent::new(
+            code, modifiers,
+        ))));
+    }
+
+    fn type_text(app: &mut App, text: &str) {
+        for c in text.chars() {
+            press(app, KeyCode::Char(c), KeyModifiers::NONE);
+        }
+    }
+
+    /// Draws `app` and returns the screen, row by row.
+    fn screen(app: &App) -> Vec<String> {
+        let mut terminal = Terminal::new(TestBackend::new(WIDTH, HEIGHT)).unwrap();
+        terminal
+            .draw(|frame| {
+                draw(frame, app);
+            })
+            .unwrap();
+        let buffer = terminal.backend().buffer();
+        (0..HEIGHT)
+            .map(|y| (0..WIDTH).map(|x| buffer[(x, y)].symbol()).collect())
+            .collect()
+    }
+
+    /// An app with `#general` open, holding one Message.
+    fn reading_general() -> App {
+        let mut app = App::new("test".into());
+        let general = Conversation {
+            id: ConversationId::new("C1"),
+            kind: ConversationKind::Channel { private: false },
+            name: "general".into(),
+        };
+        let snapshot = Snapshot {
+            workspace: WorkspaceId::new("T1"),
+            name: "Test".into(),
+            me: UserId::new("UME"),
+            conversations: vec![(general, Activity::default())],
+        };
+        app.update(Event::Slack(Update::Ready(Box::new(snapshot))));
+        press(&mut app, KeyCode::Enter, KeyModifiers::NONE);
+        let message = Message {
+            ts: Ts::from_micros(1_700_000_000_000_000),
+            author: Author::User(UserId::new("U2")),
+            content: RichText::plain("the only message"),
+            reply_to: None,
+            thread: None,
+            reactions: Vec::new(),
+            files: Vec::new(),
+            edited: false,
+        };
+        let page = HistoryPage {
+            messages: vec![message],
+            has_more: false,
+        };
+        app.update(Event::Slack(Update::History {
+            conversation: ConversationId::new("C1"),
+            result: Ok(page),
+        }));
+        app
+    }
+
+    #[test]
+    fn insert_mode_opens_the_composer_under_the_messages_and_says_so() {
+        let mut app = reading_general();
+        assert!(!screen(&app).last().unwrap().contains("INSERT"));
+
+        type_text(&mut app, "i");
+        type_text(&mut app, "hello");
+        press(&mut app, KeyCode::Enter, KeyModifiers::SHIFT);
+        type_text(&mut app, "world");
+        let rows = screen(&app);
+        let row_of = |text: &str| rows.iter().position(|row| row.contains(text));
+        let (message, hello, world) =
+            (row_of("the only message"), row_of("hello"), row_of("world"));
+        assert!(
+            message < hello && hello.map(|h| h + 1) == world,
+            "{rows:#?}"
+        );
+        assert!(rows.last().unwrap().contains("INSERT"), "{rows:#?}");
+
+        // Back in Normal mode the draft stays, dimmed.
+        press(&mut app, KeyCode::Esc, KeyModifiers::NONE);
+        let rows = screen(&app);
+        assert!(rows.iter().any(|row| row.contains("hello")));
+        assert!(!rows.last().unwrap().contains("INSERT"));
+    }
+
+    #[test]
+    fn command_mode_takes_the_status_line() {
+        let mut app = reading_general();
+        type_text(&mut app, ":q");
+        assert!(screen(&app).last().unwrap().starts_with(":q"));
     }
 }

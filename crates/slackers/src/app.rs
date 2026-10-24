@@ -1,10 +1,15 @@
 //! The app's state, and how events change it. No I/O here: every effect is a [`Command`] for the runtime to carry
 //! out, so that `update` can be tested on its own.
+//!
+//! Keys work as in vim: Normal mode moves around, `i` enters Insert mode to write in the open Conversation, and
+//! `:` enters Command mode (`:q` quits).
 
 use std::collections::{HashMap, HashSet};
 use std::time::{Duration, Instant};
 
 use crossterm::event::{Event as TerminalEvent, KeyCode, KeyEvent, KeyEventKind, KeyModifiers};
+use ratatui::style::Style;
+use ratatui_textarea::TextArea;
 use slackers_gfx::{Fit, Picture};
 use slackers_model::{
     Activity, Author, Conversation, ConversationId, ConversationKind, Inline, Message, Timeline,
@@ -27,6 +32,13 @@ pub(crate) enum Event {
     /// A picture couldn't be loaded.
     PictureFailed {
         url: String,
+    },
+    /// The terminal lost every picture, as it may when slackers hands it to another program.
+    PicturesLost,
+    /// The external editor asked for with [`Command::Edit`] finished: with the new draft, or why there's none.
+    Edited {
+        conversation: ConversationId,
+        outcome: Result<String, String>,
     },
     /// What the last draw found; see [`Drawn`].
     Drawn(Drawn),
@@ -56,10 +68,27 @@ pub(crate) enum Command {
         bytes: Vec<u8>,
         fit: Fit,
     },
+    /// Hand the terminal to `$EDITOR` to edit `text`, the draft for `conversation`, then report back with
+    /// [`Event::Edited`] and [`Event::PicturesLost`].
+    Edit {
+        conversation: ConversationId,
+        text: String,
+    },
     Quit,
 }
 
-/// Which pane keys go to.
+/// What keys do, as in vim.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) enum Mode {
+    /// Keys move around the pane in [`Focus`].
+    Normal,
+    /// Keys write the open Conversation's draft.
+    Insert,
+    /// Keys write a command, shown after `:` on the status line.
+    Command(String),
+}
+
+/// Which pane Normal mode's keys move around.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum Focus {
     Sidebar,
@@ -87,6 +116,16 @@ pub(crate) struct Workspace {
     loading: HashSet<ConversationId>,
 }
 
+/// A Message on its way to Slack.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) struct Outgoing {
+    /// Matches the [`Request::Post`] to its [`Update::Posted`].
+    id: u64,
+    pub(crate) conversation: ConversationId,
+    /// As typed.
+    pub(crate) text: String,
+}
+
 /// Everything slackers shows. Only [`App::update`] changes it; the view reads it.
 #[derive(Debug)]
 pub(crate) struct App {
@@ -94,18 +133,28 @@ pub(crate) struct App {
     pub(crate) label: String,
     pub(crate) phase: Phase,
     pub(crate) connection: Option<Connection>,
-    /// The latest problem worth telling the user about.
+    /// The latest thing worth telling the user, usually a problem.
     pub(crate) notice: Option<String>,
     /// People's names, as far as they've been looked up.
     pub(crate) users: HashMap<UserId, String>,
     requested_users: HashSet<UserId>,
     pub(crate) emojis: Emojis,
+    pub(crate) mode: Mode,
     /// The sidebar entry under the cursor.
     pub(crate) selected: usize,
     pub(crate) open: Option<ConversationId>,
     pub(crate) focus: Focus,
     /// How many lines the open Timeline is scrolled up from its newest Message.
     pub(crate) scroll: usize,
+    /// Unsent text, per Conversation.
+    pub(crate) drafts: HashMap<ConversationId, TextArea<'static>>,
+    /// Messages posted but not yet confirmed, oldest first.
+    pub(crate) outbox: Vec<Outgoing>,
+    next_post: u64,
+    /// Whether `Ctrl-x` was just pressed in Insert mode, starting `Ctrl-x Ctrl-e`.
+    awaiting_chord: bool,
+    /// Whether the terminal window has focus. Messages count as read only while it does.
+    focused: bool,
     /// The last [`Drawn`] report.
     drawn: Drawn,
     /// When animations started; every picture is drawn against it, so copies of one emoji animate in step.
@@ -122,10 +171,16 @@ impl App {
             users: HashMap::new(),
             requested_users: HashSet::new(),
             emojis: Emojis::default(),
+            mode: Mode::Normal,
             selected: 0,
             open: None,
             focus: Focus::Sidebar,
             scroll: 0,
+            drafts: HashMap::new(),
+            outbox: Vec::new(),
+            next_post: 0,
+            awaiting_chord: false,
+            focused: true,
             drawn: Drawn::default(),
             epoch: Instant::now(),
         }
@@ -153,6 +208,11 @@ impl App {
         self.users.get(user).map_or(user.as_str(), String::as_str)
     }
 
+    /// The open Conversation's draft, if it has one.
+    pub(crate) fn draft(&self) -> Option<&TextArea<'static>> {
+        self.drafts.get(self.open.as_ref()?)
+    }
+
     /// Reacts to `event`, returning what the runtime should do.
     pub(crate) fn update(&mut self, event: Event) -> Vec<Command> {
         let mut commands = Vec::new();
@@ -160,10 +220,22 @@ impl App {
             Event::Terminal(TerminalEvent::Key(key)) if key.kind == KeyEventKind::Press => {
                 self.key(key, &mut commands);
             }
+            Event::Terminal(TerminalEvent::FocusGained) => self.focused = true,
+            Event::Terminal(TerminalEvent::FocusLost) => self.focused = false,
             Event::Terminal(_) => {}
             Event::Slack(update) => self.slack(update, &mut commands),
             Event::PictureReady { url, picture } => self.emojis.loaded(url, picture),
             Event::PictureFailed { url } => self.emojis.failed(url),
+            Event::PicturesLost => self.emojis.forget_pictures(),
+            Event::Edited {
+                conversation,
+                outcome,
+            } => match outcome {
+                Ok(text) => {
+                    self.drafts.insert(conversation, draft_of(&text));
+                }
+                Err(reason) => self.notice = Some(reason),
+            },
             Event::Drawn(drawn) => {
                 for url in &drawn.wanted_pictures {
                     if self.emojis.request(url) {
@@ -177,14 +249,39 @@ impl App {
                 }
             }
         }
+        self.mark_seen(&mut commands);
         commands
     }
 
     fn key(&mut self, key: KeyEvent, commands: &mut Vec<Command>) {
+        match self.mode {
+            Mode::Normal => self.normal_key(key, commands),
+            Mode::Insert => self.insert_key(key, commands),
+            Mode::Command(_) => self.command_key(key, commands),
+        }
+    }
+
+    fn normal_key(&mut self, key: KeyEvent, commands: &mut Vec<Command>) {
         let control = key.modifiers.contains(KeyModifiers::CONTROL);
         match (key.code, control) {
-            (KeyCode::Char('q'), false) | (KeyCode::Char('c'), true) => {
-                return commands.push(Command::Quit);
+            (KeyCode::Char('c'), true) => {
+                self.notice = Some("type :q and press Enter to quit".to_owned());
+                return;
+            }
+            (KeyCode::Char(':'), false) => {
+                self.mode = Mode::Command(String::new());
+                return;
+            }
+            (KeyCode::Char('i'), false) => {
+                if let Some(open) = self.open.clone() {
+                    self.drafts.entry(open).or_insert_with(|| draft_of(""));
+                    self.mode = Mode::Insert;
+                    self.focus = Focus::Timeline;
+                    self.scroll = 0;
+                } else {
+                    self.notice = Some("open a conversation first".to_owned());
+                }
+                return;
             }
             (KeyCode::Tab, _) => {
                 self.focus = match self.focus {
@@ -214,20 +311,135 @@ impl App {
             },
             Focus::Timeline => match (key.code, control) {
                 (KeyCode::Char('u'), true) | (KeyCode::PageUp, _) => {
-                    self.scroll_by(self.half_page(), commands)
+                    self.scroll_by(self.half_page(), commands);
                 }
                 (KeyCode::Char('d'), true) | (KeyCode::PageDown, _) => {
-                    self.scroll_by(-self.half_page(), commands)
+                    self.scroll_by(-self.half_page(), commands);
                 }
                 (KeyCode::Char('k') | KeyCode::Up, _) => self.scroll_by(1, commands),
                 (KeyCode::Char('j') | KeyCode::Down, _) => self.scroll_by(-1, commands),
                 (KeyCode::Char('g') | KeyCode::Home, _) => self.scroll_by(isize::MAX, commands),
                 (KeyCode::Char('G') | KeyCode::End, _) => self.scroll = 0,
                 (KeyCode::Char('h') | KeyCode::Left | KeyCode::Esc, _) => {
-                    self.focus = Focus::Sidebar
+                    self.focus = Focus::Sidebar;
                 }
                 _ => {}
             },
+        }
+    }
+
+    fn insert_key(&mut self, key: KeyEvent, commands: &mut Vec<Command>) {
+        let Some(open) = self.open.clone() else {
+            self.mode = Mode::Normal;
+            return;
+        };
+        let control = key.modifiers.contains(KeyModifiers::CONTROL);
+        let chord = std::mem::take(&mut self.awaiting_chord);
+        match (key.code, control) {
+            (KeyCode::Esc, _) | (KeyCode::Char('c'), true) => self.mode = Mode::Normal,
+            (KeyCode::Char('x'), true) => self.awaiting_chord = true,
+            (KeyCode::Char('e'), true) if chord => {
+                let text = self.drafts.get(&open).map(|draft| draft.lines().join("\n"));
+                commands.push(Command::Edit {
+                    conversation: open,
+                    text: text.unwrap_or_default(),
+                });
+            }
+            // Shift+Enter needs the kitty keyboard protocol to tell it from Enter; Alt+Enter works without.
+            (KeyCode::Enter, _)
+                if key
+                    .modifiers
+                    .intersects(KeyModifiers::SHIFT | KeyModifiers::ALT) =>
+            {
+                self.drafts
+                    .entry(open)
+                    .or_insert_with(|| draft_of(""))
+                    .insert_newline();
+            }
+            (KeyCode::Enter, _) => self.send(open, commands),
+            _ => {
+                self.drafts
+                    .entry(open)
+                    .or_insert_with(|| draft_of(""))
+                    .input(key);
+            }
+        }
+    }
+
+    fn command_key(&mut self, key: KeyEvent, commands: &mut Vec<Command>) {
+        let Mode::Command(line) = &mut self.mode else {
+            return;
+        };
+        let control = key.modifiers.contains(KeyModifiers::CONTROL);
+        match (key.code, control) {
+            (KeyCode::Esc, _) | (KeyCode::Char('c'), true) => self.mode = Mode::Normal,
+            (KeyCode::Backspace, _) => {
+                if line.pop().is_none() {
+                    self.mode = Mode::Normal;
+                }
+            }
+            (KeyCode::Enter, _) => {
+                let line = std::mem::take(line);
+                self.mode = Mode::Normal;
+                match line.trim() {
+                    "" => {}
+                    "q" | "q!" | "qa" | "qa!" | "quit" | "quitall" => commands.push(Command::Quit),
+                    other => self.notice = Some(format!("not a command: :{other}")),
+                }
+            }
+            (KeyCode::Char(c), false) => line.push(c),
+            _ => {}
+        }
+    }
+
+    /// Posts the draft for `conversation`, unless it's blank, and empties it.
+    fn send(&mut self, conversation: ConversationId, commands: &mut Vec<Command>) {
+        let Some(draft) = self.drafts.get_mut(&conversation) else {
+            return;
+        };
+        let text = draft.lines().join("\n");
+        if text.trim().is_empty() {
+            return;
+        }
+        *draft = draft_of("");
+        let id = self.next_post;
+        self.next_post += 1;
+        self.outbox.push(Outgoing {
+            id,
+            conversation: conversation.clone(),
+            text: text.clone(),
+        });
+        self.scroll = 0;
+        commands.push(Command::Slack(Request::Post {
+            conversation,
+            text,
+            id,
+        }));
+    }
+
+    /// Moves the open Conversation's Read Marker to its newest Message, if that's on screen: the window has focus
+    /// and the Timeline is scrolled to the bottom.
+    fn mark_seen(&mut self, commands: &mut Vec<Command>) {
+        if !self.focused || self.scroll != 0 {
+            return;
+        }
+        let (Some(open), Phase::Ready(workspace)) = (&self.open, &mut self.phase) else {
+            return;
+        };
+        let newest = workspace
+            .timelines
+            .get(open)
+            .and_then(|t| t.messages().next_back())
+            .map(|m| m.ts);
+        let (Some(newest), Some(activity)) = (newest, workspace.activity.get_mut(open)) else {
+            return;
+        };
+        if newest > activity.read_up_to() {
+            activity.mark_read(newest);
+            commands.push(Command::Slack(Request::Mark {
+                conversation: open.clone(),
+                up_to: newest,
+            }));
         }
     }
 
@@ -301,14 +513,51 @@ impl App {
                     Ok(page) => {
                         let people: Vec<UserId> =
                             page.messages.iter().flat_map(people_in).collect();
-                        workspace
-                            .timelines
-                            .entry(conversation)
-                            .or_default()
-                            .add_history(page.messages, page.has_more);
+                        let timeline = workspace.timelines.entry(conversation).or_default();
+                        timeline.add_history(page.messages, page.has_more);
                         self.want_users(people, commands);
                     }
                     Err(error) => self.notice = Some(describe(&error)),
+                }
+            }
+            Update::Posted {
+                id,
+                conversation,
+                result,
+            } => {
+                let Some(at) = self.outbox.iter().position(|outgoing| outgoing.id == id) else {
+                    return;
+                };
+                let outgoing = self.outbox.remove(at);
+                match result {
+                    Ok(message) => {
+                        let Phase::Ready(workspace) = &mut self.phase else {
+                            return;
+                        };
+                        // Slack moves the Read Marker past the user's own Message itself.
+                        if let Some(activity) = workspace.activity.get_mut(&conversation) {
+                            activity.mark_read(message.ts);
+                        }
+                        if let Some(timeline) = workspace.timelines.get_mut(&conversation) {
+                            timeline.insert(message);
+                        }
+                    }
+                    Err(error) => {
+                        self.notice =
+                            Some(format!("not sent, back in the draft: {}", describe(&error)));
+                        // Put it back where it came from, ahead of anything typed since.
+                        let draft = self
+                            .drafts
+                            .entry(conversation)
+                            .or_insert_with(|| draft_of(""));
+                        let typed_since = draft.lines().join("\n");
+                        let restored = if typed_since.is_empty() {
+                            outgoing.text
+                        } else {
+                            format!("{}\n{typed_since}", outgoing.text)
+                        };
+                        *draft = draft_of(&restored);
+                    }
                 }
             }
             Update::User(user) => {
@@ -355,8 +604,9 @@ impl App {
                 _ => None,
             })
             .collect();
-        // Start on the first Conversation with something unread, if any.
-        let first = conversations
+        // Put the cursor on the first Conversation with something unread, without opening it: opening marks it
+        // read, which the user should choose.
+        self.selected = conversations
             .iter()
             .position(|(_, activity)| activity.has_unread())
             .unwrap_or(0);
@@ -364,21 +614,15 @@ impl App {
             .iter()
             .map(|(c, a)| (c.id.clone(), a.clone()))
             .collect();
-        let workspace = Workspace {
+        self.phase = Phase::Ready(Box::new(Workspace {
             name: snapshot.name,
             me: snapshot.me,
             conversations: conversations.into_iter().map(|(c, _)| c).collect(),
             activity,
             timelines: HashMap::new(),
             loading: HashSet::new(),
-        };
-        let first_id = workspace.conversations.get(first).map(|c| c.id.clone());
-        self.phase = Phase::Ready(Box::new(workspace));
+        }));
         self.want_users(partners, commands);
-        self.selected = first;
-        if let Some(id) = first_id {
-            self.open(id, commands);
-        }
     }
 
     fn live(&mut self, event: LiveEvent, commands: &mut Vec<Command>) {
@@ -456,6 +700,16 @@ impl App {
     }
 }
 
+/// A composer holding `text`, with the cursor at its end.
+fn draft_of(text: &str) -> TextArea<'static> {
+    let mut draft = TextArea::new(text.lines().map(str::to_owned).collect());
+    draft.set_cursor_line_style(Style::default());
+    draft.set_placeholder_text("message");
+    draft.move_cursor(ratatui_textarea::CursorMove::Bottom);
+    draft.move_cursor(ratatui_textarea::CursorMove::End);
+    draft
+}
+
 /// Everyone a Message names: its author and the people it mentions.
 fn people_in(message: &Message) -> Vec<UserId> {
     let author = match &message.author {
@@ -511,6 +765,27 @@ mod tests {
         }
     }
 
+    fn key(code: KeyCode) -> Event {
+        Event::Terminal(TerminalEvent::Key(KeyEvent::from(code)))
+    }
+
+    fn keys(app: &mut App, text: &str) -> Vec<Command> {
+        text.chars()
+            .flat_map(|c| app.update(key(KeyCode::Char(c))))
+            .collect()
+    }
+
+    fn control(c: char) -> Event {
+        Event::Terminal(TerminalEvent::Key(KeyEvent::new(
+            KeyCode::Char(c),
+            KeyModifiers::CONTROL,
+        )))
+    }
+
+    fn c(id: &str) -> ConversationId {
+        ConversationId::new(id)
+    }
+
     /// An app signed in to a Workspace with two Channels and a DM, `#random` having unread Messages.
     fn ready_app() -> (App, Vec<Command>) {
         let mut app = App::new("test".into());
@@ -543,81 +818,130 @@ mod tests {
         (app, commands)
     }
 
+    /// `ready_app` with `#random` open and its history loaded.
+    fn reading_random() -> App {
+        let (mut app, _) = ready_app();
+        app.update(key(KeyCode::Enter));
+        let page = HistoryPage {
+            messages: vec![
+                message(5, "U2", RichText::plain("hi")),
+                message(2, "U2", RichText::plain("hello")),
+            ],
+            has_more: true,
+        };
+        app.update(Event::Slack(Update::History {
+            conversation: c("C2"),
+            result: Ok(page),
+        }));
+        app
+    }
+
+    fn unread(app: &App, id: &str) -> bool {
+        app.workspace().unwrap().activity[&c(id)].has_unread()
+    }
+
     #[test]
-    fn signing_in_sorts_the_sidebar_and_opens_the_first_unread() {
+    fn signing_in_sorts_the_sidebar_and_selects_the_first_unread_without_opening_it() {
         let (app, commands) = ready_app();
-        let names: Vec<&str> = app
+        let ids: Vec<&str> = app
             .workspace()
             .unwrap()
             .conversations
             .iter()
             .map(|c| c.id.as_str())
             .collect();
-        assert_eq!(names, ["C1", "C2", "D1"], "channels by name, then DMs");
+        assert_eq!(ids, ["C1", "C2", "D1"], "channels by name, then DMs");
         assert_eq!(app.selected, 1);
-        assert_eq!(app.open, Some(ConversationId::new("C2")));
+        assert_eq!(app.open, None);
+        assert_eq!(commands, [Command::Slack(Request::User(UserId::new("U9")))]);
+    }
+
+    #[test]
+    fn opening_loads_history_asks_for_names_and_marks_it_read() {
+        let (mut app, _) = ready_app();
+        assert_eq!(
+            app.update(key(KeyCode::Enter)),
+            [Command::Slack(Request::History {
+                conversation: c("C2"),
+                before: None
+            })]
+        );
+        assert!(unread(&app, "C2"));
+        let page = HistoryPage {
+            messages: vec![message(5, "U2", RichText::plain("hi"))],
+            has_more: false,
+        };
+        let commands = app.update(Event::Slack(Update::History {
+            conversation: c("C2"),
+            result: Ok(page),
+        }));
         assert_eq!(
             commands,
             [
-                Command::Slack(Request::User(UserId::new("U9"))),
-                Command::Slack(Request::History {
-                    conversation: ConversationId::new("C2"),
-                    before: None
+                Command::Slack(Request::User(UserId::new("U2"))),
+                Command::Slack(Request::Mark {
+                    conversation: c("C2"),
+                    up_to: seconds(5)
                 }),
             ]
         );
+        assert!(!unread(&app, "C2"));
     }
 
     #[test]
-    fn history_fills_the_timeline_and_asks_for_names_once() {
+    fn nothing_is_marked_read_while_unfocused_or_scrolled_up() {
         let (mut app, _) = ready_app();
+        app.update(Event::Terminal(TerminalEvent::FocusLost));
+        app.update(key(KeyCode::Enter));
         let page = HistoryPage {
-            messages: vec![
-                message(3, "U2", RichText::plain("hi")),
-                message(2, "U2", RichText::plain("hello")),
-            ],
-            has_more: true,
-        };
-        let commands = app.update(Event::Slack(Update::History {
-            conversation: ConversationId::new("C2"),
-            result: Ok(page),
-        }));
-        assert_eq!(commands, [Command::Slack(Request::User(UserId::new("U2")))]);
-        assert_eq!(
-            app.workspace().unwrap().timelines[&ConversationId::new("C2")]
-                .messages()
-                .len(),
-            2
-        );
-    }
-
-    #[test]
-    fn scrolling_to_the_top_loads_older_history_once() {
-        let (mut app, _) = ready_app();
-        let page = HistoryPage {
-            messages: vec![message(3, "U2", RichText::plain("hi"))],
+            messages: vec![message(5, "U2", RichText::plain("hi"))],
             has_more: true,
         };
         app.update(Event::Slack(Update::History {
-            conversation: ConversationId::new("C2"),
+            conversation: c("C2"),
             result: Ok(page),
         }));
-        app.focus = Focus::Timeline;
+        assert!(unread(&app, "C2"));
+
         app.update(Event::Drawn(Drawn {
             max_scroll: 5,
             page: 10,
             ..Drawn::default()
         }));
+        app.update(key(KeyCode::Char('k')));
+        assert!(
+            app.update(Event::Terminal(TerminalEvent::FocusGained))
+                .is_empty(),
+            "scrolled up"
+        );
+        assert!(unread(&app, "C2"));
 
-        let key = |code| Event::Terminal(TerminalEvent::Key(KeyEvent::from(code)));
+        let commands = app.update(key(KeyCode::Char('G')));
+        assert_eq!(
+            commands,
+            [Command::Slack(Request::Mark {
+                conversation: c("C2"),
+                up_to: seconds(5)
+            })]
+        );
+    }
+
+    #[test]
+    fn scrolling_to_the_top_loads_older_history_once() {
+        let mut app = reading_random();
+        app.update(Event::Drawn(Drawn {
+            max_scroll: 5,
+            page: 10,
+            ..Drawn::default()
+        }));
         assert!(app.update(key(KeyCode::Char('k'))).is_empty());
         let commands = app.update(key(KeyCode::Char('g')));
         assert_eq!(app.scroll, 5);
         assert_eq!(
             commands,
             [Command::Slack(Request::History {
-                conversation: ConversationId::new("C2"),
-                before: Some(seconds(3))
+                conversation: c("C2"),
+                before: Some(seconds(2))
             })]
         );
         assert!(
@@ -636,7 +960,7 @@ mod tests {
         }
         let post = |conversation: &str, message: Message| {
             Event::Slack(Update::Live(LiveEvent::Posted {
-                conversation: ConversationId::new(conversation),
+                conversation: c(conversation),
                 message,
             }))
         };
@@ -644,21 +968,125 @@ mod tests {
         let mut reply = message(11, "U2", RichText::plain("reply"));
         reply.reply_to = Some(seconds(1));
         app.update(post("C1", reply));
-        let activity = |app: &App, id: &str| {
-            app.workspace().unwrap().activity[&ConversationId::new(id)].clone()
-        };
-        assert!(!activity(&app, "C1").has_unread());
+        assert!(!unread(&app, "C1"));
 
         app.update(post("C1", message(12, "U2", mention)));
         app.update(post("D1", message(13, "U9", RichText::plain("dm"))));
-        assert_eq!(activity(&app, "C1").mentions(), 1);
-        assert_eq!(activity(&app, "D1").mentions(), 1, "DMs count as mentions");
+        let mentions = |app: &App, id: &str| app.workspace().unwrap().activity[&c(id)].mentions();
+        assert_eq!(mentions(&app, "C1"), 1);
+        assert_eq!(mentions(&app, "D1"), 1, "DMs count as mentions");
 
-        app.update(Event::Slack(Update::Live(LiveEvent::Marked {
-            conversation: ConversationId::new("C1"),
+        let marked = LiveEvent::Marked {
+            conversation: c("C1"),
             up_to: seconds(12),
-        })));
-        assert!(!activity(&app, "C1").has_unread());
+        };
+        app.update(Event::Slack(Update::Live(marked)));
+        assert!(!unread(&app, "C1"));
+    }
+
+    #[test]
+    fn insert_mode_writes_and_enter_sends() {
+        let mut app = reading_random();
+        assert!(keys(&mut app, "i").is_empty());
+        assert_eq!(app.mode, Mode::Insert);
+        keys(&mut app, "hi :wave:");
+        let newline = KeyEvent::new(KeyCode::Enter, KeyModifiers::SHIFT);
+        app.update(Event::Terminal(TerminalEvent::Key(newline)));
+        keys(&mut app, "there");
+
+        let commands = app.update(key(KeyCode::Enter));
+        let text = "hi :wave:\nthere".to_owned();
+        assert_eq!(
+            commands,
+            [Command::Slack(Request::Post {
+                conversation: c("C2"),
+                text,
+                id: 0
+            })]
+        );
+        assert_eq!(app.outbox.len(), 1);
+        assert!(app.draft().unwrap().is_empty());
+        assert!(
+            app.update(key(KeyCode::Enter)).is_empty(),
+            "nothing to send"
+        );
+
+        app.update(key(KeyCode::Esc));
+        assert_eq!(app.mode, Mode::Normal);
+    }
+
+    #[test]
+    fn a_posted_message_joins_the_timeline_and_a_failed_one_returns_to_the_draft() {
+        let mut app = reading_random();
+        keys(&mut app, "ifirst");
+        app.update(key(KeyCode::Enter));
+        keys(&mut app, "second");
+        app.update(key(KeyCode::Enter));
+
+        let posted = message(9, "UME", RichText::plain("first"));
+        app.update(Event::Slack(Update::Posted {
+            id: 0,
+            conversation: c("C2"),
+            result: Ok(posted),
+        }));
+        let timeline = &app.workspace().unwrap().timelines[&c("C2")];
+        assert_eq!(timeline.messages().next_back().unwrap().ts, seconds(9));
+
+        keys(&mut app, "third");
+        app.update(Event::Slack(Update::Posted {
+            id: 1,
+            conversation: c("C2"),
+            result: Err(Error::SignedOut),
+        }));
+        assert!(app.outbox.is_empty());
+        assert_eq!(app.draft().unwrap().lines(), ["second", "third"]);
+        assert!(app.notice.as_deref().unwrap().starts_with("not sent"));
+    }
+
+    #[test]
+    fn ctrl_x_ctrl_e_hands_the_draft_to_the_editor() {
+        let mut app = reading_random();
+        keys(&mut app, "idraft");
+        assert!(app.update(control('x')).is_empty());
+        assert_eq!(
+            app.update(control('e')),
+            [Command::Edit {
+                conversation: c("C2"),
+                text: "draft".into()
+            }]
+        );
+        app.update(Event::Edited {
+            conversation: c("C2"),
+            outcome: Ok("edited\ntext".into()),
+        });
+        assert_eq!(app.draft().unwrap().lines(), ["edited", "text"]);
+    }
+
+    #[test]
+    fn only_colon_q_quits() {
+        let (mut app, _) = ready_app();
+        assert!(keys(&mut app, "q").is_empty());
+        assert!(app.update(control('c')).is_empty());
+        assert_eq!(
+            app.notice.as_deref(),
+            Some("type :q and press Enter to quit")
+        );
+
+        keys(&mut app, ":wq");
+        assert_eq!(app.mode, Mode::Command("wq".into()));
+        assert!(app.update(key(KeyCode::Enter)).is_empty());
+        assert_eq!(app.notice.as_deref(), Some("not a command: :wq"));
+
+        keys(&mut app, ":q");
+        assert_eq!(app.update(key(KeyCode::Enter)), [Command::Quit]);
+    }
+
+    #[test]
+    fn i_needs_an_open_conversation() {
+        let (mut app, _) = ready_app();
+        keys(&mut app, "i");
+        assert_eq!(app.mode, Mode::Normal);
+        assert_eq!(app.notice.as_deref(), Some("open a conversation first"));
     }
 
     #[test]
@@ -692,28 +1120,6 @@ mod tests {
                 bytes: vec![1, 2],
                 fit: Fit::Emoji
             }]
-        );
-    }
-
-    #[test]
-    fn q_and_ctrl_c_quit() {
-        let (mut app, _) = ready_app();
-        assert_eq!(
-            app.update(Event::Terminal(TerminalEvent::Key(KeyEvent::from(
-                KeyCode::Char('q')
-            )))),
-            [Command::Quit]
-        );
-        let ctrl_c = KeyEvent::new(KeyCode::Char('c'), KeyModifiers::CONTROL);
-        assert_eq!(
-            app.update(Event::Terminal(TerminalEvent::Key(ctrl_c))),
-            [Command::Quit]
-        );
-        assert!(
-            app.update(Event::Terminal(TerminalEvent::Key(KeyEvent::from(
-                KeyCode::Char('c')
-            ))))
-            .is_empty()
         );
     }
 }

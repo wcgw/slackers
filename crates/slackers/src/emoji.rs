@@ -95,6 +95,12 @@ impl Emojis {
         self.pictures.insert(url, Loading::Ready(picture));
     }
 
+    /// Forgets every picture, loaded or not, so that each is fetched again when next drawn: the terminal no longer
+    /// has them.
+    pub(crate) fn forget_pictures(&mut self) {
+        self.pictures.clear();
+    }
+
     /// Notes that the picture at `url` couldn't be loaded, so that it's drawn by name and not asked for again.
     pub(crate) fn failed(&mut self, url: String) {
         self.pictures.insert(url, Loading::Failed);

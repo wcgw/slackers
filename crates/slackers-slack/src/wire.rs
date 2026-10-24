@@ -528,6 +528,19 @@ fn reaction_emoji(name: &str) -> Emoji {
     }
 }
 
+/// `chat.postMessage`'s reply.
+#[derive(Deserialize)]
+pub(crate) struct Posted {
+    message: Value,
+}
+
+impl Posted {
+    /// The Message as Slack stored it; `None` if it came back in an unknown shape.
+    pub(crate) fn into_message(self, me: &UserId) -> Option<Message> {
+        message(self.message, me)
+    }
+}
+
 #[derive(Deserialize)]
 pub(crate) struct UserInfo {
     user: WireUser,

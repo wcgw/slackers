@@ -36,6 +36,23 @@ pub enum Request {
         /// Where it is; Slack's private file URLs work, as the request carries the session's credentials.
         url: String,
     },
+    /// Posts a top-level Message as the user; answered by [`Update::Posted`].
+    Post {
+        /// Where.
+        conversation: ConversationId,
+        /// What, as typed: `mrkdwn` markup such as `*bold*` and `:emoji:` applies, but `&`, `<` and `>` are
+        /// taken literally.
+        text: String,
+        /// Any number the caller picks, to match the answer to the request.
+        id: u64,
+    },
+    /// Moves the user's Read Marker. Slack confirms with a [`LiveEvent::Marked`]; failures are only logged.
+    Mark {
+        /// Where.
+        conversation: ConversationId,
+        /// The newest Message read.
+        up_to: Ts,
+    },
 }
 
 /// What a [`Session`] learned.
@@ -56,6 +73,15 @@ pub enum Update {
     },
     /// The answer to [`Request::User`].
     User(User),
+    /// The answer to [`Request::Post`].
+    Posted {
+        /// The request's `id`.
+        id: u64,
+        /// Where it was posted.
+        conversation: ConversationId,
+        /// The Message as Slack stored it, or why it wasn't posted.
+        result: Result<Message, Error>,
+    },
     /// The answer to [`Request::Download`].
     Downloaded {
         /// What was asked for.
@@ -256,6 +282,26 @@ async fn serve(api: &Api, request: Request, me: &UserId, notify: &Notify) {
         Request::Download { url } => {
             let result = api.download(&url).await;
             notify(Update::Downloaded { url, result });
+        }
+        Request::Post {
+            conversation,
+            text,
+            id,
+        } => {
+            let result = api.post(&conversation, &text, me).await;
+            notify(Update::Posted {
+                id,
+                conversation,
+                result,
+            });
+        }
+        Request::Mark {
+            conversation,
+            up_to,
+        } => {
+            if let Err(error) = api.mark(&conversation, up_to).await {
+                tracing::warn!(%error, %conversation, "couldn't move the read marker");
+            }
         }
     }
 }

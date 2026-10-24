@@ -22,7 +22,8 @@ web client itself depends on, not the documented equivalents:
 | Followed Threads | `subscriptions.thread.getView` | |
 | Live events | the web client's socket: `wss://wss-primary.slack.com/?token=…&gateway_server=<id>-1&slack_client=desktop&batch_presence_aware=1`, where `<id>` is the team id, or the enterprise id for an org-level token (as wee-slack does) | `rtm.connect` |
 
-`conversations.history`, `.replies` and `.info`, `users.info`, `emoji.list` and file downloads work as documented.
+`conversations.history`, `.replies` and `.info`, `users.info`, `emoji.list`, `chat.postMessage` and file downloads
+work as documented. Posting was confirmed in both Workspaces on 2026-10-24.
 
 A spike on 2026-10-24 confirmed all of this against Red Hat (Enterprise Grid, org-level token) and CNCF. Short bursts
 of history calls weren't rate limited.
