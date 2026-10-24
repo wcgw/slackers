@@ -1,0 +1,16 @@
+[package]
+name = "slackers-gfx"
+description = "Images, animated GIFs and Custom Emoji in Ghostty, drawn by ratatui through kitty Unicode placeholders"
+version.workspace = true
+edition.workspace = true
+publish.workspace = true
+
+[dependencies]
+base64.workspace = true
+image.workspace = true
+ratatui.workspace = true
+thiserror.workspace = true
+tracing.workspace = true
+
+[lints]
+workspace = true

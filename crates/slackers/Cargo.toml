@@ -1,0 +1,24 @@
+[package]
+name = "slackers"
+description = "A terminal Slack client that groups Conversations by subject across Workspaces"
+version.workspace = true
+edition.workspace = true
+publish.workspace = true
+
+[dependencies]
+anyhow.workspace = true
+crossterm.workspace = true
+emojis.workspace = true
+futures-util.workspace = true
+jiff.workspace = true
+ratatui.workspace = true
+slackers-gfx.workspace = true
+slackers-model.workspace = true
+slackers-slack.workspace = true
+tokio.workspace = true
+tracing.workspace = true
+tracing-subscriber.workspace = true
+unicode-width.workspace = true
+
+[lints]
+workspace = true
