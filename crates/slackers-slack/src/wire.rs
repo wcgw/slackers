@@ -494,7 +494,17 @@ fn content(blocks: Vec<Value>, text: &str, attachments: Vec<WireAttachment>) -> 
             WireBlock::RichText { elements } => {
                 elements.into_iter().filter_map(rich_block).collect()
             }
-            WireBlock::Other => Vec::new(),
+            WireBlock::Image {
+                image_url: Some(url),
+                image_width: Some(width),
+                image_height: Some(height),
+                alt_text,
+            } => vec![Block::Image {
+                image: Image { url, width, height },
+                alt_text,
+            }],
+            // An image Slack didn't measure, or one of its own files: neither can take its room before it loads.
+            WireBlock::Image { .. } | WireBlock::Other => Vec::new(),
         })
         .collect();
     let mut content = if rich.is_empty() {
@@ -525,6 +535,17 @@ enum WireBlock {
     RichText {
         #[serde(default)]
         elements: Vec<Value>,
+    },
+    /// An image by URL, as Giphy posts them. Slack adds its size to those it stores.
+    Image {
+        #[serde(default)]
+        image_url: Option<String>,
+        #[serde(default)]
+        image_width: Option<u32>,
+        #[serde(default)]
+        image_height: Option<u32>,
+        #[serde(default)]
+        alt_text: String,
     },
     #[serde(other)]
     Other,
@@ -1257,6 +1278,32 @@ mod tests {
             json!({"name": "notes.pdf", "mimetype": "application/pdf", "thumb_360": "https://f/p"});
         assert_eq!(image(document), None, "no size, no image");
         assert_eq!(image(json!({"name": "gone", "mode": "tombstone"})), None);
+    }
+
+    #[test]
+    fn image_blocks_show_inline_when_slack_measured_them() {
+        let posted = message(
+            json!({"ts": "1.0", "bot_id": "B1", "text": "fallback", "blocks": [
+                {"type": "image", "image_url": "https://media4.giphy.com/media/x/giphy.gif",
+                 "image_width": 480, "image_height": 270, "image_bytes": 1000, "is_animated": true,
+                 "alt_text": "a dancing cat", "title": {"type": "plain_text", "text": "dance"}},
+                {"type": "image", "image_url": "https://unmeasured.example/i.png", "alt_text": "?"},
+                {"type": "context", "elements": []}
+            ]}),
+            &me(),
+        )
+        .unwrap();
+        assert_eq!(
+            posted.content.blocks,
+            [Block::Image {
+                image: Image {
+                    url: "https://media4.giphy.com/media/x/giphy.gif".into(),
+                    width: 480,
+                    height: 270,
+                },
+                alt_text: "a dancing cat".into(),
+            }]
+        );
     }
 
     #[test]

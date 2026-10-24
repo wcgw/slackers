@@ -1,6 +1,6 @@
 use std::ops::BitOr;
 
-use crate::{ConversationId, Emoji, UserId};
+use crate::{ConversationId, Emoji, Image, UserId};
 
 /// A Message's formatted text, as a sequence of blocks.
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
@@ -24,6 +24,13 @@ pub enum Block {
         ordered: bool,
         /// The list items, in order.
         items: Vec<Vec<Inline>>,
+    },
+    /// An image shown inline, such as a GIF posted from Giphy.
+    Image {
+        /// Where it is, and how big.
+        image: Image,
+        /// What it shows, in words.
+        alt_text: String,
     },
 }
 
@@ -115,7 +122,7 @@ impl RichText {
             .flat_map(|block| -> Box<dyn Iterator<Item = &Inline> + '_> {
                 match block {
                     Block::Paragraph(inlines) | Block::Quote(inlines) => Box::new(inlines.iter()),
-                    Block::Preformatted(_) => Box::new(std::iter::empty()),
+                    Block::Preformatted(_) | Block::Image { .. } => Box::new(std::iter::empty()),
                     Block::List { items, .. } => Box::new(items.iter().flatten()),
                 }
             })

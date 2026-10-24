@@ -871,36 +871,35 @@ impl<'a> Renderer<'a> {
         }
     }
 
-    /// A shared file's lines: an image as its picture, once loaded, and until then as a line saying what's coming,
-    /// followed by as many blank ones as the picture will take; anything else, or an image that can't be shown, as
-    /// its name.
+    /// A shared file's lines: an image as [`Renderer::image`] draws it; anything else, or an image that can't be
+    /// shown, as its name.
     fn file(&mut self, file: &File) -> Vec<Line<'static>> {
-        let named = |icon| {
-            Line::from(vec![
-                Span::styled(icon, DIM),
-                Span::styled(file.name.clone(), DIM),
-            ])
-        };
-        let Some(Image { url, width, height }) = &file.image else {
-            return vec![named(icons::FILE)];
-        };
-        match self.app.pictures.state(url) {
+        file.image
+            .as_ref()
+            .and_then(|image| self.image(image, &file.name))
+            .unwrap_or_else(|| vec![labelled(icons::FILE, &file.name)])
+    }
+
+    /// An image's lines: its picture, once loaded; until then, a line saying what's coming, by `label`, followed by
+    /// as many blank ones as the picture will take. `None` when it can't be shown.
+    fn image(&mut self, image: &Image, label: &str) -> Option<Vec<Line<'static>>> {
+        match self.app.pictures.state(&image.url) {
             PictureState::Ready(picture) => {
                 self.next_change = earliest(self.next_change, picture.next_change(self.now));
-                (0..picture.cells().rows)
-                    .map(|row| Line::from(picture.row(row, self.now)))
-                    .collect()
+                let rows =
+                    (0..picture.cells().rows).map(|row| Line::from(picture.row(row, self.now)));
+                Some(rows.collect())
             }
             PictureState::Awaiting { requested } => {
                 if !requested {
-                    self.want(url, Fit::Within(IMAGE));
+                    self.want(&image.url, Fit::Within(IMAGE));
                 }
-                let rows = CellBox::fitting(*width, *height, IMAGE, self.app.cell).rows;
-                let mut lines = vec![named(icons::IMAGE)];
+                let rows = CellBox::fitting(image.width, image.height, IMAGE, self.app.cell).rows;
+                let mut lines = vec![labelled(icons::IMAGE, label)];
                 lines.resize(usize::from(rows).max(1), Line::default());
-                lines
+                Some(lines)
             }
-            PictureState::Failed => vec![named(icons::FILE)],
+            PictureState::Failed => None,
         }
     }
 
@@ -944,6 +943,10 @@ impl<'a> Renderer<'a> {
                         let pieces = self.pieces(item);
                         lines.extend(self.prefixed(pieces, Span::styled(marker, DIM), &indent));
                     }
+                }
+                TextBlock::Image { image, alt_text } => {
+                    let shown = self.image(image, alt_text);
+                    lines.extend(shown.unwrap_or_else(|| vec![labelled(icons::IMAGE, alt_text)]));
                 }
             }
         }
@@ -1127,6 +1130,14 @@ fn connections(app: &App) -> Vec<Span<'static>> {
     } else {
         spans
     }
+}
+
+/// A dim line: `icon`, then `label`.
+fn labelled(icon: &'static str, label: &str) -> Line<'static> {
+    Line::from(vec![
+        Span::styled(icon, DIM),
+        Span::styled(label.to_owned(), DIM),
+    ])
 }
 
 fn text_style(style: TextStyle) -> Style {
@@ -1464,6 +1475,58 @@ mod tests {
         let (rows, _, _) = render_at(&app, WIDTH, 24);
         assert_eq!(row(&rows, "after") - row(&rows, "shot.png"), 1);
         assert!(rows[row(&rows, "shot.png")].contains(&format!("{}shot.png", icons::FILE)));
+    }
+
+    #[test]
+    fn an_image_block_shows_like_an_image_file() {
+        let mut app = reading_general();
+        let gif = slackers_model::Block::Image {
+            image: Image {
+                url: "https://media4.giphy.com/x.gif".into(),
+                width: 200,
+                height: 100,
+            },
+            alt_text: "a dancing cat".into(),
+        };
+        let start = reading_general_message().ts.as_micros();
+        let posted = slackers_slack::LiveEvent::Posted {
+            conversation: ConversationId::new("C1"),
+            message: Message {
+                ts: Ts::from_micros(start + 60_000_000),
+                author: Author::Bot {
+                    name: "giphy".into(),
+                    avatar: None,
+                },
+                content: RichText { blocks: vec![gif] },
+                ..reading_general_message()
+            },
+        };
+        app.update(Event::Slack(w(0), Update::Live(posted)));
+
+        let (rows, drawn, _) = render_at(&app, WIDTH, 24);
+        let label = rows
+            .iter()
+            .position(|row| row.contains("a dancing cat"))
+            .unwrap();
+        assert!(rows[label].contains(&format!("{}a dancing cat", icons::IMAGE)));
+        // 200 × 100 pixels on 10 × 20 pixel cells: 5 rows, the last of the pane's above the status line.
+        assert_eq!(label + 5, rows.len() - 1, "{rows:#?}");
+        let wanted = WantedPicture {
+            workspace: w(0),
+            url: "https://media4.giphy.com/x.gif".into(),
+            fit: Fit::Within(IMAGE),
+        };
+        assert!(drawn.wanted_pictures.contains(&wanted));
+
+        app.update(Event::PictureFailed {
+            url: "https://media4.giphy.com/x.gif".into(),
+        });
+        let rows = render_at(&app, WIDTH, 24).0;
+        assert_eq!(
+            rows.iter().position(|row| row.contains("a dancing cat")),
+            Some(rows.len() - 2),
+            "its words alone, once it can't be shown"
+        );
     }
 
     /// `reading_general` with the only Message's Thread open, holding one Reply.
