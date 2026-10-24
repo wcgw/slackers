@@ -15,9 +15,10 @@ use slackers_model::{
     Activity, Author, Conversation, ConversationId, ConversationKind, Inline, Message, Timeline,
     UserId,
 };
-use slackers_slack::{Connection, Error, LiveEvent, Request, Snapshot, Update};
+use slackers_slack::{Connection, Error, LiveEvent, Request, Snapshot, Update, User};
 
 use crate::emoji::Emojis;
+use crate::pictures::Pictures;
 use crate::search::{Finder, Hit};
 
 /// Something that happened, for [`App::update`] to react to.
@@ -149,9 +150,11 @@ pub(crate) struct App {
     /// The latest thing worth telling the user, usually a problem.
     pub(crate) notice: Option<String>,
     /// People's names, as far as they've been looked up.
-    pub(crate) users: HashMap<UserId, String>,
+    pub(crate) users: HashMap<UserId, User>,
     requested_users: HashSet<UserId>,
     pub(crate) emojis: Emojis,
+    /// Custom Emoji and avatars, fetched as they come on screen.
+    pub(crate) pictures: Pictures,
     pub(crate) mode: Mode,
     /// The sidebar entry under the cursor.
     pub(crate) selected: usize,
@@ -185,6 +188,7 @@ impl App {
             users: HashMap::new(),
             requested_users: HashSet::new(),
             emojis: Emojis::default(),
+            pictures: Pictures::default(),
             mode: Mode::Normal,
             selected: 0,
             open: None,
@@ -220,7 +224,17 @@ impl App {
 
     /// What to call `user`: their name once looked up, else their id.
     pub(crate) fn user_name<'a>(&'a self, user: &'a UserId) -> &'a str {
-        self.users.get(user).map_or(user.as_str(), String::as_str)
+        self.users
+            .get(user)
+            .map_or(user.as_str(), |user| user.name.as_str())
+    }
+
+    /// Where `author`'s avatar image is, as far as known.
+    pub(crate) fn avatar<'a>(&'a self, author: &'a Author) -> Option<&'a str> {
+        match author {
+            Author::User(id) => self.users.get(id)?.avatar.as_deref(),
+            Author::Bot { avatar, .. } => avatar.as_deref(),
+        }
     }
 
     /// What to call `conversation`: a DM after the other person, anything else by its name.
@@ -244,9 +258,9 @@ impl App {
             Event::Terminal(TerminalEvent::FocusLost) => self.focused = false,
             Event::Terminal(_) => {}
             Event::Slack(update) => self.slack(update, &mut commands),
-            Event::PictureReady { url, picture } => self.emojis.loaded(url, picture),
-            Event::PictureFailed { url } => self.emojis.failed(url),
-            Event::PicturesLost => self.emojis.forget_pictures(),
+            Event::PictureReady { url, picture } => self.pictures.loaded(url, picture),
+            Event::PictureFailed { url } => self.pictures.failed(url),
+            Event::PicturesLost => self.pictures.forget_all(),
             Event::Edited {
                 conversation,
                 outcome,
@@ -258,7 +272,7 @@ impl App {
             },
             Event::Drawn(drawn) => {
                 for url in &drawn.wanted_pictures {
-                    if self.emojis.request(url) {
+                    if self.pictures.request(url) {
                         commands.push(Command::Slack(Request::Download { url: url.clone() }));
                     }
                 }
@@ -656,10 +670,10 @@ impl App {
                 }
             }
             Update::User(user) => {
-                self.users.insert(user.id, user.name);
+                self.users.insert(user.id.clone(), user);
             }
             Update::Downloaded { url, result } => {
-                if !self.emojis.awaits(&url) {
+                if !self.pictures.awaits(&url) {
                     return;
                 }
                 match result {
@@ -669,8 +683,8 @@ impl App {
                         fit: Fit::Emoji,
                     }),
                     Err(error) => {
-                        tracing::warn!(%error, "couldn't download a custom emoji");
-                        self.emojis.failed(url);
+                        tracing::warn!(%error, "couldn't download a picture");
+                        self.pictures.failed(url);
                     }
                 }
             }
@@ -798,11 +812,13 @@ impl App {
 /// What to call `conversation`, given the people known by name: a DM after the other person, anything else by its
 /// name.
 fn conversation_name<'a>(
-    users: &'a HashMap<UserId, String>,
+    users: &'a HashMap<UserId, User>,
     conversation: &'a Conversation,
 ) -> &'a str {
     match &conversation.kind {
-        ConversationKind::Dm { with } => users.get(with).map_or(with.as_str(), String::as_str),
+        ConversationKind::Dm { with } => users
+            .get(with)
+            .map_or(with.as_str(), |user| user.name.as_str()),
         ConversationKind::Channel { .. } | ConversationKind::GroupDm => &conversation.name,
     }
 }
@@ -1215,9 +1231,10 @@ mod tests {
             "everything, before typing"
         );
 
-        app.update(Event::Slack(Update::User(slackers_slack::User {
+        app.update(Event::Slack(Update::User(User {
             id: UserId::new("U9"),
             name: "Rand Al'Thor".into(),
+            avatar: None,
         })));
         keys(&mut app, "ran");
         assert_eq!(

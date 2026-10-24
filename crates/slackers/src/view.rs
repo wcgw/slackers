@@ -21,8 +21,12 @@ use crate::app::{App, Drawn, Focus, Mode, Phase, Workspace};
 use crate::emoji::Drawable;
 use crate::icons;
 use crate::layout::{Piece, wrap};
+use crate::pictures::PictureState;
 
 const SIDEBAR_WIDTH: u16 = 30;
+
+/// Cells left of a Message's content, holding its author's avatar: two cells of picture and a space.
+const GUTTER: u16 = 3;
 
 /// Messages by the same author less than this far apart share one header.
 const GROUP_WITHIN: u64 = 5 * 60 * 1_000_000;
@@ -294,18 +298,9 @@ fn draw_timeline(
         .iter()
         .filter(|outgoing| &outgoing.conversation == open)
     {
-        let mut lines = vec![Line::from(vec![
-            Span::styled(
-                app.user_name(&workspace.me).to_owned(),
-                Style::new().add_modifier(Modifier::BOLD),
-            ),
-            Span::raw("  "),
-            Span::styled(icons::SENDING, DIM),
-            Span::styled("sending", DIM),
-        ])];
-        let pieces = vec![Piece::Text(outgoing.text.clone(), DIM)];
-        lines.extend(wrap(pieces, body.width).into_iter().map(Line::from));
-        rendered.push((lines, Vec::new(), None));
+        let mut renderer = Renderer::new(app, workspace, body.width, &zone);
+        let lines = renderer.sending(&outgoing.text);
+        rendered.push((lines, renderer.wanted, renderer.next_change));
     }
 
     let height = usize::from(body.height);
@@ -370,9 +365,13 @@ fn draw_composer(frame: &mut Frame<'_>, area: Rect, app: &App) -> Rect {
 }
 
 /// Lays out one Message, collecting the pictures it wants and when its animations next change.
+///
+/// A Message hangs off its author's avatar: the avatar and a space fill the [`GUTTER`] on the header line, and
+/// everything else is indented by it.
 struct Renderer<'a> {
     app: &'a App,
     workspace: &'a Workspace,
+    /// Room for content, right of the gutter, in cells.
     width: u16,
     zone: &'a TimeZone,
     /// Pictures it would show, had they been loaded, by URL.
@@ -383,11 +382,12 @@ struct Renderer<'a> {
 }
 
 impl<'a> Renderer<'a> {
+    /// A renderer for lines `width` cells wide, gutter included.
     fn new(app: &'a App, workspace: &'a Workspace, width: u16, zone: &'a TimeZone) -> Self {
         Self {
             app,
             workspace,
-            width,
+            width: width.saturating_sub(GUTTER),
             zone,
             wanted: Vec::new(),
             next_change: None,
@@ -395,32 +395,31 @@ impl<'a> Renderer<'a> {
         }
     }
 
+    /// `message`'s lines. A `grouped` one follows another by the same author: it gets no header, just a faint dot
+    /// in the gutter where it starts.
     fn message(&mut self, message: &Message, grouped: bool) -> Vec<Line<'static>> {
         let mut lines = Vec::new();
         if !grouped {
-            let (name, color) = match &message.author {
-                Author::User(id) => (self.app.user_name(id).to_owned(), author_color(id.as_str())),
-                Author::Bot { name } => (name.clone(), Color::Gray),
-            };
-            let mut header = vec![
-                Span::styled(name, Style::new().fg(color).add_modifier(Modifier::BOLD)),
-                Span::styled(format!("  {}", time(message.ts, self.zone)), DIM),
-            ];
+            let mut header = self.header(&message.author);
+            header.push(Span::styled(
+                format!("  {}", time(message.ts, self.zone)),
+                DIM,
+            ));
             if message.edited {
                 header.push(Span::styled(format!(" {}", icons::EDITED), DIM));
             }
             lines.push(Line::from(header));
         }
-        lines.extend(self.text(&message.content));
+        let mut content = self.text(&message.content);
         if grouped
             && message.edited
-            && let Some(last) = lines.last_mut()
+            && let Some(last) = content.last_mut()
         {
             last.spans
                 .push(Span::styled(format!(" {}", icons::EDITED), DIM));
         }
         for file in &message.files {
-            lines.push(Line::from(vec![
+            content.push(Line::from(vec![
                 Span::styled(icons::FILE, DIM),
                 Span::styled(file.name.clone(), DIM),
             ]));
@@ -432,16 +431,76 @@ impl<'a> Renderer<'a> {
                 let style = if reaction.mine { MENTION } else { DIM };
                 pieces.push(Piece::Text(format!(" {}  ", reaction.count), style));
             }
-            lines.extend(wrap(pieces, self.width).into_iter().map(Line::from));
+            content.extend(wrap(pieces, self.width).into_iter().map(Line::from));
         }
         if let Some(thread) = message.thread {
-            lines.push(Line::from(vec![
+            content.push(Line::from(vec![
                 Span::styled(icons::THREAD, ACCENT),
                 Span::styled(thread.replies.to_string(), ACCENT),
                 Span::styled(format!("  {}", time(thread.latest, self.zone)), DIM),
             ]));
         }
+        lines.extend(content.into_iter().enumerate().map(|(index, mut line)| {
+            let gutter = if grouped && index == 0 { " · " } else { "   " };
+            line.spans.insert(0, Span::styled(gutter, DIM));
+            line
+        }));
         lines
+    }
+
+    /// The lines of `text`, posted by the user and not yet confirmed: dimmed, under a header saying so.
+    fn sending(&mut self, text: &str) -> Vec<Line<'static>> {
+        let mut header = self.header(&Author::User(self.workspace.me.clone()));
+        header.extend([
+            Span::raw("  "),
+            Span::styled(icons::SENDING, DIM),
+            Span::styled("sending", DIM),
+        ]);
+        let mut lines = vec![Line::from(header)];
+        let pieces = vec![Piece::Text(text.to_owned(), DIM)];
+        lines.extend(wrap(pieces, self.width).into_iter().map(|mut spans| {
+            spans.insert(0, Span::raw("   "));
+            Line::from(spans)
+        }));
+        lines
+    }
+
+    /// The start of a header line: `author`'s avatar in the gutter, then their name.
+    fn header(&mut self, author: &Author) -> Vec<Span<'static>> {
+        let (name, color) = match author {
+            Author::User(id) => (self.app.user_name(id).to_owned(), author_color(id.as_str())),
+            Author::Bot { name, .. } => (name.clone(), Color::Gray),
+        };
+        vec![
+            self.avatar(author, color),
+            Span::raw(" "),
+            Span::styled(name, Style::new().fg(color).add_modifier(Modifier::BOLD)),
+        ]
+    }
+
+    /// `author`'s avatar, two cells wide: their picture once loaded, an icon in `color` until then or without one.
+    fn avatar(&mut self, author: &Author, color: Color) -> Span<'static> {
+        let icon = match author {
+            Author::User(_) => icons::AVATAR,
+            Author::Bot { .. } => icons::BOT,
+        };
+        let fallback = Span::styled(icon, Style::new().fg(color));
+        let Some(url) = self.app.avatar(author) else {
+            return fallback;
+        };
+        match self.app.pictures.state(url) {
+            PictureState::Ready(picture) => {
+                self.next_change = earliest(self.next_change, picture.next_change(self.now));
+                picture.row(0, self.now)
+            }
+            PictureState::Awaiting { requested } => {
+                if !requested {
+                    self.wanted.push(url.to_owned());
+                }
+                fallback
+            }
+            PictureState::Failed => fallback,
+        }
     }
 
     fn text(&mut self, text: &RichText) -> Vec<Line<'static>> {
@@ -540,7 +599,7 @@ impl<'a> Renderer<'a> {
     }
 
     fn emoji(&mut self, emoji: &Emoji) -> Piece {
-        match self.app.emojis.drawable(emoji) {
+        match self.app.emojis.drawable(emoji, &self.app.pictures) {
             Drawable::Text(text) => Piece::Atom(
                 Span::raw(text.to_owned()),
                 u16::try_from(text.width().max(1)).unwrap_or(2),
@@ -719,16 +778,33 @@ mod tests {
 
     /// Draws `app` and returns the screen, row by row.
     fn screen(app: &App) -> Vec<String> {
+        render(app).0
+    }
+
+    /// Draws `app` and returns the screen, row by row, and what the draw reported.
+    fn render(app: &App) -> (Vec<String>, Drawn) {
         let mut terminal = Terminal::new(TestBackend::new(WIDTH, HEIGHT)).unwrap();
-        terminal
-            .draw(|frame| {
-                draw(frame, app);
-            })
-            .unwrap();
+        let mut drawn = Drawn::default();
+        terminal.draw(|frame| drawn = draw(frame, app)).unwrap();
         let buffer = terminal.backend().buffer();
-        (0..HEIGHT)
+        let rows = (0..HEIGHT)
             .map(|y| (0..WIDTH).map(|x| buffer[(x, y)].symbol()).collect())
-            .collect()
+            .collect();
+        (rows, drawn)
+    }
+
+    /// The one Message `reading_general` holds, by `U2`.
+    fn reading_general_message() -> Message {
+        Message {
+            ts: Ts::from_micros(1_700_000_000_000_000),
+            author: Author::User(UserId::new("U2")),
+            content: RichText::plain("the only message"),
+            reply_to: None,
+            thread: None,
+            reactions: Vec::new(),
+            files: Vec::new(),
+            edited: false,
+        }
     }
 
     /// An app with `#general` open, holding one Message.
@@ -747,18 +823,8 @@ mod tests {
         };
         app.update(Event::Slack(Update::Ready(Box::new(snapshot))));
         press(&mut app, KeyCode::Enter, KeyModifiers::NONE);
-        let message = Message {
-            ts: Ts::from_micros(1_700_000_000_000_000),
-            author: Author::User(UserId::new("U2")),
-            content: RichText::plain("the only message"),
-            reply_to: None,
-            thread: None,
-            reactions: Vec::new(),
-            files: Vec::new(),
-            edited: false,
-        };
         let page = HistoryPage {
-            messages: vec![message],
+            messages: vec![reading_general_message()],
             has_more: false,
         };
         app.update(Event::Slack(Update::History {
@@ -813,6 +879,54 @@ mod tests {
             "{rows:#?}"
         );
         assert!(rows.last().unwrap().contains("0 of 1"));
+    }
+
+    #[test]
+    fn messages_hang_off_their_authors_avatar() {
+        let mut app = reading_general();
+        app.update(Event::Slack(Update::User(slackers_slack::User {
+            id: UserId::new("U2"),
+            name: "Ana".into(),
+            avatar: Some("https://a/ana.png".into()),
+        })));
+        let follow_up = Message {
+            ts: Ts::from_micros(1_700_000_060_000_000),
+            content: RichText::plain("a minute later"),
+            ..reading_general_message()
+        };
+        app.update(Event::Slack(Update::Live(
+            slackers_slack::LiveEvent::Posted {
+                conversation: ConversationId::new("C1"),
+                message: follow_up,
+            },
+        )));
+
+        let (rows, drawn) = render(&app);
+        // The sidebar is 30 cells wide, and the message pane has a margin of 1.
+        let pane = |row: &String| row.chars().skip(31).collect::<String>();
+        let header = rows
+            .iter()
+            .map(pane)
+            .find(|row| row.contains("Ana"))
+            .unwrap();
+        // Avatar (an icon and its space, until the picture loads), a space, then the name, aligned with the text.
+        assert!(
+            header.starts_with(&format!("{} Ana", icons::AVATAR)),
+            "{header:?}"
+        );
+        let body = rows
+            .iter()
+            .map(pane)
+            .find(|row| row.contains("the only message"))
+            .unwrap();
+        assert!(body.starts_with("   the only message"), "{body:?}");
+        let grouped = rows
+            .iter()
+            .map(pane)
+            .find(|row| row.contains("a minute later"))
+            .unwrap();
+        assert!(grouped.starts_with(" · a minute later"), "{grouped:?}");
+        assert_eq!(drawn.wanted_pictures, ["https://a/ana.png"]);
     }
 
     #[test]

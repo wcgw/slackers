@@ -23,6 +23,10 @@ pub(crate) const FILE: &str = "\u{f4fb} ";
 pub(crate) const EDITED: &str = "\u{f448} ";
 /// `fa-slack`: the Workspace.
 pub(crate) const WORKSPACE: &str = "\u{f198} ";
+/// `md-account_circle`: a person, until their avatar loads.
+pub(crate) const AVATAR: &str = "\u{f0009} ";
+/// `md-robot`: a bot, until its avatar loads.
+pub(crate) const BOT: &str = "\u{f06a9} ";
 /// `md-keyboard`: Insert mode.
 pub(crate) const INSERT: &str = "\u{f030c} ";
 /// `oct-clock`: a Message on its way to Slack.

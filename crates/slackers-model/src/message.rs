@@ -30,6 +30,8 @@ pub enum Author {
     Bot {
         /// The name it posts under.
         name: String,
+        /// Where its avatar image is; `None` when it has none.
+        avatar: Option<String>,
     },
 }
 

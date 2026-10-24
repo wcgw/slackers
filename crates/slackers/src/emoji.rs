@@ -1,23 +1,15 @@
 //! Which emoji to draw how: standard emoji as their characters, Custom Emoji as pictures once loaded.
 
-use std::collections::HashMap;
-
 use emojis::SkinTone;
 use slackers_gfx::Picture;
 use slackers_model::{CustomEmoji, CustomEmojiSet, Emoji};
 
-/// A Workspace's emoji: its Custom Emoji and the pictures loaded for them, by image URL.
+use crate::pictures::{PictureState, Pictures};
+
+/// A Workspace's emoji: its Custom Emoji, by name.
 #[derive(Debug, Default)]
 pub(crate) struct Emojis {
     custom: CustomEmojiSet,
-    pictures: HashMap<String, Loading>,
-}
-
-#[derive(Debug)]
-enum Loading {
-    Pending,
-    Ready(Picture),
-    Failed,
 }
 
 /// How to draw one emoji.
@@ -39,8 +31,8 @@ impl Emojis {
         self.custom = custom;
     }
 
-    /// How to draw `emoji` right now.
-    pub(crate) fn drawable<'a>(&'a self, emoji: &'a Emoji) -> Drawable<'a> {
+    /// How to draw `emoji` right now, given the `pictures` loaded so far.
+    pub(crate) fn drawable<'a>(&'a self, emoji: &'a Emoji, pictures: &'a Pictures) -> Drawable<'a> {
         if let Some(text) = emoji.unicode.as_deref() {
             return Drawable::Text(text);
         }
@@ -58,52 +50,16 @@ impl Emojis {
         };
         // A Workspace's Custom Emoji shadow standard ones of the same name, as in Slack.
         match self.custom.resolve(&emoji.name) {
-            Some(CustomEmoji::Image { url }) => match self.pictures.get(url) {
-                Some(Loading::Ready(picture)) => Drawable::Picture(picture),
-                Some(Loading::Pending) => Drawable::Awaiting {
-                    url,
-                    requested: true,
-                },
-                Some(Loading::Failed) => Drawable::Name,
-                None => Drawable::Awaiting {
-                    url,
-                    requested: false,
-                },
+            Some(CustomEmoji::Image { url }) => match pictures.state(url) {
+                PictureState::Ready(picture) => Drawable::Picture(picture),
+                PictureState::Awaiting { requested } => Drawable::Awaiting { url, requested },
+                PictureState::Failed => Drawable::Name,
             },
             Some(CustomEmoji::Standard { name }) => {
                 standard(name).map_or(Drawable::Name, Drawable::Text)
             }
             None => standard(&emoji.name).map_or(Drawable::Name, Drawable::Text),
         }
-    }
-
-    /// Notes that the picture at `url` is being fetched. Returns whether it wasn't already: whether to fetch it.
-    pub(crate) fn request(&mut self, url: &str) -> bool {
-        if self.pictures.contains_key(url) {
-            return false;
-        }
-        self.pictures.insert(url.to_owned(), Loading::Pending);
-        true
-    }
-
-    /// Whether `url` is a picture these emoji are waiting for.
-    pub(crate) fn awaits(&self, url: &str) -> bool {
-        matches!(self.pictures.get(url), Some(Loading::Pending))
-    }
-
-    pub(crate) fn loaded(&mut self, url: String, picture: Picture) {
-        self.pictures.insert(url, Loading::Ready(picture));
-    }
-
-    /// Forgets every picture, loaded or not, so that each is fetched again when next drawn: the terminal no longer
-    /// has them.
-    pub(crate) fn forget_pictures(&mut self) {
-        self.pictures.clear();
-    }
-
-    /// Notes that the picture at `url` couldn't be loaded, so that it's drawn by name and not asked for again.
-    pub(crate) fn failed(&mut self, url: String) {
-        self.pictures.insert(url, Loading::Failed);
     }
 }
 
@@ -113,15 +69,16 @@ mod tests {
 
     #[test]
     fn standard_emoji_draw_as_text_with_skin_tones() {
-        let emojis = Emojis::default();
-        assert_eq!(emojis.drawable(&Emoji::named("+1")), Drawable::Text("👍"));
+        let (emojis, pictures) = (Emojis::default(), Pictures::default());
+        assert_eq!(
+            emojis.drawable(&Emoji::named("+1"), &pictures),
+            Drawable::Text("👍")
+        );
         let mut toned = Emoji::named("thumbsup");
         toned.skin_tone = Some(3);
-        assert_eq!(emojis.drawable(&toned), Drawable::Text("👍🏼"));
-        assert_eq!(
-            emojis.drawable(&Emoji::named("no-such-emoji")),
-            Drawable::Name
-        );
+        assert_eq!(emojis.drawable(&toned, &pictures), Drawable::Text("👍🏼"));
+        let unknown = Emoji::named("no-such-emoji");
+        assert_eq!(emojis.drawable(&unknown, &pictures), Drawable::Name);
     }
 
     #[test]
@@ -131,40 +88,32 @@ mod tests {
             skin_tone: None,
             unicode: Some("🎉".into()),
         };
-        assert_eq!(Emojis::default().drawable(&emoji), Drawable::Text("🎉"));
+        let (emojis, pictures) = (Emojis::default(), Pictures::default());
+        assert_eq!(emojis.drawable(&emoji, &pictures), Drawable::Text("🎉"));
     }
 
     #[test]
-    fn custom_emoji_await_their_picture_once() {
+    fn custom_emoji_follow_their_picture() {
         let mut emojis = Emojis::default();
         let mut custom = CustomEmojiSet::default();
         custom.insert_image("parrot", "https://e/parrot.gif");
         custom.insert_alias("yes", "white_check_mark");
         emojis.set_custom(custom);
+        let mut pictures = Pictures::default();
 
-        assert_eq!(emojis.drawable(&Emoji::named("yes")), Drawable::Text("✅"));
+        assert_eq!(
+            emojis.drawable(&Emoji::named("yes"), &pictures),
+            Drawable::Text("✅")
+        );
         let parrot = Emoji::named("parrot");
-        assert_eq!(
-            emojis.drawable(&parrot),
-            Drawable::Awaiting {
-                url: "https://e/parrot.gif",
-                requested: false
-            }
-        );
-        assert!(emojis.request("https://e/parrot.gif"));
-        assert!(
-            !emojis.request("https://e/parrot.gif"),
-            "asked for only once"
-        );
-        assert!(emojis.awaits("https://e/parrot.gif"));
-        assert_eq!(
-            emojis.drawable(&parrot),
-            Drawable::Awaiting {
-                url: "https://e/parrot.gif",
-                requested: true
-            }
-        );
-        emojis.failed("https://e/parrot.gif".into());
-        assert_eq!(emojis.drawable(&parrot), Drawable::Name);
+        let awaiting = |requested| Drawable::Awaiting {
+            url: "https://e/parrot.gif",
+            requested,
+        };
+        assert_eq!(emojis.drawable(&parrot, &pictures), awaiting(false));
+        pictures.request("https://e/parrot.gif");
+        assert_eq!(emojis.drawable(&parrot, &pictures), awaiting(true));
+        pictures.failed("https://e/parrot.gif".into());
+        assert_eq!(emojis.drawable(&parrot, &pictures), Drawable::Name);
     }
 }

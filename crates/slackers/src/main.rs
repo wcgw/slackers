@@ -13,6 +13,7 @@ mod credentials;
 mod emoji;
 mod icons;
 mod layout;
+mod pictures;
 mod search;
 mod view;
 

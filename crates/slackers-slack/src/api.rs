@@ -158,30 +158,71 @@ impl Api {
         Ok(list.into_set())
     }
 
-    /// The bytes at `url`, fetched with the session's credentials, as private files need.
+    /// The bytes at `url`. Slack's own hosts get the session's credentials, as private files need; any other host,
+    /// such as gravatar.com for avatars, gets none.
     pub(crate) async fn download(&self, url: &str) -> Result<Vec<u8>, Error> {
         let _permit = self
             .in_flight
             .acquire()
             .await
             .expect("the semaphore is never closed");
-        let response = self
-            .http
-            .get(url)
-            .bearer_auth(self.credentials.token())
-            .header(COOKIE, self.credentials.cookies())
-            .send()
-            .await?
-            .error_for_status()?;
+        let mut request = self.http.get(url);
+        if is_slack(url) {
+            request = request
+                .bearer_auth(self.credentials.token())
+                .header(COOKIE, self.credentials.cookies());
+        }
+        let response = request.send().await?.error_for_status()?;
         // Without valid credentials Slack answers 200 with its login page rather than an error.
-        let is_html = response
-            .headers()
-            .get(CONTENT_TYPE)
-            .and_then(|value| value.to_str().ok())
-            .is_some_and(|value| value.starts_with("text/html"));
-        if is_html {
+        let is_login_page = is_slack(url)
+            && response
+                .headers()
+                .get(CONTENT_TYPE)
+                .and_then(|value| value.to_str().ok())
+                .is_some_and(|value| value.starts_with("text/html"));
+        if is_login_page {
             return Err(Error::SignedOut);
         }
         Ok(response.bytes().await?.to_vec())
+    }
+}
+
+/// Whether `url` is served over HTTPS by Slack itself, and may therefore see the session's credentials.
+fn is_slack(url: &str) -> bool {
+    let Ok(url) = reqwest::Url::parse(url) else {
+        return false;
+    };
+    let host = url.host_str().unwrap_or_default();
+    url.scheme() == "https"
+        && ["slack.com", "slack-edge.com"].iter().any(|domain| {
+            host == *domain
+                || host
+                    .strip_suffix(domain)
+                    .is_some_and(|sub| sub.ends_with('.'))
+        })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn only_slack_sees_the_credentials() {
+        for url in [
+            "https://files.slack.com/files-pri/T1-F1/x.png",
+            "https://emoji.slack-edge.com/T1/parrot/abc.gif",
+            "https://slack.com/api/x",
+        ] {
+            assert!(is_slack(url), "{url}");
+        }
+        for url in [
+            "https://secure.gravatar.com/avatar/x.jpg",
+            "https://evilslack.com/x",
+            "https://slack.com.evil.org/x",
+            "http://files.slack.com/x",
+            "not a url",
+        ] {
+            assert!(!is_slack(url), "{url}");
+        }
     }
 }

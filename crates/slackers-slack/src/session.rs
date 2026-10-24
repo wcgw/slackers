@@ -31,9 +31,10 @@ pub enum Request {
     },
     /// A person's name; answered by [`Update::User`], or not at all if Slack doesn't know them.
     User(UserId),
-    /// A file, image or Custom Emoji; answered by [`Update::Downloaded`].
+    /// A file, image, avatar or Custom Emoji; answered by [`Update::Downloaded`].
     Download {
-        /// Where it is; Slack's private file URLs work, as the request carries the session's credentials.
+        /// Where it is. Requests to Slack's own hosts carry the session's credentials, so private files work;
+        /// requests elsewhere carry none.
         url: String,
     },
     /// Posts a top-level Message as the user; answered by [`Update::Posted`].
@@ -124,6 +125,8 @@ pub struct User {
     pub id: UserId,
     /// What to call them: their display name, else their full name, else their handle.
     pub name: String,
+    /// Where their avatar image is, about 48 pixels square; `None` when they have none.
+    pub avatar: Option<String>,
 }
 
 /// Something that just happened in a Workspace.

@@ -194,6 +194,9 @@ struct WireMessage {
     username: Option<String>,
     #[serde(default)]
     bot_profile: Option<BotProfile>,
+    /// An integration's avatar, when it has no bot profile.
+    #[serde(default)]
+    icons: Icons,
     #[serde(default)]
     text: String,
     #[serde(default)]
@@ -217,6 +220,26 @@ struct WireMessage {
 #[derive(Deserialize)]
 struct BotProfile {
     name: String,
+    #[serde(default)]
+    icons: Icons,
+}
+
+/// A bot's avatar, at several sizes.
+#[derive(Default, Deserialize)]
+struct Icons {
+    #[serde(default)]
+    image_48: Option<String>,
+    #[serde(default)]
+    image_72: Option<String>,
+    #[serde(default)]
+    image_36: Option<String>,
+}
+
+impl Icons {
+    /// The avatar closest to 48 pixels square.
+    fn avatar(self) -> Option<String> {
+        self.image_48.or(self.image_72).or(self.image_36)
+    }
 }
 
 #[derive(Deserialize)]
@@ -252,13 +275,15 @@ fn message(value: Value, me: &UserId) -> Option<Message> {
         )
         .ok()?;
     let ts = ts(&wire.ts);
-    let author = match (&wire.bot_profile, wire.user, wire.username) {
+    let author = match (wire.bot_profile, wire.user, wire.username) {
         (Some(bot), _, _) => Author::Bot {
-            name: bot.name.clone(),
+            name: bot.name,
+            avatar: bot.icons.avatar(),
         },
         (None, Some(user), _) => Author::User(UserId::new(user)),
         (None, None, name) => Author::Bot {
             name: name.unwrap_or_else(|| "bot".to_owned()),
+            avatar: wire.icons.avatar(),
         },
     };
     // A broadcast Reply also shows in the Conversation, so it's top-level here.
@@ -563,6 +588,8 @@ struct Profile {
     display_name: String,
     #[serde(default)]
     real_name: String,
+    #[serde(default)]
+    image_48: Option<String>,
 }
 
 impl UserInfo {
@@ -580,6 +607,7 @@ impl UserInfo {
         User {
             id: UserId::new(user.id),
             name,
+            avatar: user.profile.image_48.filter(|url| !url.is_empty()),
         }
     }
 }
@@ -841,13 +869,20 @@ mod tests {
         let message = message(
             json!({
                 "ts": "1.000000", "subtype": "bot_message", "username": "CI", "text": "*build* failed",
+                "icons": {"image_48": "https://a/48.png"},
                 "blocks": [{"type": "section", "text": {"type": "mrkdwn", "text": "ignored"}}],
                 "attachments": [{"fallback": "details"}]
             }),
             &me(),
         )
         .unwrap();
-        assert_eq!(message.author, Author::Bot { name: "CI".into() });
+        assert_eq!(
+            message.author,
+            Author::Bot {
+                name: "CI".into(),
+                avatar: Some("https://a/48.png".into())
+            }
+        );
         assert_eq!(
             message.content.blocks,
             [
@@ -949,14 +984,15 @@ mod tests {
     #[test]
     fn users_are_named_by_display_name_first() {
         let info: UserInfo = serde_json::from_value(json!({
-            "user": {"id": "U1", "name": "handle", "real_name": "Real", "profile": {"display_name": "", "real_name": "Profile Real"}}
+            "user": {"id": "U1", "name": "handle", "real_name": "Real", "profile": {"display_name": "", "real_name": "Profile Real", "image_48": "https://a/u1.png"}}
         }))
         .unwrap();
         assert_eq!(
             info.into_user(),
             User {
                 id: UserId::new("U1"),
-                name: "Profile Real".into()
+                name: "Profile Real".into(),
+                avatar: Some("https://a/u1.png".into()),
             }
         );
     }
