@@ -13,6 +13,7 @@ mod credentials;
 mod emoji;
 mod icons;
 mod layout;
+mod search;
 mod view;
 
 use std::fs::{self, OpenOptions};

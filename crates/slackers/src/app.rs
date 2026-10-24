@@ -18,6 +18,7 @@ use slackers_model::{
 use slackers_slack::{Connection, Error, LiveEvent, Request, Snapshot, Update};
 
 use crate::emoji::Emojis;
+use crate::search::{Finder, Hit};
 
 /// Something that happened, for [`App::update`] to react to.
 #[derive(Debug)]
@@ -86,6 +87,18 @@ pub(crate) enum Mode {
     Insert,
     /// Keys write a command, shown after `:` on the status line.
     Command(String),
+    /// Keys narrow the sidebar down to the Conversations matching a query, shown after `/` on the status line.
+    Search(Search),
+}
+
+/// A search of the sidebar under way.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) struct Search {
+    pub(crate) query: String,
+    /// The matching Conversations, best first; each [`Hit::index`] is a position in the sidebar.
+    pub(crate) hits: Vec<Hit>,
+    /// The hit under the cursor.
+    pub(crate) selected: usize,
 }
 
 /// Which pane Normal mode's keys move around.
@@ -155,6 +168,7 @@ pub(crate) struct App {
     awaiting_chord: bool,
     /// Whether the terminal window has focus. Messages count as read only while it does.
     focused: bool,
+    finder: Finder,
     /// The last [`Drawn`] report.
     drawn: Drawn,
     /// When animations started; every picture is drawn against it, so copies of one emoji animate in step.
@@ -181,6 +195,7 @@ impl App {
             next_post: 0,
             awaiting_chord: false,
             focused: true,
+            finder: Finder::new(),
             drawn: Drawn::default(),
             epoch: Instant::now(),
         }
@@ -206,6 +221,11 @@ impl App {
     /// What to call `user`: their name once looked up, else their id.
     pub(crate) fn user_name<'a>(&'a self, user: &'a UserId) -> &'a str {
         self.users.get(user).map_or(user.as_str(), String::as_str)
+    }
+
+    /// What to call `conversation`: a DM after the other person, anything else by its name.
+    pub(crate) fn conversation_name<'a>(&'a self, conversation: &'a Conversation) -> &'a str {
+        conversation_name(&self.users, conversation)
     }
 
     /// The open Conversation's draft, if it has one.
@@ -250,6 +270,8 @@ impl App {
             }
         }
         self.mark_seen(&mut commands);
+        // People's names keep arriving: keep a search's hits current.
+        self.refresh_search();
         commands
     }
 
@@ -258,6 +280,7 @@ impl App {
             Mode::Normal => self.normal_key(key, commands),
             Mode::Insert => self.insert_key(key, commands),
             Mode::Command(_) => self.command_key(key, commands),
+            Mode::Search(_) => self.search_key(key, commands),
         }
     }
 
@@ -270,6 +293,15 @@ impl App {
             }
             (KeyCode::Char(':'), false) => {
                 self.mode = Mode::Command(String::new());
+                return;
+            }
+            (KeyCode::Char('/'), false) => {
+                self.mode = Mode::Search(Search {
+                    query: String::new(),
+                    hits: Vec::new(),
+                    selected: 0,
+                });
+                self.focus = Focus::Sidebar;
                 return;
             }
             (KeyCode::Char('i'), false) => {
@@ -390,6 +422,69 @@ impl App {
             (KeyCode::Char(c), false) => line.push(c),
             _ => {}
         }
+    }
+
+    fn search_key(&mut self, key: KeyEvent, commands: &mut Vec<Command>) {
+        let Mode::Search(search) = &mut self.mode else {
+            return;
+        };
+        let control = key.modifiers.contains(KeyModifiers::CONTROL);
+        match (key.code, control) {
+            (KeyCode::Esc, _) | (KeyCode::Char('c'), true) => self.mode = Mode::Normal,
+            (KeyCode::Down, _) | (KeyCode::Char('n' | 'j'), true) => {
+                search.selected = (search.selected + 1).min(search.hits.len().saturating_sub(1));
+            }
+            (KeyCode::Up, _) | (KeyCode::Char('p' | 'k'), true) => {
+                search.selected = search.selected.saturating_sub(1);
+            }
+            (KeyCode::Backspace, _) => {
+                if search.query.pop().is_none() {
+                    self.mode = Mode::Normal;
+                } else {
+                    search.selected = 0;
+                }
+            }
+            (KeyCode::Enter, _) => {
+                let chosen = search.hits.get(search.selected).map(|hit| hit.index);
+                let query = std::mem::take(&mut search.query);
+                self.mode = Mode::Normal;
+                let id = chosen.and_then(|index| {
+                    self.selected = index;
+                    self.workspace()?
+                        .conversations
+                        .get(index)
+                        .map(|c| c.id.clone())
+                });
+                match id {
+                    Some(id) => {
+                        self.open(id, commands);
+                        self.focus = Focus::Timeline;
+                    }
+                    None => self.notice = Some(format!("no conversation matches /{query}")),
+                }
+            }
+            (KeyCode::Char(c), false) => {
+                search.query.push(c);
+                search.selected = 0;
+            }
+            _ => {}
+        }
+    }
+
+    /// Re-ranks the sidebar against the search query, if a search is under way.
+    fn refresh_search(&mut self) {
+        let Mode::Search(search) = &mut self.mode else {
+            return;
+        };
+        let Phase::Ready(workspace) = &self.phase else {
+            return;
+        };
+        let names = workspace
+            .conversations
+            .iter()
+            .map(|c| conversation_name(&self.users, c));
+        search.hits = self.finder.rank(&search.query, names);
+        search.selected = search.selected.min(search.hits.len().saturating_sub(1));
     }
 
     /// Posts the draft for `conversation`, unless it's blank, and empties it.
@@ -697,6 +792,18 @@ impl App {
                 commands.push(Command::Slack(Request::User(person)));
             }
         }
+    }
+}
+
+/// What to call `conversation`, given the people known by name: a DM after the other person, anything else by its
+/// name.
+fn conversation_name<'a>(
+    users: &'a HashMap<UserId, String>,
+    conversation: &'a Conversation,
+) -> &'a str {
+    match &conversation.kind {
+        ConversationKind::Dm { with } => users.get(with).map_or(with.as_str(), String::as_str),
+        ConversationKind::Channel { .. } | ConversationKind::GroupDm => &conversation.name,
     }
 }
 
@@ -1079,6 +1186,85 @@ mod tests {
 
         keys(&mut app, ":q");
         assert_eq!(app.update(key(KeyCode::Enter)), [Command::Quit]);
+    }
+
+    fn hit_names(app: &App) -> Vec<String> {
+        let Mode::Search(search) = &app.mode else {
+            panic!("not searching: {:?}", app.mode)
+        };
+        let workspace = app.workspace().unwrap();
+        search
+            .hits
+            .iter()
+            .map(|hit| {
+                app.conversation_name(&workspace.conversations[hit.index])
+                    .to_owned()
+            })
+            .collect()
+    }
+
+    #[test]
+    fn slash_narrows_the_sidebar_and_enter_opens_the_pick() {
+        let (mut app, _) = ready_app();
+        app.focus = Focus::Timeline;
+        keys(&mut app, "/");
+        assert_eq!(app.focus, Focus::Sidebar);
+        assert_eq!(
+            hit_names(&app),
+            ["general", "random", "U9"],
+            "everything, before typing"
+        );
+
+        app.update(Event::Slack(Update::User(slackers_slack::User {
+            id: UserId::new("U9"),
+            name: "Rand Al'Thor".into(),
+        })));
+        keys(&mut app, "ran");
+        assert_eq!(
+            hit_names(&app),
+            ["random", "Rand Al'Thor"],
+            "DMs match by the person's name"
+        );
+
+        app.update(control('n'));
+        let commands = app.update(key(KeyCode::Enter));
+        assert_eq!(app.mode, Mode::Normal);
+        assert_eq!(app.open, Some(c("D1")));
+        assert_eq!(app.selected, 2);
+        assert_eq!(app.focus, Focus::Timeline);
+        assert_eq!(
+            commands,
+            [Command::Slack(Request::History {
+                conversation: c("D1"),
+                before: None
+            })]
+        );
+    }
+
+    #[test]
+    fn escape_and_backspacing_past_the_slash_cancel_a_search() {
+        let (mut app, _) = ready_app();
+        keys(&mut app, "/gen");
+        app.update(key(KeyCode::Esc));
+        assert_eq!(
+            (&app.mode, app.selected, &app.open),
+            (&Mode::Normal, 1, &None)
+        );
+
+        keys(&mut app, "/g");
+        app.update(key(KeyCode::Backspace));
+        assert_eq!(hit_names(&app).len(), 3);
+        app.update(key(KeyCode::Backspace));
+        assert_eq!(app.mode, Mode::Normal);
+    }
+
+    #[test]
+    fn a_search_without_hits_says_so() {
+        let (mut app, _) = ready_app();
+        keys(&mut app, "/zzz");
+        assert!(hit_names(&app).is_empty());
+        assert!(app.update(key(KeyCode::Enter)).is_empty());
+        assert_eq!(app.notice.as_deref(), Some("no conversation matches /zzz"));
     }
 
     #[test]

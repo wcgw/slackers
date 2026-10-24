@@ -36,6 +36,7 @@ const LINK: Style = Style::new()
     .add_modifier(Modifier::UNDERLINED);
 const CODE: Style = Style::new().fg(Color::LightRed);
 const ALERT: Style = Style::new().fg(Color::Red);
+const MATCH: Style = Style::new().fg(Color::Yellow).add_modifier(Modifier::BOLD);
 
 /// Draws `app` on `frame`, and reports what only drawing can tell.
 pub(crate) fn draw(frame: &mut Frame<'_>, app: &App) -> Drawn {
@@ -105,20 +106,37 @@ fn draw_sidebar(frame: &mut Frame<'_>, area: Rect, app: &App, workspace: &Worksp
     ]);
     frame.render_widget(Paragraph::new(title), header);
 
-    // Keep the selection in view.
+    // What to list, in which order, where the cursor is, and which characters matched a search.
+    let (entries, cursor): (Vec<(usize, &[usize])>, usize) = match &app.mode {
+        Mode::Search(search) => (
+            search
+                .hits
+                .iter()
+                .map(|hit| (hit.index, hit.positions.as_slice()))
+                .collect(),
+            search.selected,
+        ),
+        _ => (
+            (0..workspace.conversations.len())
+                .map(|index| (index, &[][..]))
+                .collect(),
+            app.selected,
+        ),
+    };
+    // Keep the cursor in view.
     let rows = usize::from(list.height);
-    let first = (app.selected + 1).saturating_sub(rows);
-    let lines: Vec<Line<'_>> = workspace
-        .conversations
+    let first = (cursor + 1).saturating_sub(rows);
+    let lines: Vec<Line<'_>> = entries
         .iter()
         .enumerate()
         .skip(first)
         .take(rows)
-        .map(|(index, conversation)| {
+        .map(|(row, &(index, matched))| {
+            let conversation = &workspace.conversations[index];
             let activity = workspace.activity.get(&conversation.id);
-            let line = sidebar_row(app, conversation, activity, list.width);
+            let line = sidebar_row(app, conversation, activity, matched, list.width);
             let is_open = app.open.as_ref() == Some(&conversation.id);
-            match (index == app.selected, app.focus) {
+            match (row == cursor, app.focus) {
                 (true, Focus::Sidebar) => {
                     line.patch_style(Style::new().add_modifier(Modifier::REVERSED))
                 }
@@ -134,20 +152,22 @@ fn draw_sidebar(frame: &mut Frame<'_>, area: Rect, app: &App, workspace: &Worksp
 
 /// The icon for `conversation`'s kind, and what to call it.
 fn label<'a>(app: &'a App, conversation: &'a Conversation) -> (&'static str, &'a str) {
-    match &conversation.kind {
-        ConversationKind::Channel { private: false } => (icons::CHANNEL, &conversation.name),
-        ConversationKind::Channel { private: true } => (icons::PRIVATE_CHANNEL, &conversation.name),
-        ConversationKind::Dm { with } => (icons::DM, app.user_name(with)),
-        ConversationKind::GroupDm => (icons::GROUP_DM, &conversation.name),
-    }
+    let icon = match &conversation.kind {
+        ConversationKind::Channel { private: false } => icons::CHANNEL,
+        ConversationKind::Channel { private: true } => icons::PRIVATE_CHANNEL,
+        ConversationKind::Dm { .. } => icons::DM,
+        ConversationKind::GroupDm => icons::GROUP_DM,
+    };
+    (icon, app.conversation_name(conversation))
 }
 
-/// One sidebar entry: an icon for its kind, its name, bold when unread, and on the right its Mentions, or a dot
-/// when only unread.
+/// One sidebar entry: an icon for its kind, its name (bold when unread, with `matched` characters highlighted),
+/// and on the right its Mentions, or a dot when only unread.
 fn sidebar_row<'a>(
     app: &'a App,
     conversation: &'a Conversation,
     activity: Option<&Activity>,
+    matched: &[usize],
     width: u16,
 ) -> Line<'a> {
     let (icon, name) = label(app, conversation);
@@ -163,23 +183,47 @@ fn sidebar_row<'a>(
     } else {
         DIM
     };
+
+    // The name, cut to fit with an ellipsis, in runs of matched and unmatched characters.
     let room = usize::from(width).saturating_sub(2 + badge.width() + 1);
-    let mut shown = String::new();
-    for c in name.chars() {
-        if shown.width() + unicode_width::UnicodeWidthChar::width(c).unwrap_or(0) > room {
-            shown.pop();
-            shown.push('…');
+    let limit = if name.width() > room {
+        room.saturating_sub(1)
+    } else {
+        room
+    };
+    let mut spans = vec![Span::styled(icon, if unread { ACCENT } else { DIM })];
+    let (mut run, mut run_matched, mut used) = (String::new(), false, 0);
+    for (index, c) in name.chars().enumerate() {
+        let cells = unicode_width::UnicodeWidthChar::width(c).unwrap_or(0);
+        if used + cells > limit {
             break;
         }
-        shown.push(c);
+        let is_match = matched.binary_search(&index).is_ok();
+        if is_match != run_matched && !run.is_empty() {
+            let style = if run_matched {
+                name_style.patch(MATCH)
+            } else {
+                name_style
+            };
+            spans.push(Span::styled(std::mem::take(&mut run), style));
+        }
+        run_matched = is_match;
+        run.push(c);
+        used += cells;
     }
-    let padding = room.saturating_sub(shown.width()) + 1;
-    Line::from(vec![
-        Span::styled(icon, if unread { ACCENT } else { DIM }),
-        Span::styled(shown, name_style),
-        Span::raw(" ".repeat(padding)),
-        Span::styled(badge, badge_style),
-    ])
+    let style = if run_matched {
+        name_style.patch(MATCH)
+    } else {
+        name_style
+    };
+    spans.push(Span::styled(run, style));
+    if limit < room {
+        spans.push(Span::styled("…", name_style));
+        used += 1;
+    }
+    spans.push(Span::raw(" ".repeat(room.saturating_sub(used) + 1)));
+    spans.push(Span::styled(badge, badge_style));
+    Line::from(spans)
 }
 
 fn draw_timeline(
@@ -517,14 +561,29 @@ impl<'a> Renderer<'a> {
 }
 
 fn draw_status(frame: &mut Frame<'_>, area: Rect, app: &App) {
-    // Command mode takes the whole line, as in vim.
-    if let Mode::Command(line) = &app.mode {
-        let command = Line::from(vec![
-            Span::raw(format!(":{line}")),
-            Span::styled(" ", Style::new().add_modifier(Modifier::REVERSED)),
-        ]);
-        frame.render_widget(Paragraph::new(command), area);
-        return;
+    // Command and Search modes take the line, as in vim.
+    let cursor = Span::styled(" ", Style::new().add_modifier(Modifier::REVERSED));
+    match &app.mode {
+        Mode::Command(line) => {
+            let command = Line::from(vec![Span::raw(format!(":{line}")), cursor]);
+            frame.render_widget(Paragraph::new(command), area);
+            return;
+        }
+        Mode::Search(search) => {
+            let query = Line::from(vec![Span::raw(format!("/{}", search.query)), cursor]);
+            let total = app.workspace().map_or(0, |w| w.conversations.len());
+            let hints = format!(
+                "{} of {total} · ⏎ open · ^n/^p next/previous · esc cancel",
+                search.hits.len()
+            );
+            frame.render_widget(Paragraph::new(query), area);
+            frame.render_widget(
+                Paragraph::new(Line::styled(hints, DIM)).alignment(Alignment::Right),
+                area,
+            );
+            return;
+        }
+        Mode::Normal | Mode::Insert => {}
     }
     let (icon, state, style) = match (&app.phase, app.connection) {
         (Phase::SigningIn, _) | (Phase::Ready(_), None) => {
@@ -560,7 +619,7 @@ fn draw_status(frame: &mut Frame<'_>, area: Rect, app: &App) {
     }
     let hints = match (&app.mode, app.focus) {
         (Mode::Insert, _) => "⏎ send · ⇧⏎ new line · ^x^e $EDITOR · esc normal",
-        (_, Focus::Sidebar) => "j/k select · ⏎ open · i write · tab messages · :q quit",
+        (_, Focus::Sidebar) => "j/k select · ⏎ open · / search · i write · tab messages · :q quit",
         (_, Focus::Timeline) => "k/j scroll · ^u/^d page · g/G oldest/newest · i write · :q quit",
     };
     frame.render_widget(Paragraph::new(Line::from(left)), area);
@@ -733,6 +792,27 @@ mod tests {
         let rows = screen(&app);
         assert!(rows.iter().any(|row| row.contains("hello")));
         assert!(!rows.last().unwrap().contains("INSERT"));
+    }
+
+    #[test]
+    fn searching_lists_only_hits_and_shows_the_query() {
+        let mut app = reading_general();
+        type_text(&mut app, "/gnl");
+        let rows = screen(&app);
+        assert!(rows.iter().any(|row| row.contains("general")));
+        let status = rows.last().unwrap();
+        assert!(status.starts_with("/gnl"), "{status}");
+        assert!(status.contains("1 of 1"), "{status}");
+
+        type_text(&mut app, "x");
+        let rows = screen(&app);
+        assert!(
+            !rows[1..rows.len() - 1]
+                .iter()
+                .any(|row| row.starts_with("\u{f4df}")),
+            "{rows:#?}"
+        );
+        assert!(rows.last().unwrap().contains("0 of 1"));
     }
 
     #[test]

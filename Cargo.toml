@@ -20,6 +20,7 @@ emojis = "0.9.1"
 futures-util = { version = "0.3.34", default-features = false, features = ["sink", "std"] }
 image = { version = "0.25.10", default-features = false, features = ["gif", "jpeg", "png"] }
 ratatui-textarea = "0.9.3"
+nucleo-matcher = "0.3.1"
 jiff = "0.2.38"
 ratatui = "0.30.2"
 reqwest = { version = "0.13.5", features = ["form", "json"] }
