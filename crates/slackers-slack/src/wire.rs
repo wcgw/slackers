@@ -170,6 +170,62 @@ pub(crate) fn snapshot(auth: AuthTest, boot: UserBoot, counts: Counts) -> Snapsh
     }
 }
 
+/// `conversations.info`'s reply.
+#[derive(Deserialize)]
+pub(crate) struct ConversationInfo {
+    channel: InfoChannel,
+}
+
+#[derive(Deserialize)]
+struct InfoChannel {
+    id: String,
+    #[serde(default)]
+    name: String,
+    #[serde(default)]
+    is_im: bool,
+    /// The other person in a DM.
+    #[serde(default)]
+    user: Option<String>,
+    #[serde(default)]
+    is_mpim: bool,
+    #[serde(default)]
+    is_private: bool,
+    #[serde(default)]
+    is_archived: bool,
+    /// Absent for a DM, which the user is always in.
+    #[serde(default)]
+    is_member: Option<bool>,
+    #[serde(default)]
+    last_read: String,
+}
+
+impl ConversationInfo {
+    /// The Conversation as the sidebar lists it, with its Activity up to its Read Marker; `None` when the sidebar
+    /// wouldn't list it: it's archived, or the user isn't in it.
+    pub(crate) fn into_listed(self) -> Option<(Conversation, Activity)> {
+        let channel = self.channel;
+        if channel.is_archived || channel.is_member == Some(false) {
+            return None;
+        }
+        let (kind, name) = if channel.is_im {
+            let with = UserId::new(channel.user?);
+            (ConversationKind::Dm { with }, String::new())
+        } else if channel.is_mpim {
+            (ConversationKind::GroupDm, group_dm_name(&channel.name))
+        } else {
+            let private = channel.is_private;
+            (ConversationKind::Channel { private }, channel.name)
+        };
+        let read = ts(&channel.last_read);
+        let conversation = Conversation {
+            id: ConversationId::new(channel.id),
+            kind,
+            name,
+        };
+        Some((conversation, Activity::counted(read, read, false, 0)))
+    }
+}
+
 /// `mpdm-alice--bob--carol-1` as `alice, bob, carol`.
 fn group_dm_name(slack_name: &str) -> String {
     let members = slack_name.strip_prefix("mpdm-").unwrap_or(slack_name);
@@ -693,6 +749,8 @@ pub(crate) enum SocketMessage {
     /// Where to reconnect, should this connection drop.
     ReconnectUrl(String),
     Live(LiveEvent),
+    /// A Conversation appeared in the user's sidebar: they joined a Channel, or a DM opened.
+    Appeared(ConversationId),
     /// Anything we don't follow.
     Ignored,
 }
@@ -749,6 +807,15 @@ pub(crate) fn socket_message(frame: &str, me: &UserId) -> SocketMessage {
             conversation: conversation(),
             up_to: ts(text("ts")),
         },
+        "channel_joined" | "group_joined" | "mpim_joined" | "im_created" | "im_open"
+        | "mpim_open" => {
+            // Some carry the Conversation, others only its id.
+            let channel = &event["channel"];
+            return match channel["id"].as_str().or_else(|| channel.as_str()) {
+                Some(id) => SocketMessage::Appeared(ConversationId::new(id)),
+                None => SocketMessage::Ignored,
+            };
+        }
         _ => return SocketMessage::Ignored,
     };
     SocketMessage::Live(live)
@@ -1029,7 +1096,75 @@ mod tests {
             socket_message(r#"{"type":"user_typing"}"#, &me()),
             SocketMessage::Ignored
         );
+        assert_eq!(
+            socket_message(
+                r#"{"type":"channel_joined","channel":{"id":"C9","name":"new"}}"#,
+                &me()
+            ),
+            SocketMessage::Appeared(ConversationId::new("C9"))
+        );
+        assert_eq!(
+            socket_message(r#"{"type":"im_open","user":"U2","channel":"D9"}"#, &me()),
+            SocketMessage::Appeared(ConversationId::new("D9"))
+        );
+        assert_eq!(
+            socket_message(r#"{"type":"mpim_joined"}"#, &me()),
+            SocketMessage::Ignored
+        );
         assert_eq!(socket_message("not json", &me()), SocketMessage::Ignored);
+    }
+
+    #[test]
+    fn conversation_info_lists_what_the_sidebar_would() {
+        let listed = |channel: Value| {
+            let info: ConversationInfo =
+                serde_json::from_value(json!({ "channel": channel })).unwrap();
+            info.into_listed()
+        };
+        let (dm, activity) =
+            listed(json!({"id": "D9", "is_im": true, "user": "U2", "last_read": "4.000000"}))
+                .unwrap();
+        assert_eq!(
+            (dm.kind, dm.name.as_str()),
+            (
+                ConversationKind::Dm {
+                    with: UserId::new("U2")
+                },
+                ""
+            )
+        );
+        assert_eq!(
+            (activity.read_up_to(), activity.has_unread()),
+            (seconds(4), false)
+        );
+
+        let (channel, _) =
+            listed(json!({"id": "C9", "name": "new", "is_private": true, "is_member": true}))
+                .unwrap();
+        assert_eq!(
+            (channel.kind, channel.name.as_str()),
+            (ConversationKind::Channel { private: true }, "new")
+        );
+        let (group, _) =
+            listed(json!({"id": "G9", "name": "mpdm-ana--bo-1", "is_mpim": true})).unwrap();
+        assert_eq!(
+            (group.kind, group.name.as_str()),
+            (ConversationKind::GroupDm, "ana, bo")
+        );
+
+        assert_eq!(
+            listed(json!({"id": "C8", "name": "x", "is_member": false})),
+            None
+        );
+        assert_eq!(
+            listed(json!({"id": "C7", "name": "x", "is_archived": true})),
+            None
+        );
+        assert_eq!(
+            listed(json!({"id": "D8", "is_im": true})),
+            None,
+            "a DM with nobody"
+        );
     }
 
     #[test]

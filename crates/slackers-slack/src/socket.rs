@@ -5,12 +5,13 @@ use std::time::Duration;
 
 use futures_util::{SinkExt as _, StreamExt as _};
 use slackers_model::{UserId, WorkspaceId};
+use tokio::sync::mpsc;
 use tokio_tungstenite::tungstenite::client::IntoClientRequest as _;
 use tokio_tungstenite::tungstenite::http::HeaderValue;
 use tokio_tungstenite::tungstenite::{self, Message};
 
 use crate::Credentials;
-use crate::session::{Connection, Notify, Update};
+use crate::session::{Connection, Heard, Notify, Update};
 use crate::wire::{SocketMessage, socket_message};
 
 /// How often to ping Slack, so that it, and anything in between, keeps the connection open.
@@ -19,12 +20,13 @@ const PING_EVERY: Duration = Duration::from_secs(30);
 /// The longest wait between reconnection attempts.
 const MAX_BACKOFF: Duration = Duration::from_secs(60);
 
-/// Follows the Workspace's live events forever, reconnecting with backoff whenever the connection drops. Runs
-/// until its task is aborted.
+/// Follows the Workspace's live events forever, reconnecting with backoff whenever the connection drops. What it
+/// hears goes to `heard`; how the connection stands, to `notify`. Runs until its task is aborted.
 pub(crate) async fn follow(
     credentials: Credentials,
     gateway: WorkspaceId,
     me: UserId,
+    heard: mpsc::UnboundedSender<Heard>,
     notify: Notify,
 ) {
     let Ok(cookies) = HeaderValue::from_str(credentials.cookies()) else {
@@ -46,6 +48,7 @@ pub(crate) async fn follow(
             &url,
             &cookies,
             &me,
+            &heard,
             &notify,
             &mut reconnect_url,
             &mut attempt,
@@ -69,6 +72,7 @@ async fn connect_and_read(
     url: &str,
     cookies: &HeaderValue,
     me: &UserId,
+    heard: &mpsc::UnboundedSender<Heard>,
     notify: &Notify,
     reconnect_url: &mut Option<String>,
     attempt: &mut u32,
@@ -91,7 +95,13 @@ async fn connect_and_read(
                         notify(Update::Connection(Connection::Live));
                     }
                     SocketMessage::ReconnectUrl(url) => *reconnect_url = Some(url),
-                    SocketMessage::Live(event) => notify(Update::Live(event)),
+                    // Sending fails only once the Session is stopping.
+                    SocketMessage::Live(event) => {
+                        let _ = heard.send(Heard::Event(event));
+                    }
+                    SocketMessage::Appeared(conversation) => {
+                        let _ = heard.send(Heard::Appeared(conversation));
+                    }
                     SocketMessage::Ignored => {}
                 },
                 Some(Ok(_)) => {}

@@ -7,11 +7,13 @@ use reqwest::StatusCode;
 use reqwest::header::{CONTENT_TYPE, COOKIE, RETRY_AFTER};
 use serde::de::DeserializeOwned;
 use serde_json::Value;
-use slackers_model::{ConversationId, CustomEmojiSet, Message, Ts, UserId};
+use slackers_model::{Activity, Conversation, ConversationId, CustomEmojiSet, Message, Ts, UserId};
 use tokio::sync::Semaphore;
 
 use crate::session::{HistoryPage, Snapshot, User};
-use crate::wire::{AuthTest, Counts, EmojiList, History, Posted, Replies, UserBoot, UserInfo};
+use crate::wire::{
+    AuthTest, ConversationInfo, Counts, EmojiList, History, Posted, Replies, UserBoot, UserInfo,
+};
 use crate::{Credentials, Error};
 
 const BASE: &str = "https://slack.com/api";
@@ -117,6 +119,18 @@ impl Api {
         }
         let history: History = self.call("conversations.history", &params).await?;
         Ok(history.into_page(me))
+    }
+
+    /// The Conversation `id` as the sidebar lists it, with its Activity up to its Read Marker; `None` when the
+    /// sidebar wouldn't list it, being archived or not the user's.
+    pub(crate) async fn conversation(
+        &self,
+        id: &ConversationId,
+    ) -> Result<Option<(Conversation, Activity)>, Error> {
+        let info: ConversationInfo = self
+            .call("conversations.info", &[("channel", id.as_str())])
+            .await?;
+        Ok(info.into_listed())
     }
 
     pub(crate) async fn user(&self, id: &UserId) -> Result<User, Error> {

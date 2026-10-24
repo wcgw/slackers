@@ -1176,7 +1176,21 @@ impl App {
         let Some(workspace) = self.workspaces.get_mut(key) else {
             return;
         };
+        let mut joined = false;
         match event {
+            LiveEvent::Joined {
+                conversation,
+                activity,
+            } => {
+                let partner = match &conversation.kind {
+                    ConversationKind::Dm { with } => Some(with.clone()),
+                    ConversationKind::Channel { .. } | ConversationKind::GroupDm => None,
+                };
+                joined = workspace.join(conversation, activity);
+                if joined {
+                    workspace.want_users(key, partner, commands);
+                }
+            }
             LiveEvent::Posted {
                 conversation,
                 message,
@@ -1232,6 +1246,9 @@ impl App {
                 }
             }
         }
+        if joined {
+            self.list_sidebar();
+        }
     }
 }
 
@@ -1241,7 +1258,6 @@ impl Workspace {
     fn new(snapshot: Snapshot) -> Self {
         let mut conversations = snapshot.conversations;
         conversations.sort_by(|(a, a_activity), (b, b_activity)| {
-            let is_dm = |c: &Conversation| !matches!(c.kind, ConversationKind::Channel { .. });
             is_dm(a).cmp(&is_dm(b)).then_with(|| {
                 if is_dm(a) {
                     b_activity.latest().cmp(&a_activity.latest())
@@ -1269,6 +1285,25 @@ impl Workspace {
             loading: HashSet::new(),
             loading_threads: HashSet::new(),
         }
+    }
+
+    /// Lists `conversation`, which just appeared, with its `activity`: a Channel among the Channels by name, a DM
+    /// first among the DMs, as the most recently active. Returns whether it wasn't listed yet.
+    fn join(&mut self, conversation: Conversation, activity: Activity) -> bool {
+        if self.conversation(&conversation.id).is_some() {
+            return false;
+        }
+        let at = if is_dm(&conversation) {
+            self.conversations.iter().position(is_dm)
+        } else {
+            self.conversations
+                .iter()
+                .position(|listed| is_dm(listed) || listed.name > conversation.name)
+        };
+        self.activity.insert(conversation.id.clone(), activity);
+        self.conversations
+            .insert(at.unwrap_or(self.conversations.len()), conversation);
+        true
     }
 
     /// The Conversation with `id`, if the Workspace lists it.
@@ -1358,6 +1393,11 @@ fn move_in(pane: &mut Pane, timeline: &Timeline, key: KeyEvent) {
         (KeyCode::Char('G') | KeyCode::End, false) => pane.newest(),
         _ => {}
     }
+}
+
+/// Whether `conversation` is a DM or a group DM, which the sidebar lists after the Channels.
+fn is_dm(conversation: &Conversation) -> bool {
+    !matches!(conversation.kind, ConversationKind::Channel { .. })
 }
 
 /// `text`'s first word, and the rest without leading spaces.
@@ -2210,6 +2250,56 @@ mod tests {
         keys(&mut app, "/gen");
         app.update(key(KeyCode::Enter));
         assert_eq!((app.open_thread, &app.open), (None, &Some(c("C1"))));
+    }
+
+    #[test]
+    fn a_conversation_that_appears_joins_the_sidebar_where_it_belongs() {
+        let later = VirtualWorkspace {
+            name: "K".into(),
+            channels: vec![ChannelRef {
+                workspace: "test".into(),
+                channel: "later".into(),
+            }],
+        };
+        let mut app = App::new(vec!["test".into()], vec![later]);
+        app.update(slack(Update::Ready(Box::new(test_snapshot()))));
+        let joined = |conversation| {
+            slack(Update::Live(LiveEvent::Joined {
+                conversation,
+                activity: Activity::default(),
+            }))
+        };
+        let dm = ConversationKind::Dm {
+            with: UserId::new("U8"),
+        };
+        let commands = app.update(joined(conversation("D7", dm.clone(), "")));
+        assert_eq!(commands, [ask(Request::User(UserId::new("U8")))]);
+        assert_eq!(
+            sidebar(&app),
+            [">K", ">test", "general", "random", "U8", "U9"]
+        );
+
+        app.update(joined(channel("C3", "alpha")));
+        app.update(joined(channel("C4", "later")));
+        assert_eq!(
+            sidebar(&app),
+            [
+                ">K", "later", ">test", "alpha", "general", "random", "U8", "U9"
+            ],
+            "into its virtual workspace, as the config says"
+        );
+        assert!(
+            app.update(joined(conversation("D7", dm, ""))).is_empty(),
+            "only once"
+        );
+        assert_eq!(sidebar(&app).len(), 8);
+
+        let posted = LiveEvent::Posted {
+            conversation: id("D7"),
+            message: message(20, "U8", RichText::plain("hello")),
+        };
+        app.update(slack(Update::Live(posted)));
+        assert_eq!(workspace(&app, W0).activity[&id("D7")].mentions(), 1);
     }
 
     #[test]
