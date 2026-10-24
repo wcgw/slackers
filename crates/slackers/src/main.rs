@@ -1,14 +1,16 @@
 //! slackers: a terminal Slack client that groups Conversations by subject across Workspaces.
 //!
 //! ```sh
-//! slackers WORKSPACE
+//! slackers [WORKSPACE…]
 //! ```
 //!
-//! signs in to `WORKSPACE` with the credentials stored in the keyring under that name (see [`credentials`]). Keys
+//! signs in to each `WORKSPACE` with the credentials stored in the keyring under that name (see [`credentials`]),
+//! or to the `workspaces` the config file lists (see [`config`]), and shows the Virtual Workspaces it defines. Keys
 //! work as in vim (see [`app`]); `:q` quits. Logs go to `$XDG_STATE_HOME/slackers/slackers.log`; `RUST_LOG` sets
 //! their level.
 
 mod app;
+mod config;
 mod credentials;
 mod emoji;
 mod icons;
@@ -16,9 +18,11 @@ mod layout;
 mod pane;
 mod pictures;
 mod search;
+mod sidebar;
 mod theme;
 mod view;
 
+use std::collections::HashMap;
 use std::fs::{self, OpenOptions};
 use std::io::{self, Write as _};
 use std::os::unix::fs::OpenOptionsExt as _;
@@ -43,21 +47,36 @@ use slackers_slack::{Credentials, Session};
 use tokio::sync::mpsc;
 use tracing_subscriber::EnvFilter;
 
-use crate::app::{App, Command, Drawn, Event, Place};
+use crate::app::{App, Command, Drawn, Event, Place, WorkspaceKey};
+use crate::config::Config;
 
 fn main() -> Result<()> {
-    let label = std::env::args()
-        .nth(1)
-        .context("usage: slackers WORKSPACE")?;
+    let config_path = config::path()?;
+    let config = Config::load(&config_path)?;
+    let named: Vec<String> = std::env::args().skip(1).collect();
+    let labels = if named.is_empty() {
+        config.workspaces
+    } else {
+        named
+    };
+    ensure!(
+        !labels.is_empty(),
+        "usage: slackers WORKSPACE…, or list workspaces = [\"WORKSPACE\", …] in {}",
+        config_path.display()
+    );
     start_logging()?;
     // Before the runtime starts: reading the keyring blocks.
-    let credentials = credentials::load(&label)?;
+    let credentials = labels
+        .iter()
+        .map(|label| credentials::load(label))
+        .collect();
+    let app = App::new(labels, config.virtual_workspaces);
     let runtime = tokio::runtime::Runtime::new()?;
 
     let mut terminal = ratatui::try_init()?;
     terminal_extras(true)?;
     let cell = CellSize::query();
-    let outcome = runtime.block_on(run(&mut terminal, label, credentials, cell));
+    let outcome = runtime.block_on(run(&mut terminal, app, credentials, config_path, cell));
     // Best effort on the way out: the terminal drops these with its screen anyway.
     let _ = terminal_extras(false);
     let _ = slackers_gfx::forget_all(&mut io::stdout());
@@ -93,28 +112,43 @@ enum Inbox {
     },
 }
 
-/// Runs the app until the user quits.
+/// Runs `app` until the user quits, signing in to each of its Workspaces with the `credentials` at the same place.
 async fn run(
     terminal: &mut DefaultTerminal,
-    label: String,
-    credentials: Credentials,
+    mut app: App,
+    credentials: Vec<Result<Credentials>>,
+    config: PathBuf,
     cell: CellSize,
 ) -> Result<()> {
     let (inbox, mut received) = mpsc::unbounded_channel();
-    let session = {
-        let inbox = inbox.clone();
-        // Runs on the Session's tasks. Sending fails only once the loop below has ended.
-        Session::start(credentials, move |update| {
-            let _ = inbox.send(Inbox::App(Event::Slack(update)));
-        })
-    };
+    let mut sessions = HashMap::new();
+    for (key, credentials) in app.workspace_keys().zip(credentials) {
+        match credentials {
+            Ok(credentials) => {
+                let inbox = inbox.clone();
+                // Runs on the Session's tasks. Sending fails only once the loop below has ended.
+                let session = Session::start(credentials, move |update| {
+                    let _ = inbox.send(Inbox::App(Event::Slack(key, update)));
+                });
+                sessions.insert(key, session);
+            }
+            Err(error) => {
+                let reason = format!("{error:#}");
+                // The receiver is right here: sending can't fail.
+                let _ = inbox.send(Inbox::App(Event::CantSignIn {
+                    workspace: key,
+                    reason,
+                }));
+            }
+        }
+    }
     let effects = Effects {
-        session,
+        sessions,
         inbox,
         ids: Arc::new(Ids::default()),
         cell,
+        config,
     };
-    let mut app = App::new(label);
     let mut terminal_events = EventStream::new();
     loop {
         let mut drawn = Drawn::default();
@@ -177,11 +211,14 @@ fn show(result: Result<Prepared, slackers_gfx::Error>) -> Result<slackers_gfx::P
 
 /// Carries out [`Command`]s: the app's only way to reach Slack, the terminal and other programs.
 struct Effects {
-    session: Session,
+    /// Each Workspace's Session, for those whose credentials were found.
+    sessions: HashMap<WorkspaceKey, Session>,
     /// Where background work reports back to the event loop.
     inbox: mpsc::UnboundedSender<Inbox>,
     ids: Arc<Ids>,
     cell: CellSize,
+    /// Where the config file is.
+    config: PathBuf,
 }
 
 impl Effects {
@@ -199,7 +236,11 @@ impl Effects {
         for command in commands {
             match command {
                 Command::Quit => return Ok(true),
-                Command::Slack(request) => self.session.request(request),
+                Command::Slack(workspace, request) => {
+                    if let Some(session) = self.sessions.get(&workspace) {
+                        session.request(request);
+                    }
+                }
                 Command::Prepare { url, bytes, fit } => {
                     let (inbox, ids, cell) = (self.inbox.clone(), Arc::clone(&self.ids), self.cell);
                     // Decoding and resizing are CPU-heavy, and staging writes files: keep them off the loop's
@@ -209,6 +250,19 @@ impl Effects {
                         let result = slackers_gfx::prepare(&bytes, fit, cell, &ids);
                         let _ = inbox.send(Inbox::Prepared { url, result });
                     }));
+                }
+                Command::SaveVirtualWorkspaces(virtual_workspaces) => {
+                    // A small file, rarely written: write it right away, on this thread, so that saves can't
+                    // overtake one another.
+                    let saved = tokio::task::block_in_place(|| {
+                        config::save_virtual_workspaces(&self.config, &virtual_workspaces)
+                    });
+                    if let Err(error) = saved {
+                        tracing::warn!(error = format!("{error:#}"), "couldn't save the config");
+                        let _ = self
+                            .inbox
+                            .send(Inbox::App(Event::SaveFailed(format!("{error:#}"))));
+                    }
                 }
                 Command::Edit { place, text } => {
                     // The old stream's reader thread would steal the editor's keystrokes: drop it now. The new

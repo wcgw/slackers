@@ -21,8 +21,12 @@ pub(crate) const THREAD: &str = "\u{f442} ";
 pub(crate) const FILE: &str = "\u{f4fb} ";
 /// `oct-pencil`: an edited Message.
 pub(crate) const EDITED: &str = "\u{f448} ";
-/// `fa-slack`: the Workspace.
-pub(crate) const WORKSPACE: &str = "\u{f198} ";
+/// `oct-stack`: a Virtual Workspace.
+pub(crate) const VIRTUAL_WORKSPACE: &str = "\u{f51e} ";
+/// `oct-triangle_right`: a folded sidebar section.
+pub(crate) const FOLDED: &str = "\u{f44a} ";
+/// `oct-triangle_down`: an unfolded sidebar section.
+pub(crate) const UNFOLDED: &str = "\u{f44b} ";
 /// `oct-chevron_right`: between the parts of a pane's title, as in a breadcrumb.
 pub(crate) const CRUMB: &str = "\u{f460} ";
 /// `md-account_circle`: a person, until their avatar loads.

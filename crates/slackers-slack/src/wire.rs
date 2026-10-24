@@ -37,6 +37,22 @@ pub(crate) struct UserBoot {
 #[derive(Deserialize)]
 struct Team {
     name: String,
+    #[serde(default)]
+    icon: TeamIcon,
+}
+
+/// A Workspace's icon, at several sizes.
+#[derive(Default, Deserialize)]
+struct TeamIcon {
+    #[serde(default)]
+    image_44: Option<String>,
+    #[serde(default)]
+    image_68: Option<String>,
+    #[serde(default)]
+    image_34: Option<String>,
+    /// Whether it's Slack's generated default rather than one the Workspace chose.
+    #[serde(default)]
+    image_default: bool,
 }
 
 #[derive(Deserialize)]
@@ -139,9 +155,16 @@ pub(crate) fn snapshot(auth: AuthTest, boot: UserBoot, counts: Counts) -> Snapsh
             activity(count),
         ));
     }
+    let icon = boot.team.icon;
+    let icon = if icon.image_default {
+        None
+    } else {
+        icon.image_44.or(icon.image_68).or(icon.image_34)
+    };
     Snapshot {
         workspace: WorkspaceId::new(auth.team_id),
         name: boot.team.name,
+        icon,
         me: UserId::new(auth.user_id),
         conversations,
     }
@@ -751,7 +774,7 @@ mod tests {
             serde_json::from_value(json!({"team_id": "E1", "user_id": "UME"})).unwrap();
         let boot: UserBoot = serde_json::from_value(json!({
             "self": {"id": "UME"},
-            "team": {"name": "Org"},
+            "team": {"name": "Org", "icon": {"image_34": "https://i/34.png", "image_44": "https://i/44.png"}},
             "channels": [
                 {"id": "C1", "name": "general", "is_private": false},
                 {"id": "G1", "name": "secret", "is_private": true},
@@ -782,6 +805,7 @@ mod tests {
             ),
             ("E1", "Org", "UME")
         );
+        assert_eq!(snapshot.icon.as_deref(), Some("https://i/44.png"));
         let listed: Vec<(&str, &ConversationKind, &str)> = snapshot
             .conversations
             .iter()

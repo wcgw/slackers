@@ -1,9 +1,11 @@
 //! The app's state, and how events change it. No I/O here: every effect is a [`Command`] for the runtime to carry
 //! out, so that `update` can be tested on its own.
 //!
-//! Keys work as in vim: Normal mode moves around (`j`/`k` from Message to Message, `Enter` opens a Thread, `\`
-//! jumps to the sidebar), `i` enters Insert mode to write in the open Conversation or Thread, `/` searches the
-//! sidebar, and `:` enters Command mode (`:q` quits).
+//! Keys work as in vim: Normal mode moves around (`j`/`k` from row to row in the sidebar and from Message to Message
+//! beside it, `Enter` opens a Conversation or a Thread, `za`, `zo`, `zc`, `zM` and `zR` fold the sidebar's
+//! sections, `\` jumps to the sidebar), `i` enters Insert mode to write in the open Conversation or Thread, `/`
+//! searches the sidebar, and `:` enters Command mode: `:q` quits, `:vw add NAME` puts the open Channel in the
+//! Virtual Workspace called NAME, and `:vw rm NAME` takes it out.
 
 use std::collections::{HashMap, HashSet};
 use std::time::{Duration, Instant};
@@ -18,16 +20,24 @@ use slackers_model::{
 };
 use slackers_slack::{Connection, Error, LiveEvent, Request, Snapshot, Update, User};
 
+use crate::config::{ChannelRef, VirtualWorkspace};
 use crate::emoji::Emojis;
 use crate::pane::{Pane, Settled};
 use crate::pictures::Pictures;
-use crate::search::{Finder, Hit};
+use crate::search::Finder;
+use crate::sidebar::{Fold, Row, Section, Sidebar};
 
 /// Something that happened, for [`App::update`] to react to.
 #[derive(Debug)]
 pub(crate) enum Event {
     Terminal(TerminalEvent),
-    Slack(Update),
+    /// News from a Workspace's Session.
+    Slack(WorkspaceKey, Update),
+    /// Signing in to `workspace` can't even start, for `reason`: its credentials aren't in the keyring, say.
+    CantSignIn {
+        workspace: WorkspaceKey,
+        reason: String,
+    },
     /// A picture finished loading and is in the terminal.
     PictureReady {
         url: String,
@@ -44,6 +54,8 @@ pub(crate) enum Event {
         place: Place,
         outcome: Result<String, String>,
     },
+    /// Saving the Virtual Workspaces, as [`Command::SaveVirtualWorkspaces`] asked, failed for this reason.
+    SaveFailed(String),
     /// What the last draw found; see [`Drawn`].
     Drawn(Drawn),
 }
@@ -51,8 +63,8 @@ pub(crate) enum Event {
 /// What a draw found out that only drawing can tell.
 #[derive(Debug, Default, PartialEq, Eq)]
 pub(crate) struct Drawn {
-    /// Pictures it would have shown, had they been loaded, by URL.
-    pub(crate) wanted_pictures: Vec<String>,
+    /// Pictures it would have shown, had they been loaded.
+    pub(crate) wanted_pictures: Vec<WantedPicture>,
     /// When something drawn next changes frame, as animation time; `None` when nothing animates.
     pub(crate) next_change: Option<Duration>,
     /// Where the open Conversation's pane settled; `None` when it wasn't on screen.
@@ -61,10 +73,18 @@ pub(crate) struct Drawn {
     pub(crate) thread: Option<Settled>,
 }
 
+/// A picture to fetch, and the Workspace to fetch it through: Slack serves a Workspace's files to its members only.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) struct WantedPicture {
+    pub(crate) workspace: WorkspaceKey,
+    pub(crate) url: String,
+}
+
 /// Something for the runtime to do.
 #[derive(Debug, PartialEq, Eq)]
 pub(crate) enum Command {
-    Slack(Request),
+    /// Ask a Workspace's Session for something.
+    Slack(WorkspaceKey, Request),
     /// Decode `bytes` and send them to the terminal as the picture for `url`, then report back with
     /// [`Event::PictureReady`] or [`Event::PictureFailed`].
     Prepare {
@@ -78,7 +98,33 @@ pub(crate) enum Command {
         place: Place,
         text: String,
     },
+    /// Write these Virtual Workspaces to the config file in place of those there, keeping the rest of it, and report
+    /// a failure with [`Event::SaveFailed`].
+    SaveVirtualWorkspaces(Vec<VirtualWorkspace>),
     Quit,
+}
+
+/// A Workspace, by its place among those the user signs in to.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub(crate) struct WorkspaceKey(usize);
+
+#[cfg(test)]
+impl WorkspaceKey {
+    /// The `index`-th Workspace signed in to, counting from 0.
+    pub(crate) fn nth(index: usize) -> Self {
+        Self(index)
+    }
+
+    pub(crate) fn index(self) -> usize {
+        self.0
+    }
+}
+
+/// A Conversation in one of the Workspaces signed in to.
+#[derive(Clone, Debug, PartialEq, Eq, Hash)]
+pub(crate) struct ConversationRef {
+    pub(crate) workspace: WorkspaceKey,
+    pub(crate) id: ConversationId,
 }
 
 /// What keys do, as in vim.
@@ -98,10 +144,20 @@ pub(crate) enum Mode {
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) struct Search {
     pub(crate) query: String,
-    /// The matching Conversations, best first; each [`Hit::index`] is a position in the sidebar.
-    pub(crate) hits: Vec<Hit>,
+    /// The matching Conversations, best first.
+    pub(crate) hits: Vec<Found>,
     /// The hit under the cursor.
     pub(crate) selected: usize,
+    /// How many Conversations it looked through.
+    pub(crate) searched: usize,
+}
+
+/// A Conversation that matches a search.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) struct Found {
+    pub(crate) conversation: ConversationRef,
+    /// Which characters of its name matched, by char index, ascending.
+    pub(crate) positions: Vec<usize>,
 }
 
 /// Which pane Normal mode's keys move around.
@@ -117,25 +173,146 @@ pub(crate) enum Focus {
 /// Where a draft is written and a Message posted: a Conversation, or a Thread in it.
 #[derive(Clone, Debug, PartialEq, Eq, Hash)]
 pub(crate) struct Place {
-    pub(crate) conversation: ConversationId,
+    pub(crate) conversation: ConversationRef,
     /// The Thread, by its parent; `None` for the Conversation itself.
     pub(crate) thread: Option<Ts>,
 }
 
-/// Where signing in stands.
+/// The first key of a two-key command, pressed last.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Prefix {
+    /// `z` in Normal mode, starting a fold command.
+    Z,
+    /// `Ctrl-x` in Insert mode, starting `Ctrl-x Ctrl-e`.
+    CtrlX,
+}
+
+/// The Workspaces the user signs in to, in the order the config lists them.
+#[derive(Debug)]
+pub(crate) struct Workspaces(Vec<SignIn>);
+
+/// A Workspace the user signs in to, and how far that got.
+#[derive(Debug)]
+pub(crate) struct SignIn {
+    /// What the config and the keyring call it.
+    pub(crate) label: String,
+    pub(crate) phase: Phase,
+}
+
+/// Where signing in to a Workspace stands.
 #[derive(Debug)]
 pub(crate) enum Phase {
     SigningIn,
     Ready(Box<Workspace>),
+    /// It failed, for this reason.
     Failed(String),
 }
 
-/// A signed-in Workspace, as the user sees it.
+impl Workspaces {
+    /// Every Workspace, signed in to or not, in order.
+    pub(crate) fn iter(&self) -> impl Iterator<Item = (WorkspaceKey, &SignIn)> {
+        self.0
+            .iter()
+            .enumerate()
+            .map(|(index, sign_in)| (WorkspaceKey(index), sign_in))
+    }
+
+    /// The Workspace at `key`, signed in to or not.
+    pub(crate) fn sign_in(&self, key: WorkspaceKey) -> Option<&SignIn> {
+        self.0.get(key.0)
+    }
+
+    /// The Workspace at `key`, once signed in to.
+    pub(crate) fn get(&self, key: WorkspaceKey) -> Option<&Workspace> {
+        match &self.sign_in(key)?.phase {
+            Phase::Ready(workspace) => Some(workspace),
+            Phase::SigningIn | Phase::Failed(_) => None,
+        }
+    }
+
+    fn get_mut(&mut self, key: WorkspaceKey) -> Option<&mut Workspace> {
+        match &mut self.0.get_mut(key.0)?.phase {
+            Phase::Ready(workspace) => Some(workspace),
+            Phase::SigningIn | Phase::Failed(_) => None,
+        }
+    }
+
+    fn set_phase(&mut self, key: WorkspaceKey, phase: Phase) {
+        if let Some(sign_in) = self.0.get_mut(key.0) {
+            sign_in.phase = phase;
+        }
+    }
+
+    /// `conversation` and its Workspace, once signed in to.
+    pub(crate) fn conversation(
+        &self,
+        conversation: &ConversationRef,
+    ) -> Option<(&Workspace, &Conversation)> {
+        let workspace = self.get(conversation.workspace)?;
+        Some((workspace, workspace.conversation(&conversation.id)?))
+    }
+
+    /// `conversation`'s Activity, as far as known.
+    pub(crate) fn activity(&self, conversation: &ConversationRef) -> Option<&Activity> {
+        self.get(conversation.workspace)?
+            .activity
+            .get(&conversation.id)
+    }
+
+    /// The Channel `channel` names, once its Workspace is signed in to and lists it.
+    fn resolve(&self, channel: &ChannelRef) -> Option<ConversationRef> {
+        let (key, _) = self
+            .iter()
+            .find(|(_, sign_in)| sign_in.label == channel.workspace)?;
+        let found = self.get(key)?.conversations.iter().find(|c| {
+            matches!(c.kind, ConversationKind::Channel { .. }) && c.name == channel.channel
+        })?;
+        Some(ConversationRef {
+            workspace: key,
+            id: found.id.clone(),
+        })
+    }
+
+    /// The Channel at `conversation`, as the config names it: only a Channel can be in a Virtual Workspace.
+    ///
+    /// # Errors
+    ///
+    /// Says why `conversation` can't be: it's a DM, or isn't known.
+    fn channel_ref(&self, conversation: &ConversationRef) -> Result<ChannelRef, String> {
+        let (_, found) = self
+            .conversation(conversation)
+            .ok_or("open a channel first")?;
+        match found.kind {
+            ConversationKind::Channel { .. } => Ok(ChannelRef {
+                workspace: self
+                    .sign_in(conversation.workspace)
+                    .ok_or("open a channel first")?
+                    .label
+                    .clone(),
+                channel: found.name.clone(),
+            }),
+            ConversationKind::Dm { .. } | ConversationKind::GroupDm => {
+                Err("DMs stay with their workspace: only channels join a virtual workspace".into())
+            }
+        }
+    }
+}
+
+/// A Workspace signed in to, as the user sees it.
 #[derive(Debug)]
 pub(crate) struct Workspace {
+    /// What Slack calls it.
     pub(crate) name: String,
+    /// Where its icon is; `None` when it has none of its own.
+    pub(crate) icon: Option<String>,
     pub(crate) me: UserId,
-    /// The sidebar, in display order: Channels by name, then DMs, most recently active first.
+    /// Its live connection; `None` until that first comes up.
+    pub(crate) connection: Option<Connection>,
+    /// Its people, as far as they've been looked up.
+    pub(crate) users: HashMap<UserId, User>,
+    requested_users: HashSet<UserId>,
+    pub(crate) emojis: Emojis,
+    /// Channels by name, then DMs, most recently active first.
     pub(crate) conversations: Vec<Conversation>,
     pub(crate) activity: HashMap<ConversationId, Activity>,
     /// Conversations' top-level Messages.
@@ -161,22 +338,16 @@ pub(crate) struct Outgoing {
 /// Everything slackers shows. Only [`App::update`] changes it; the view reads it.
 #[derive(Debug)]
 pub(crate) struct App {
-    /// The name the user gave the Workspace, until Slack names it.
-    pub(crate) label: String,
-    pub(crate) phase: Phase,
-    pub(crate) connection: Option<Connection>,
+    pub(crate) workspaces: Workspaces,
+    /// The Virtual Workspaces, as the config defines them.
+    pub(crate) virtual_workspaces: Vec<VirtualWorkspace>,
+    pub(crate) sidebar: Sidebar,
     /// The latest thing worth telling the user, usually a problem.
     pub(crate) notice: Option<String>,
-    /// People, as far as they've been looked up.
-    pub(crate) users: HashMap<UserId, User>,
-    requested_users: HashSet<UserId>,
-    pub(crate) emojis: Emojis,
-    /// Custom Emoji and avatars, fetched as they come on screen.
+    /// Custom Emoji, avatars and Workspace icons, fetched as they come on screen.
     pub(crate) pictures: Pictures,
     pub(crate) mode: Mode,
-    /// The sidebar entry under the cursor.
-    pub(crate) selected: usize,
-    pub(crate) open: Option<ConversationId>,
+    pub(crate) open: Option<ConversationRef>,
     /// Where the user is in the open Conversation.
     pub(crate) conversation_pane: Pane,
     /// The open Thread, in the open Conversation, by its parent.
@@ -191,8 +362,8 @@ pub(crate) struct App {
     /// Messages posted but not yet confirmed, oldest first.
     pub(crate) outbox: Vec<Outgoing>,
     next_post: u64,
-    /// Whether `Ctrl-x` was just pressed in Insert mode, starting `Ctrl-x Ctrl-e`.
-    awaiting_chord: bool,
+    /// The start of a two-key command, if the last key was one.
+    pending: Option<Prefix>,
     /// Whether the terminal window has focus. Messages count as read only while it does.
     focused: bool,
     /// Whether the open Conversation's pane was on screen at the last draw; a Thread may cover it.
@@ -205,18 +376,22 @@ pub(crate) struct App {
 }
 
 impl App {
-    pub(crate) fn new(label: String) -> Self {
-        Self {
-            label,
-            phase: Phase::SigningIn,
-            connection: None,
+    /// An app signing in to the Workspaces with these `labels`, in this order, and listing `virtual_workspaces`.
+    pub(crate) fn new(labels: Vec<String>, virtual_workspaces: Vec<VirtualWorkspace>) -> Self {
+        let sign_ins = labels
+            .into_iter()
+            .map(|label| SignIn {
+                label,
+                phase: Phase::SigningIn,
+            })
+            .collect();
+        let mut app = Self {
+            workspaces: Workspaces(sign_ins),
+            virtual_workspaces,
+            sidebar: Sidebar::default(),
             notice: None,
-            users: HashMap::new(),
-            requested_users: HashSet::new(),
-            emojis: Emojis::default(),
             pictures: Pictures::default(),
             mode: Mode::Normal,
-            selected: 0,
             open: None,
             conversation_pane: Pane::default(),
             open_thread: None,
@@ -226,13 +401,20 @@ impl App {
             drafts: HashMap::new(),
             outbox: Vec::new(),
             next_post: 0,
-            awaiting_chord: false,
+            pending: None,
             focused: true,
             conversation_shown: false,
             finder: Finder::new(),
             next_change: None,
             epoch: Instant::now(),
-        }
+        };
+        app.list_sidebar();
+        app
+    }
+
+    /// Every Workspace, signed in to or not, in order.
+    pub(crate) fn workspace_keys(&self) -> impl Iterator<Item = WorkspaceKey> + use<> {
+        (0..self.workspaces.0.len()).map(WorkspaceKey)
     }
 
     /// Time since animations started.
@@ -243,33 +425,6 @@ impl App {
     /// When the screen next needs redrawing for animation alone, as animation time.
     pub(crate) fn next_change(&self) -> Option<Duration> {
         self.next_change
-    }
-
-    pub(crate) fn workspace(&self) -> Option<&Workspace> {
-        match &self.phase {
-            Phase::Ready(workspace) => Some(workspace),
-            Phase::SigningIn | Phase::Failed(_) => None,
-        }
-    }
-
-    /// What to call `user`: their name once looked up, else their id.
-    pub(crate) fn user_name<'a>(&'a self, user: &'a UserId) -> &'a str {
-        self.users
-            .get(user)
-            .map_or(user.as_str(), |user| user.name.as_str())
-    }
-
-    /// Where `author`'s avatar image is, as far as known.
-    pub(crate) fn avatar<'a>(&'a self, author: &'a Author) -> Option<&'a str> {
-        match author {
-            Author::User(id) => self.users.get(id)?.avatar.as_deref(),
-            Author::Bot { avatar, .. } => avatar.as_deref(),
-        }
-    }
-
-    /// What to call `conversation`: a DM after the other person, anything else by its name.
-    pub(crate) fn conversation_name<'a>(&'a self, conversation: &'a Conversation) -> &'a str {
-        conversation_name(&self.users, conversation)
     }
 
     /// Where Insert mode writes: the open Thread when its pane has focus, else the open Conversation.
@@ -291,7 +446,10 @@ impl App {
             Event::Terminal(TerminalEvent::FocusGained) => self.focused = true,
             Event::Terminal(TerminalEvent::FocusLost) => self.focused = false,
             Event::Terminal(_) => {}
-            Event::Slack(update) => self.slack(update, &mut commands),
+            Event::Slack(workspace, update) => self.slack(workspace, update, &mut commands),
+            Event::CantSignIn { workspace, reason } => {
+                self.workspaces.set_phase(workspace, Phase::Failed(reason));
+            }
             Event::PictureReady { url, picture } => self.pictures.loaded(url, picture),
             Event::PictureFailed { url } => self.pictures.failed(url),
             Event::PicturesLost => self.pictures.forget_all(),
@@ -302,10 +460,14 @@ impl App {
                 }
                 Err(reason) => self.notice = Some(reason),
             },
+            Event::SaveFailed(reason) => {
+                self.notice = Some(format!("couldn't save the virtual workspaces: {reason}"));
+            }
             Event::Drawn(drawn) => {
-                for url in &drawn.wanted_pictures {
-                    if self.pictures.request(url) {
-                        commands.push(Command::Slack(Request::Download { url: url.clone() }));
+                for wanted in drawn.wanted_pictures {
+                    if self.pictures.request(&wanted.url) {
+                        let request = Request::Download { url: wanted.url };
+                        commands.push(Command::Slack(wanted.workspace, request));
                     }
                 }
                 self.next_change = drawn.next_change;
@@ -328,16 +490,31 @@ impl App {
     }
 
     fn key(&mut self, key: KeyEvent, commands: &mut Vec<Command>) {
+        let pending = self.pending.take();
         match self.mode {
-            Mode::Normal => self.normal_key(key, commands),
-            Mode::Insert => self.insert_key(key, commands),
+            Mode::Normal => self.normal_key(key, pending, commands),
+            Mode::Insert => self.insert_key(key, pending, commands),
             Mode::Command(_) => self.command_key(key, commands),
             Mode::Search(_) => self.search_key(key, commands),
         }
     }
 
-    fn normal_key(&mut self, key: KeyEvent, commands: &mut Vec<Command>) {
+    fn normal_key(&mut self, key: KeyEvent, pending: Option<Prefix>, commands: &mut Vec<Command>) {
         let control = key.modifiers.contains(KeyModifiers::CONTROL);
+        if pending == Some(Prefix::Z) {
+            let fold = match key.code {
+                KeyCode::Char('a') => Some(Fold::Toggle),
+                KeyCode::Char('o') => Some(Fold::Open),
+                KeyCode::Char('c') => Some(Fold::Close),
+                KeyCode::Char('R') => Some(Fold::OpenAll),
+                KeyCode::Char('M') => Some(Fold::CloseAll),
+                _ => None,
+            };
+            if let Some(fold) = fold {
+                self.sidebar.fold(fold);
+            }
+            return;
+        }
         match (key.code, control) {
             (KeyCode::Char('c'), true) => {
                 self.notice = Some("type :q and press Enter to quit".to_owned());
@@ -363,6 +540,7 @@ impl App {
                     query: String::new(),
                     hits: Vec::new(),
                     selected: 0,
+                    searched: 0,
                 });
                 self.focus_sidebar();
                 return;
@@ -395,17 +573,19 @@ impl App {
         }
         match self.focus {
             Focus::Sidebar => match key.code {
-                KeyCode::Char('j') | KeyCode::Down => self.select(self.selected.saturating_add(1)),
-                KeyCode::Char('k') | KeyCode::Up => self.select(self.selected.saturating_sub(1)),
-                KeyCode::Char('g') | KeyCode::Home => self.select(0),
-                KeyCode::Char('G') | KeyCode::End => self.select(usize::MAX),
+                KeyCode::Char('z') => self.pending = Some(Prefix::Z),
+                KeyCode::Char('j') | KeyCode::Down => self.sidebar.move_by(1),
+                KeyCode::Char('k') | KeyCode::Up => self.sidebar.move_by(-1),
+                KeyCode::Char('g') | KeyCode::Home => self.sidebar.first(),
+                KeyCode::Char('G') | KeyCode::End => self.sidebar.last(),
                 KeyCode::Enter | KeyCode::Char('l') | KeyCode::Right => {
-                    let selected = self
-                        .workspace()
-                        .and_then(|w| w.conversations.get(self.selected));
-                    if let Some(id) = selected.map(|c| c.id.clone()) {
-                        self.open(id, commands);
-                        self.focus = Focus::Timeline;
+                    match self.sidebar.selected().map(Row::conversation) {
+                        Some(Some(conversation)) => {
+                            self.open(conversation.clone(), commands);
+                            self.focus = Focus::Timeline;
+                        }
+                        Some(None) => self.sidebar.fold(Fold::Toggle),
+                        None => {}
                     }
                 }
                 _ => {}
@@ -414,10 +594,12 @@ impl App {
                 KeyCode::Enter => self.open_selected_thread(commands),
                 KeyCode::Char('h') | KeyCode::Left | KeyCode::Esc => self.focus_sidebar(),
                 _ => {
-                    let (Some(open), Phase::Ready(workspace)) = (&self.open, &self.phase) else {
-                        return;
-                    };
-                    if let Some(timeline) = workspace.timelines.get(open) {
+                    let Some(open) = &self.open else { return };
+                    let timeline = self
+                        .workspaces
+                        .get(open.workspace)
+                        .and_then(|w| w.timelines.get(&open.id));
+                    if let Some(timeline) = timeline {
                         move_in(&mut self.conversation_pane, timeline, key);
                     }
                 }
@@ -428,12 +610,14 @@ impl App {
                     self.focus = Focus::Timeline;
                 }
                 _ => {
-                    let (Some(open), Some(parent), Phase::Ready(workspace)) =
-                        (&self.open, self.open_thread, &self.phase)
-                    else {
+                    let (Some(open), Some(parent)) = (&self.open, self.open_thread) else {
                         return;
                     };
-                    if let Some(thread) = workspace.threads.get(&(open.clone(), parent)) {
+                    let thread = self
+                        .workspaces
+                        .get(open.workspace)
+                        .and_then(|w| w.threads.get(&(open.id.clone(), parent)));
+                    if let Some(thread) = thread {
                         move_in(&mut self.thread_pane, thread, key);
                     }
                 }
@@ -441,13 +625,12 @@ impl App {
         }
     }
 
-    fn insert_key(&mut self, key: KeyEvent, commands: &mut Vec<Command>) {
+    fn insert_key(&mut self, key: KeyEvent, pending: Option<Prefix>, commands: &mut Vec<Command>) {
         let Some(place) = self.writing_place() else {
             self.mode = Mode::Normal;
             return;
         };
         let control = key.modifiers.contains(KeyModifiers::CONTROL);
-        let chord = std::mem::take(&mut self.awaiting_chord);
         let draft = |drafts: &mut HashMap<Place, TextArea<'static>>, place: &Place| {
             drafts
                 .entry(place.clone())
@@ -457,8 +640,8 @@ impl App {
         };
         match (key.code, control) {
             (KeyCode::Esc, _) | (KeyCode::Char('c'), true) => self.mode = Mode::Normal,
-            (KeyCode::Char('x'), true) => self.awaiting_chord = true,
-            (KeyCode::Char('e'), true) if chord => {
+            (KeyCode::Char('x'), true) => self.pending = Some(Prefix::CtrlX),
+            (KeyCode::Char('e'), true) if pending == Some(Prefix::CtrlX) => {
                 let text = draft(&mut self.drafts, &place);
                 commands.push(Command::Edit { place, text });
             }
@@ -498,15 +681,101 @@ impl App {
             (KeyCode::Enter, _) => {
                 let line = std::mem::take(line);
                 self.mode = Mode::Normal;
-                match line.trim() {
-                    "" => {}
-                    "q" | "q!" | "qa" | "qa!" | "quit" | "quitall" => commands.push(Command::Quit),
-                    other => self.notice = Some(format!("not a command: :{other}")),
-                }
+                self.run(&line, commands);
             }
             (KeyCode::Char(c), false) => line.push(c),
             _ => {}
         }
+    }
+
+    /// Carries out `line`, a command typed after `:`.
+    fn run(&mut self, line: &str, commands: &mut Vec<Command>) {
+        let line = line.trim();
+        let (verb, arguments) = split_word(line);
+        match (verb, arguments) {
+            ("", _) => {}
+            ("q" | "q!" | "qa" | "qa!" | "quit" | "quitall", "") => commands.push(Command::Quit),
+            ("vw", arguments) => {
+                let (verb, name) = split_word(arguments);
+                let changed = match (verb, name) {
+                    ("add", name) if !name.is_empty() => self.add_to_virtual_workspace(name),
+                    ("rm", name) if !name.is_empty() => self.remove_from_virtual_workspace(name),
+                    _ => Err("usage: :vw add NAME, or :vw rm NAME".to_owned()),
+                };
+                match changed {
+                    Ok(()) => {
+                        self.list_sidebar();
+                        let saved = self.virtual_workspaces.clone();
+                        commands.push(Command::SaveVirtualWorkspaces(saved));
+                    }
+                    Err(reason) => self.notice = Some(reason),
+                }
+            }
+            _ => self.notice = Some(format!("not a command: :{line}")),
+        }
+    }
+
+    /// Puts the open Channel in the Virtual Workspace called `name` (in any case), creating it if there's none.
+    ///
+    /// # Errors
+    ///
+    /// Says why not: no Channel is open, or it's already there.
+    fn add_to_virtual_workspace(&mut self, name: &str) -> Result<(), String> {
+        let open = self.open.as_ref().ok_or("open a channel first")?;
+        let channel = self.workspaces.channel_ref(open)?;
+        let existing = self
+            .virtual_workspaces
+            .iter()
+            .position(|virtual_workspace| same_name(&virtual_workspace.name, name));
+        match existing {
+            Some(at) => {
+                let virtual_workspace = &mut self.virtual_workspaces[at];
+                if virtual_workspace.channels.contains(&channel) {
+                    return Err(format!(
+                        "#{} is in {} already",
+                        channel.channel, virtual_workspace.name
+                    ));
+                }
+                virtual_workspace.channels.push(channel);
+            }
+            None => self.virtual_workspaces.push(VirtualWorkspace {
+                name: name.to_owned(),
+                channels: vec![channel],
+            }),
+        }
+        Ok(())
+    }
+
+    /// Takes the open Channel out of the Virtual Workspace called `name` (in any case), and drops the Virtual
+    /// Workspace once it holds nothing.
+    ///
+    /// # Errors
+    ///
+    /// Says why not: no Channel is open, there's no such Virtual Workspace, or the Channel isn't in it.
+    fn remove_from_virtual_workspace(&mut self, name: &str) -> Result<(), String> {
+        let open = self.open.as_ref().ok_or("open a channel first")?;
+        let channel = self.workspaces.channel_ref(open)?;
+        let at = self
+            .virtual_workspaces
+            .iter()
+            .position(|virtual_workspace| same_name(&virtual_workspace.name, name))
+            .ok_or_else(|| format!("no virtual workspace is called {name}"))?;
+        let virtual_workspace = &mut self.virtual_workspaces[at];
+        let Some(listed) = virtual_workspace
+            .channels
+            .iter()
+            .position(|c| *c == channel)
+        else {
+            return Err(format!(
+                "#{} isn't in {}",
+                channel.channel, virtual_workspace.name
+            ));
+        };
+        virtual_workspace.channels.remove(listed);
+        if virtual_workspace.channels.is_empty() {
+            self.virtual_workspaces.remove(at);
+        }
+        Ok(())
     }
 
     fn search_key(&mut self, key: KeyEvent, commands: &mut Vec<Command>) {
@@ -530,19 +799,16 @@ impl App {
                 }
             }
             (KeyCode::Enter, _) => {
-                let chosen = search.hits.get(search.selected).map(|hit| hit.index);
+                let chosen = search
+                    .hits
+                    .get(search.selected)
+                    .map(|hit| hit.conversation.clone());
                 let query = std::mem::take(&mut search.query);
                 self.mode = Mode::Normal;
-                let id = chosen.and_then(|index| {
-                    self.selected = index;
-                    self.workspace()?
-                        .conversations
-                        .get(index)
-                        .map(|c| c.id.clone())
-                });
-                match id {
-                    Some(id) => {
-                        self.open(id, commands);
+                match chosen {
+                    Some(conversation) => {
+                        self.sidebar.select(&conversation);
+                        self.open(conversation, commands);
                         self.focus = Focus::Timeline;
                     }
                     None => self.notice = Some(format!("no conversation matches /{query}")),
@@ -556,42 +822,58 @@ impl App {
         }
     }
 
-    /// Re-ranks the sidebar against the search query, if a search is under way.
+    /// Re-ranks the sidebar's Conversations against the search query, if a search is under way. Each is known by its
+    /// name followed by its Workspace's, so that either narrows the search down.
     fn refresh_search(&mut self) {
         let Mode::Search(search) = &mut self.mode else {
             return;
         };
-        let Phase::Ready(workspace) = &self.phase else {
-            return;
-        };
-        let names = workspace
-            .conversations
+        let candidates = self.sidebar.conversations();
+        let names: Vec<String> = candidates
             .iter()
-            .map(|c| conversation_name(&self.users, c));
-        search.hits = self.finder.rank(&search.query, names);
+            .map(|candidate| match self.workspaces.conversation(candidate) {
+                Some((workspace, conversation)) => {
+                    let name = workspace.conversation_name(conversation);
+                    format!("{name} {}", workspace.name)
+                }
+                None => String::new(),
+            })
+            .collect();
+        search.hits = self
+            .finder
+            .rank(&search.query, names.iter().map(String::as_str))
+            .into_iter()
+            .map(|hit| Found {
+                conversation: candidates[hit.index].clone(),
+                positions: hit.positions,
+            })
+            .collect();
+        search.searched = candidates.len();
         search.selected = search.selected.min(search.hits.len().saturating_sub(1));
     }
 
     /// Opens the Thread of the open Conversation's selected Message, in its own pane, and asks for its Replies.
     /// Any Message can start a Thread: one without Replies yet opens empty, ready for one.
     fn open_selected_thread(&mut self, commands: &mut Vec<Command>) {
-        let (Some(open), Phase::Ready(workspace)) = (&self.open, &mut self.phase) else {
+        let Some(open) = &self.open else { return };
+        let Some(workspace) = self.workspaces.get_mut(open.workspace) else {
             return;
         };
         let selected = workspace
             .timelines
-            .get(open)
+            .get(&open.id)
             .and_then(|t| self.conversation_pane.selected(t));
         let Some(parent) = selected else { return };
         self.open_thread = Some(parent);
         self.thread_pane = Pane::default();
         self.focus = Focus::Thread;
-        let key = (open.clone(), parent);
-        if !workspace.threads.contains_key(&key) && workspace.loading_threads.insert(key) {
-            commands.push(Command::Slack(Request::Replies {
-                conversation: open.clone(),
+        let thread = (open.id.clone(), parent);
+        if !workspace.threads.contains_key(&thread) && workspace.loading_threads.insert(thread) {
+            let request = Request::Replies {
+                conversation: open.id.clone(),
                 parent,
-            }));
+            };
+            commands.push(Command::Slack(open.workspace, request));
         }
     }
 
@@ -611,12 +893,13 @@ impl App {
             Some(_) => self.thread_pane.newest(),
             None => self.conversation_pane.newest(),
         }
-        commands.push(Command::Slack(Request::Post {
-            conversation: place.conversation.clone(),
+        let request = Request::Post {
+            conversation: place.conversation.id.clone(),
             thread: place.thread,
             text: text.clone(),
             id,
-        }));
+        };
+        commands.push(Command::Slack(place.conversation.workspace, request));
         self.outbox.push(Outgoing { id, place, text });
     }
 
@@ -626,19 +909,21 @@ impl App {
         if !self.focused || !self.conversation_shown || !self.conversation_pane.at_newest() {
             return;
         }
-        let (Some(open), Phase::Ready(workspace)) = (&self.open, &mut self.phase) else {
+        let Some(open) = &self.open else { return };
+        let Some(workspace) = self.workspaces.get_mut(open.workspace) else {
             return;
         };
-        let newest = workspace.timelines.get(open).and_then(Timeline::newest);
-        let (Some(newest), Some(activity)) = (newest, workspace.activity.get_mut(open)) else {
+        let newest = workspace.timelines.get(&open.id).and_then(Timeline::newest);
+        let (Some(newest), Some(activity)) = (newest, workspace.activity.get_mut(&open.id)) else {
             return;
         };
         if newest > activity.read_up_to() {
             activity.mark_read(newest);
-            commands.push(Command::Slack(Request::Mark {
-                conversation: open.clone(),
+            let request = Request::Mark {
+                conversation: open.id.clone(),
                 up_to: newest,
-            }));
+            };
+            commands.push(Command::Slack(open.workspace, request));
         }
     }
 
@@ -648,53 +933,91 @@ impl App {
         self.focus = Focus::Sidebar;
     }
 
-    fn select(&mut self, index: usize) {
-        let count = self.workspace().map_or(0, |w| w.conversations.len());
-        self.selected = index.min(count.saturating_sub(1));
-    }
-
-    fn open(&mut self, id: ConversationId, commands: &mut Vec<Command>) {
+    fn open(&mut self, conversation: ConversationRef, commands: &mut Vec<Command>) {
         self.conversation_pane = Pane::default();
         self.conversation_shown = false;
         self.open_thread = None;
-        self.open = Some(id.clone());
-        let Phase::Ready(workspace) = &mut self.phase else {
-            return;
-        };
-        if !workspace.timelines.contains_key(&id) && workspace.loading.insert(id.clone()) {
-            commands.push(Command::Slack(Request::History {
-                conversation: id,
+        if let Some(workspace) = self.workspaces.get_mut(conversation.workspace)
+            && !workspace.timelines.contains_key(&conversation.id)
+            && workspace.loading.insert(conversation.id.clone())
+        {
+            let request = Request::History {
+                conversation: conversation.id.clone(),
                 before: None,
-            }));
+            };
+            commands.push(Command::Slack(conversation.workspace, request));
         }
+        self.open = Some(conversation);
     }
 
     /// Asks for the page before the oldest Message of the open Timeline, if there is one and it isn't on its way.
     fn load_older(&mut self, commands: &mut Vec<Command>) {
-        let (Some(open), Phase::Ready(workspace)) = (&self.open, &mut self.phase) else {
+        let Some(open) = &self.open else { return };
+        let Some(workspace) = self.workspaces.get_mut(open.workspace) else {
             return;
         };
-        let Some(timeline) = workspace.timelines.get(open) else {
+        let Some(timeline) = workspace.timelines.get(&open.id) else {
             return;
         };
-        if timeline.has_older() && workspace.loading.insert(open.clone()) {
-            commands.push(Command::Slack(Request::History {
-                conversation: open.clone(),
+        if timeline.has_older() && workspace.loading.insert(open.id.clone()) {
+            let request = Request::History {
+                conversation: open.id.clone(),
                 before: timeline.oldest(),
-            }));
+            };
+            commands.push(Command::Slack(open.workspace, request));
         }
     }
 
-    fn slack(&mut self, update: Update, commands: &mut Vec<Command>) {
+    /// Lists the sidebar's sections afresh: each Virtual Workspace with its Channels, in the config's order, then each
+    /// Workspace with its Conversations in no Virtual Workspace.
+    fn list_sidebar(&mut self) {
+        let mut in_virtual_workspaces = HashSet::new();
+        let mut sections = Vec::new();
+        for virtual_workspace in &self.virtual_workspaces {
+            let channels: Vec<ConversationRef> = virtual_workspace
+                .channels
+                .iter()
+                .filter_map(|channel| self.workspaces.resolve(channel))
+                .collect();
+            in_virtual_workspaces.extend(channels.iter().cloned());
+            let section = Section::VirtualWorkspace(virtual_workspace.name.clone());
+            sections.push((section, channels));
+        }
+        for (key, sign_in) in self.workspaces.iter() {
+            let conversations = match &sign_in.phase {
+                Phase::Ready(workspace) => workspace
+                    .conversations
+                    .iter()
+                    .map(|c| ConversationRef {
+                        workspace: key,
+                        id: c.id.clone(),
+                    })
+                    .filter(|c| !in_virtual_workspaces.contains(c))
+                    .collect(),
+                Phase::SigningIn | Phase::Failed(_) => Vec::new(),
+            };
+            sections.push((Section::Workspace(key), conversations));
+        }
+        self.sidebar.list(sections);
+    }
+
+    fn slack(&mut self, key: WorkspaceKey, update: Update, commands: &mut Vec<Command>) {
         match update {
-            Update::Ready(snapshot) => self.ready(*snapshot, commands),
-            Update::SignInFailed(error) => self.phase = Phase::Failed(error.to_string()),
-            Update::CustomEmoji(custom) => self.emojis.set_custom(custom),
+            Update::Ready(snapshot) => self.ready(key, *snapshot, commands),
+            Update::SignInFailed(error) => {
+                self.workspaces
+                    .set_phase(key, Phase::Failed(error.to_string()));
+            }
+            Update::CustomEmoji(custom) => {
+                if let Some(workspace) = self.workspaces.get_mut(key) {
+                    workspace.emojis.set_custom(custom);
+                }
+            }
             Update::History {
                 conversation,
                 result,
             } => {
-                let Phase::Ready(workspace) = &mut self.phase else {
+                let Some(workspace) = self.workspaces.get_mut(key) else {
                     return;
                 };
                 workspace.loading.remove(&conversation);
@@ -704,7 +1027,7 @@ impl App {
                             page.messages.iter().flat_map(people_in).collect();
                         let timeline = workspace.timelines.entry(conversation).or_default();
                         timeline.add_history(page.messages, page.has_more);
-                        self.want_users(people, commands);
+                        workspace.want_users(key, people, commands);
                     }
                     Err(error) => self.notice = Some(describe(&error)),
                 }
@@ -714,20 +1037,20 @@ impl App {
                 parent,
                 result,
             } => {
-                let Phase::Ready(workspace) = &mut self.phase else {
+                let Some(workspace) = self.workspaces.get_mut(key) else {
                     return;
                 };
-                let key = (conversation, parent);
-                workspace.loading_threads.remove(&key);
+                let thread = (conversation, parent);
+                workspace.loading_threads.remove(&thread);
                 match result {
                     Ok(messages) => {
                         let people: Vec<UserId> = messages.iter().flat_map(people_in).collect();
-                        let thread = workspace
+                        workspace
                             .threads
-                            .entry(key)
-                            .or_insert_with(|| Timeline::thread(parent));
-                        thread.add_history(messages, false);
-                        self.want_users(people, commands);
+                            .entry(thread)
+                            .or_insert_with(|| Timeline::thread(parent))
+                            .add_history(messages, false);
+                        workspace.want_users(key, people, commands);
                     }
                     Err(error) => self.notice = Some(describe(&error)),
                 }
@@ -743,7 +1066,7 @@ impl App {
                 let outgoing = self.outbox.remove(at);
                 match result {
                     Ok(message) => {
-                        let Phase::Ready(workspace) = &mut self.phase else {
+                        let Some(workspace) = self.workspaces.get_mut(key) else {
                             return;
                         };
                         // Slack moves the Read Marker past the user's own Message itself.
@@ -774,7 +1097,9 @@ impl App {
                 }
             }
             Update::User(user) => {
-                self.users.insert(user.id.clone(), user);
+                if let Some(workspace) = self.workspaces.get_mut(key) {
+                    workspace.users.insert(user.id.clone(), user);
+                }
             }
             Update::Downloaded { url, result } => {
                 if !self.pictures.awaits(&url) {
@@ -792,56 +1117,63 @@ impl App {
                     }
                 }
             }
-            Update::Live(event) => self.live(event, commands),
-            Update::Connection(connection) => self.connection = Some(connection),
+            Update::Live(event) => self.live(key, event, commands),
+            Update::Connection(connection) => {
+                if let Some(workspace) = self.workspaces.get_mut(key) {
+                    workspace.connection = Some(connection);
+                }
+            }
         }
     }
 
-    fn ready(&mut self, snapshot: Snapshot, commands: &mut Vec<Command>) {
-        let mut conversations: Vec<(Conversation, Activity)> = snapshot.conversations;
-        // Channels by name, then DMs with the most recent first, as Slack's sidebar does by default.
-        conversations.sort_by(|(a, a_activity), (b, b_activity)| {
-            let is_dm = |c: &Conversation| !matches!(c.kind, ConversationKind::Channel { .. });
-            is_dm(a).cmp(&is_dm(b)).then_with(|| {
-                if is_dm(a) {
-                    b_activity.latest().cmp(&a_activity.latest())
-                } else {
-                    a.name.cmp(&b.name)
-                }
-            })
-        });
-        let partners: Vec<UserId> = conversations
+    fn ready(&mut self, key: WorkspaceKey, snapshot: Snapshot, commands: &mut Vec<Command>) {
+        let mut workspace = Workspace::new(snapshot);
+        let partners: Vec<UserId> = workspace
+            .conversations
             .iter()
-            .filter_map(|(c, _)| match &c.kind {
+            .filter_map(|c| match &c.kind {
                 ConversationKind::Dm { with } => Some(with.clone()),
-                _ => None,
+                ConversationKind::Channel { .. } | ConversationKind::GroupDm => None,
             })
             .collect();
+        workspace.want_users(key, partners, commands);
+        self.workspaces
+            .set_phase(key, Phase::Ready(Box::new(workspace)));
+
+        let Some(label) = self.workspaces.sign_in(key).map(|s| s.label.as_str()) else {
+            return;
+        };
+        let missing = self
+            .virtual_workspaces
+            .iter()
+            .flat_map(|virtual_workspace| {
+                virtual_workspace
+                    .channels
+                    .iter()
+                    .filter(|channel| channel.workspace == label)
+                    .filter(|channel| self.workspaces.resolve(channel).is_none())
+                    .map(move |channel| (&virtual_workspace.name, channel))
+            });
+        for (name, channel) in missing {
+            tracing::warn!(virtual_workspace = %name, %channel, "not among the user's channels");
+            self.notice = Some(format!(
+                "{name} lists {channel}, which isn't among your channels"
+            ));
+        }
+
+        self.list_sidebar();
         // Put the cursor on the first Conversation with something unread, without opening it: opening marks it
         // read, which the user should choose.
-        self.selected = conversations
-            .iter()
-            .position(|(_, activity)| activity.has_unread())
-            .unwrap_or(0);
-        let activity = conversations
-            .iter()
-            .map(|(c, a)| (c.id.clone(), a.clone()))
-            .collect();
-        self.phase = Phase::Ready(Box::new(Workspace {
-            name: snapshot.name,
-            me: snapshot.me,
-            conversations: conversations.into_iter().map(|(c, _)| c).collect(),
-            activity,
-            timelines: HashMap::new(),
-            threads: HashMap::new(),
-            loading: HashSet::new(),
-            loading_threads: HashSet::new(),
-        }));
-        self.want_users(partners, commands);
+        let workspaces = &self.workspaces;
+        self.sidebar.suggest(|row| {
+            row.conversation()
+                .and_then(|conversation| workspaces.activity(conversation))
+                .is_some_and(Activity::has_unread)
+        });
     }
 
-    fn live(&mut self, event: LiveEvent, commands: &mut Vec<Command>) {
-        let Phase::Ready(workspace) = &mut self.phase else {
+    fn live(&mut self, key: WorkspaceKey, event: LiveEvent, commands: &mut Vec<Command>) {
+        let Some(workspace) = self.workspaces.get_mut(key) else {
             return;
         };
         match event {
@@ -851,9 +1183,8 @@ impl App {
             } => {
                 let people = people_in(&message);
                 let is_dm = workspace
-                    .conversations
-                    .iter()
-                    .any(|c| c.id == conversation && matches!(c.kind, ConversationKind::Dm { .. }));
+                    .conversation(&conversation)
+                    .is_some_and(|c| matches!(c.kind, ConversationKind::Dm { .. }));
                 if message.reply_to.is_none()
                     && !message.is_by(&workspace.me)
                     && let Some(activity) = workspace.activity.get_mut(&conversation)
@@ -862,7 +1193,7 @@ impl App {
                     activity.record(message.ts, is_dm || message.mentions(&workspace.me));
                 }
                 workspace.add(&conversation, message);
-                self.want_users(people, commands);
+                workspace.want_users(key, people, commands);
             }
             LiveEvent::Edited {
                 conversation,
@@ -902,22 +1233,86 @@ impl App {
             }
         }
     }
+}
 
-    /// Asks for the names of `people` not known or asked for yet.
+impl Workspace {
+    /// The Workspace `snapshot` shows, with its Conversations in sidebar order: Channels by name, then DMs with the
+    /// most recent first, as Slack's sidebar does by default.
+    fn new(snapshot: Snapshot) -> Self {
+        let mut conversations = snapshot.conversations;
+        conversations.sort_by(|(a, a_activity), (b, b_activity)| {
+            let is_dm = |c: &Conversation| !matches!(c.kind, ConversationKind::Channel { .. });
+            is_dm(a).cmp(&is_dm(b)).then_with(|| {
+                if is_dm(a) {
+                    b_activity.latest().cmp(&a_activity.latest())
+                } else {
+                    a.name.cmp(&b.name)
+                }
+            })
+        });
+        let activity = conversations
+            .iter()
+            .map(|(c, a)| (c.id.clone(), a.clone()))
+            .collect();
+        Self {
+            name: snapshot.name,
+            icon: snapshot.icon,
+            me: snapshot.me,
+            connection: None,
+            users: HashMap::new(),
+            requested_users: HashSet::new(),
+            emojis: Emojis::default(),
+            conversations: conversations.into_iter().map(|(c, _)| c).collect(),
+            activity,
+            timelines: HashMap::new(),
+            threads: HashMap::new(),
+            loading: HashSet::new(),
+            loading_threads: HashSet::new(),
+        }
+    }
+
+    /// The Conversation with `id`, if the Workspace lists it.
+    pub(crate) fn conversation(&self, id: &ConversationId) -> Option<&Conversation> {
+        self.conversations.iter().find(|c| c.id == *id)
+    }
+
+    /// What to call `user`: their name once looked up, else their id.
+    pub(crate) fn user_name<'a>(&'a self, user: &'a UserId) -> &'a str {
+        self.users
+            .get(user)
+            .map_or(user.as_str(), |user| user.name.as_str())
+    }
+
+    /// Where `author`'s avatar image is, as far as known.
+    pub(crate) fn avatar<'a>(&'a self, author: &'a Author) -> Option<&'a str> {
+        match author {
+            Author::User(id) => self.users.get(id)?.avatar.as_deref(),
+            Author::Bot { avatar, .. } => avatar.as_deref(),
+        }
+    }
+
+    /// What to call `conversation`: a DM after the other person, anything else by its name.
+    pub(crate) fn conversation_name<'a>(&'a self, conversation: &'a Conversation) -> &'a str {
+        match &conversation.kind {
+            ConversationKind::Dm { with } => self.user_name(with),
+            ConversationKind::Channel { .. } | ConversationKind::GroupDm => &conversation.name,
+        }
+    }
+
+    /// Asks this Workspace, at `key`, for the names of `people` not known or asked for yet.
     fn want_users(
         &mut self,
+        key: WorkspaceKey,
         people: impl IntoIterator<Item = UserId>,
         commands: &mut Vec<Command>,
     ) {
         for person in people {
             if !self.users.contains_key(&person) && self.requested_users.insert(person.clone()) {
-                commands.push(Command::Slack(Request::User(person)));
+                commands.push(Command::Slack(key, Request::User(person)));
             }
         }
     }
-}
 
-impl Workspace {
     /// Adds a Message posted in `conversation` wherever it's held: its Timeline, which counts a Reply on its parent,
     /// and its Thread's.
     fn add(&mut self, conversation: &ConversationId, message: Message) {
@@ -965,17 +1360,17 @@ fn move_in(pane: &mut Pane, timeline: &Timeline, key: KeyEvent) {
     }
 }
 
-/// What to call `conversation`, given the people known: a DM after the other person, anything else by its name.
-fn conversation_name<'a>(
-    users: &'a HashMap<UserId, User>,
-    conversation: &'a Conversation,
-) -> &'a str {
-    match &conversation.kind {
-        ConversationKind::Dm { with } => users
-            .get(with)
-            .map_or(with.as_str(), |user| user.name.as_str()),
-        ConversationKind::Channel { .. } | ConversationKind::GroupDm => &conversation.name,
+/// `text`'s first word, and the rest without leading spaces.
+fn split_word(text: &str) -> (&str, &str) {
+    match text.split_once(char::is_whitespace) {
+        Some((word, rest)) => (word, rest.trim_start()),
+        None => (text, ""),
     }
+}
+
+/// Whether two Virtual Workspaces' names are the same, ignoring case.
+fn same_name(a: &str, b: &str) -> bool {
+    a.to_lowercase() == b.to_lowercase()
 }
 
 /// A composer for `place` holding `text`, with the cursor at its end.
@@ -1022,12 +1417,19 @@ mod tests {
 
     use super::*;
 
+    const W0: WorkspaceKey = WorkspaceKey(0);
+    const W1: WorkspaceKey = WorkspaceKey(1);
+
     fn conversation(id: &str, kind: ConversationKind, name: &str) -> Conversation {
         Conversation {
             id: ConversationId::new(id),
             kind,
             name: name.into(),
         }
+    }
+
+    fn channel(id: &str, name: &str) -> Conversation {
+        conversation(id, ConversationKind::Channel { private: false }, name)
     }
 
     fn seconds(s: u64) -> Ts {
@@ -1064,6 +1466,12 @@ mod tests {
             .collect()
     }
 
+    /// Types `line` in Command mode and presses Enter.
+    fn command(app: &mut App, line: &str) -> Vec<Command> {
+        keys(app, &format!(":{line}"));
+        app.update(key(KeyCode::Enter))
+    }
+
     fn control(c: char) -> Event {
         Event::Terminal(TerminalEvent::Key(KeyEvent::new(
             KeyCode::Char(c),
@@ -1071,8 +1479,26 @@ mod tests {
         )))
     }
 
-    fn c(id: &str) -> ConversationId {
+    /// The Conversation `id` in the first Workspace.
+    fn c(id: &str) -> ConversationRef {
+        ConversationRef {
+            workspace: W0,
+            id: ConversationId::new(id),
+        }
+    }
+
+    fn id(id: &str) -> ConversationId {
         ConversationId::new(id)
+    }
+
+    /// News from the first Workspace.
+    fn slack(update: Update) -> Event {
+        Event::Slack(W0, update)
+    }
+
+    /// A request to the first Workspace.
+    fn ask(request: Request) -> Command {
+        Command::Slack(W0, request)
     }
 
     fn place(conversation: &str, thread: Option<u64>) -> Place {
@@ -1080,6 +1506,15 @@ mod tests {
             conversation: c(conversation),
             thread: thread.map(seconds),
         }
+    }
+
+    fn workspace(app: &App, key: WorkspaceKey) -> &Workspace {
+        app.workspaces.get(key).unwrap()
+    }
+
+    /// The Conversation under the sidebar's cursor.
+    fn selected(app: &App) -> Option<ConversationRef> {
+        app.sidebar.selected()?.conversation().cloned()
     }
 
     /// Reports a draw that showed the Conversation's pane, as tall as `height`, with everything fitting: the pane
@@ -1096,26 +1531,27 @@ mod tests {
         }))
     }
 
-    /// An app signed in to a Workspace with two Channels and a DM, `#random` having unread Messages.
-    fn ready_app() -> (App, Vec<Command>) {
-        let mut app = App::new("test".into());
-        let snapshot = Snapshot {
+    fn snapshot(name: &str, conversations: Vec<(Conversation, Activity)>) -> Snapshot {
+        Snapshot {
             workspace: WorkspaceId::new("T1"),
-            name: "Test".into(),
+            name: name.into(),
+            icon: None,
             me: UserId::new("UME"),
-            conversations: vec![
+            conversations,
+        }
+    }
+
+    /// The first Workspace's Conversations: two Channels and a DM, `#random` having unread Messages.
+    fn test_snapshot() -> Snapshot {
+        let dm = ConversationKind::Dm {
+            with: UserId::new("U9"),
+        };
+        snapshot(
+            "Test",
+            vec![
+                (conversation("D1", dm, ""), Activity::default()),
                 (
-                    conversation(
-                        "D1",
-                        ConversationKind::Dm {
-                            with: UserId::new("U9"),
-                        },
-                        "",
-                    ),
-                    Activity::default(),
-                ),
-                (
-                    conversation("C2", ConversationKind::Channel { private: false }, "random"),
+                    channel("C2", "random"),
                     Activity::counted(seconds(1), seconds(5), true, 0),
                 ),
                 (
@@ -1123,9 +1559,61 @@ mod tests {
                     Activity::default(),
                 ),
             ],
-        };
-        let commands = app.update(Event::Slack(Update::Ready(Box::new(snapshot))));
+        )
+    }
+
+    /// An app signed in to one Workspace, `test`, which [`test_snapshot`] shows.
+    fn ready_app() -> (App, Vec<Command>) {
+        let mut app = App::new(vec!["test".into()], Vec::new());
+        let commands = app.update(slack(Update::Ready(Box::new(test_snapshot()))));
         (app, commands)
+    }
+
+    /// An app signed in to two Workspaces: `test`, as [`test_snapshot`] shows it, and `other`, with `#general` and
+    /// `#dev`. The Virtual Workspace `K` holds `test#random` and `other#dev`.
+    fn two_workspaces() -> App {
+        let virtual_workspaces = vec![VirtualWorkspace {
+            name: "K".into(),
+            channels: vec![
+                ChannelRef {
+                    workspace: "test".into(),
+                    channel: "random".into(),
+                },
+                ChannelRef {
+                    workspace: "other".into(),
+                    channel: "dev".into(),
+                },
+            ],
+        }];
+        let mut app = App::new(vec!["test".into(), "other".into()], virtual_workspaces);
+        app.update(slack(Update::Ready(Box::new(test_snapshot()))));
+        let other = snapshot(
+            "Other",
+            vec![
+                (channel("C5", "general"), Activity::default()),
+                (channel("C6", "dev"), Activity::default()),
+            ],
+        );
+        app.update(Event::Slack(W1, Update::Ready(Box::new(other))));
+        app
+    }
+
+    /// The sidebar, as `>` and a section's name for a header, else the Conversation's name.
+    fn sidebar(app: &App) -> Vec<String> {
+        app.sidebar
+            .rows()
+            .iter()
+            .map(|row| match row {
+                Row::Header(Section::VirtualWorkspace(name)) => format!(">{name}"),
+                Row::Header(Section::Workspace(key)) => {
+                    format!(">{}", app.workspaces.sign_in(*key).unwrap().label)
+                }
+                Row::Conversation { conversation, .. } => {
+                    let (workspace, found) = app.workspaces.conversation(conversation).unwrap();
+                    workspace.conversation_name(found).to_owned()
+                }
+            })
+            .collect()
     }
 
     /// `ready_app` with `#random` open, drawn, and holding Messages at 2 and 5 seconds, the latter with a Reply.
@@ -1143,32 +1631,234 @@ mod tests {
             messages: vec![parent, message(2, "U2", RichText::plain("hello"))],
             has_more: true,
         };
-        app.update(Event::Slack(Update::History {
-            conversation: c("C2"),
+        app.update(slack(Update::History {
+            conversation: id("C2"),
             result: Ok(page),
         }));
         drawn(&mut app, 10);
         app
     }
 
-    fn unread(app: &App, id: &str) -> bool {
-        app.workspace().unwrap().activity[&c(id)].has_unread()
+    fn unread(app: &App, conversation: &str) -> bool {
+        workspace(app, W0).activity[&id(conversation)].has_unread()
     }
 
     #[test]
     fn signing_in_sorts_the_sidebar_and_selects_the_first_unread_without_opening_it() {
         let (app, commands) = ready_app();
-        let ids: Vec<&str> = app
-            .workspace()
-            .unwrap()
-            .conversations
-            .iter()
-            .map(|c| c.id.as_str())
-            .collect();
-        assert_eq!(ids, ["C1", "C2", "D1"], "channels by name, then DMs");
-        assert_eq!(app.selected, 1);
+        assert_eq!(sidebar(&app), [">test", "general", "random", "U9"]);
+        assert_eq!(selected(&app), Some(c("C2")));
         assert_eq!(app.open, None);
-        assert_eq!(commands, [Command::Slack(Request::User(UserId::new("U9")))]);
+        assert_eq!(commands, [ask(Request::User(UserId::new("U9")))]);
+    }
+
+    #[test]
+    fn virtual_workspaces_come_first_and_take_their_channels_out_of_their_workspaces() {
+        let app = two_workspaces();
+        assert_eq!(
+            sidebar(&app),
+            [
+                ">K", "random", "dev", ">test", "general", "U9", ">other", "general"
+            ]
+        );
+        assert_eq!(selected(&app), Some(c("C2")), "the unread one, in K");
+    }
+
+    #[test]
+    fn workspaces_sign_in_on_their_own() {
+        let mut app = App::new(vec!["test".into(), "other".into()], Vec::new());
+        assert_eq!(sidebar(&app), [">test", ">other"]);
+        app.update(Event::CantSignIn {
+            workspace: W1,
+            reason: "no token".into(),
+        });
+        app.update(slack(Update::Ready(Box::new(test_snapshot()))));
+        let other = &app.workspaces.sign_in(W1).unwrap().phase;
+        assert!(matches!(other, Phase::Failed(reason) if reason == "no token"));
+        assert_eq!(
+            sidebar(&app),
+            [">test", "general", "random", "U9", ">other"]
+        );
+    }
+
+    #[test]
+    fn requests_go_to_the_conversations_workspace() {
+        let mut app = two_workspaces();
+        keys(&mut app, "j");
+        assert_eq!(
+            app.update(key(KeyCode::Enter)),
+            [Command::Slack(
+                W1,
+                Request::History {
+                    conversation: id("C6"),
+                    before: None
+                }
+            )]
+        );
+        assert_eq!(
+            app.open,
+            Some(ConversationRef {
+                workspace: W1,
+                id: id("C6")
+            })
+        );
+        let page = HistoryPage {
+            messages: vec![message(5, "U7", RichText::plain("hi"))],
+            has_more: false,
+        };
+        let commands = app.update(Event::Slack(
+            W1,
+            Update::History {
+                conversation: id("C6"),
+                result: Ok(page),
+            },
+        ));
+        assert_eq!(
+            commands,
+            [Command::Slack(W1, Request::User(UserId::new("U7")))]
+        );
+        assert!(workspace(&app, W0).timelines.is_empty());
+
+        let wanted = Drawn {
+            wanted_pictures: vec![WantedPicture {
+                workspace: W1,
+                url: "https://e/p.png".into(),
+            }],
+            ..Drawn::default()
+        };
+        assert_eq!(
+            app.update(Event::Drawn(wanted)),
+            [Command::Slack(
+                W1,
+                Request::Download {
+                    url: "https://e/p.png".into()
+                }
+            )]
+        );
+    }
+
+    #[test]
+    fn vw_add_puts_the_open_channel_in_a_virtual_workspace_and_saves() {
+        let mut app = two_workspaces();
+        keys(&mut app, "jjj");
+        app.update(key(KeyCode::Enter));
+        assert_eq!(app.open, Some(c("C1")));
+
+        let commands = command(&mut app, "vw add k");
+        let saved = &app.virtual_workspaces;
+        assert_eq!(saved.len(), 1, "K, in any case");
+        assert_eq!(saved[0].channels[2].to_string(), "test#general");
+        assert_eq!(commands, [Command::SaveVirtualWorkspaces(saved.clone())]);
+        assert_eq!(
+            sidebar(&app),
+            [
+                ">K", "random", "dev", "general", ">test", "U9", ">other", "general"
+            ]
+        );
+        assert_eq!(app.sidebar.cursor(), 3, "the cursor follows it");
+
+        command(&mut app, "vw add Gateway API");
+        assert_eq!(app.virtual_workspaces[1].name, "Gateway API");
+        assert_eq!(sidebar(&app)[4..7], [">Gateway API", "general", ">test"]);
+
+        assert!(command(&mut app, "vw add K").is_empty());
+        assert_eq!(app.notice.as_deref(), Some("#general is in K already"));
+    }
+
+    #[test]
+    fn vw_rm_takes_it_out_and_an_empty_virtual_workspace_goes() {
+        let mut app = two_workspaces();
+        app.update(key(KeyCode::Enter));
+        assert_eq!(app.open, Some(c("C2")));
+
+        let commands = command(&mut app, "vw rm K");
+        assert_eq!(app.virtual_workspaces[0].channels.len(), 1);
+        assert_eq!(commands.len(), 1);
+        assert_eq!(
+            sidebar(&app),
+            [
+                ">K", "dev", ">test", "general", "random", "U9", ">other", "general"
+            ]
+        );
+
+        assert!(command(&mut app, "vw rm K").is_empty());
+        assert_eq!(app.notice.as_deref(), Some("#random isn't in K"));
+        keys(&mut app, "\\");
+        keys(&mut app, "gj");
+        app.update(key(KeyCode::Enter));
+        command(&mut app, "vw rm K");
+        assert!(app.virtual_workspaces.is_empty());
+        assert_eq!(sidebar(&app)[0], ">test");
+    }
+
+    #[test]
+    fn dms_stay_out_of_virtual_workspaces() {
+        let mut app = two_workspaces();
+        keys(&mut app, "jjjj");
+        app.update(key(KeyCode::Enter));
+        assert_eq!(app.open, Some(c("D1")));
+        assert!(command(&mut app, "vw add K").is_empty());
+        assert!(app.notice.as_deref().unwrap().starts_with("DMs stay"));
+
+        assert!(command(&mut app, "vw add").is_empty());
+        assert_eq!(
+            app.notice.as_deref(),
+            Some("usage: :vw add NAME, or :vw rm NAME")
+        );
+    }
+
+    #[test]
+    fn z_commands_and_enter_fold_sections() {
+        let mut app = two_workspaces();
+        keys(&mut app, "zc");
+        assert_eq!(
+            sidebar(&app),
+            [">K", ">test", "general", "U9", ">other", "general"]
+        );
+        assert_eq!(app.sidebar.cursor(), 0);
+        app.update(key(KeyCode::Enter));
+        assert_eq!(sidebar(&app).len(), 8, "enter on a header unfolds it");
+
+        keys(&mut app, "zM");
+        assert_eq!(sidebar(&app), [">K", ">test", ">other"]);
+        keys(&mut app, "jza");
+        assert_eq!(sidebar(&app), [">K", ">test", "general", "U9", ">other"]);
+        keys(&mut app, "zR");
+        assert_eq!(sidebar(&app).len(), 8);
+        assert!(keys(&mut app, "zx").is_empty(), "not a fold command");
+        assert_eq!(app.sidebar.cursor(), 3, "and no move either");
+    }
+
+    #[test]
+    fn a_search_spans_workspaces_and_knows_them_by_name() {
+        let mut app = two_workspaces();
+        app.sidebar.fold(Fold::CloseAll);
+        keys(&mut app, "/general");
+        let hits = |app: &App| {
+            let Mode::Search(search) = &app.mode else {
+                panic!("not searching")
+            };
+            search
+                .hits
+                .iter()
+                .map(|hit| hit.conversation.clone())
+                .collect::<Vec<_>>()
+        };
+        let other_general = ConversationRef {
+            workspace: W1,
+            id: id("C5"),
+        };
+        assert_eq!(hits(&app), [c("C1"), other_general.clone()]);
+
+        keys(&mut app, " oth");
+        assert_eq!(hits(&app), std::slice::from_ref(&other_general));
+        app.update(key(KeyCode::Enter));
+        assert_eq!(app.open, Some(other_general.clone()));
+        assert_eq!(
+            selected(&app),
+            Some(other_general),
+            "its section unfolds to show it"
+        );
     }
 
     #[test]
@@ -1176,8 +1866,8 @@ mod tests {
         let (mut app, _) = ready_app();
         assert_eq!(
             app.update(key(KeyCode::Enter)),
-            [Command::Slack(Request::History {
-                conversation: c("C2"),
+            [ask(Request::History {
+                conversation: id("C2"),
                 before: None
             })]
         );
@@ -1185,17 +1875,17 @@ mod tests {
             messages: vec![message(5, "U2", RichText::plain("hi"))],
             has_more: false,
         };
-        let commands = app.update(Event::Slack(Update::History {
-            conversation: c("C2"),
+        let commands = app.update(slack(Update::History {
+            conversation: id("C2"),
             result: Ok(page),
         }));
-        assert_eq!(commands, [Command::Slack(Request::User(UserId::new("U2")))]);
+        assert_eq!(commands, [ask(Request::User(UserId::new("U2")))]);
         assert!(unread(&app, "C2"), "not on screen yet");
 
         assert_eq!(
             drawn(&mut app, 10),
-            [Command::Slack(Request::Mark {
-                conversation: c("C2"),
+            [ask(Request::Mark {
+                conversation: id("C2"),
                 up_to: seconds(5)
             })]
         );
@@ -1214,8 +1904,8 @@ mod tests {
             ],
             has_more: false,
         };
-        app.update(Event::Slack(Update::History {
-            conversation: c("C2"),
+        app.update(slack(Update::History {
+            conversation: id("C2"),
             result: Ok(page),
         }));
         drawn(&mut app, 10);
@@ -1232,8 +1922,8 @@ mod tests {
 
         assert_eq!(
             app.update(key(KeyCode::Char('G'))),
-            [Command::Slack(Request::Mark {
-                conversation: c("C2"),
+            [ask(Request::Mark {
+                conversation: id("C2"),
                 up_to: seconds(5)
             })]
         );
@@ -1250,8 +1940,8 @@ mod tests {
             ],
             has_more: true,
         };
-        app.update(Event::Slack(Update::History {
-            conversation: c("C2"),
+        app.update(slack(Update::History {
+            conversation: id("C2"),
             result: Ok(page),
         }));
         let drawn = |settled| {
@@ -1277,8 +1967,8 @@ mod tests {
         let commands = app.update(drawn(at_top));
         assert_eq!(
             commands,
-            [Command::Slack(Request::History {
-                conversation: c("C2"),
+            [ask(Request::History {
+                conversation: id("C2"),
                 before: Some(seconds(2))
             })]
         );
@@ -1294,7 +1984,7 @@ mod tests {
         let mut app = reading_random();
         app.focus = Focus::Timeline;
         let selected = |app: &App| {
-            let timeline = &app.workspace().unwrap().timelines[&c("C2")];
+            let timeline = &workspace(app, W0).timelines[&id("C2")];
             app.conversation_pane.selected(timeline)
         };
         assert_eq!(selected(&app), Some(seconds(5)));
@@ -1315,21 +2005,21 @@ mod tests {
         );
         assert_eq!(
             commands,
-            [Command::Slack(Request::Replies {
-                conversation: c("C2"),
+            [ask(Request::Replies {
+                conversation: id("C2"),
                 parent: seconds(5)
             })]
         );
 
         let replies = vec![message(5, "U2", RichText::plain("hi")), reply(6, 5)];
         let result = Ok(replies);
-        let commands = app.update(Event::Slack(Update::Replies {
-            conversation: c("C2"),
+        let commands = app.update(slack(Update::Replies {
+            conversation: id("C2"),
             parent: seconds(5),
             result,
         }));
-        assert_eq!(commands, [Command::Slack(Request::User(UserId::new("U3")))]);
-        let thread = &app.workspace().unwrap().threads[&(c("C2"), seconds(5))];
+        assert_eq!(commands, [ask(Request::User(UserId::new("U3")))]);
+        let thread = &workspace(&app, W0).threads[&(id("C2"), seconds(5))];
         assert_eq!(thread.messages().len(), 2);
 
         app.update(key(KeyCode::Esc));
@@ -1419,8 +2109,8 @@ mod tests {
         app.focus = Focus::Timeline;
         app.update(key(KeyCode::Enter));
         let result = Ok(vec![message(5, "U2", RichText::plain("hi"))]);
-        app.update(Event::Slack(Update::Replies {
-            conversation: c("C2"),
+        app.update(slack(Update::Replies {
+            conversation: id("C2"),
             parent: seconds(5),
             result,
         }));
@@ -1429,8 +2119,8 @@ mod tests {
         let commands = app.update(key(KeyCode::Enter));
         assert_eq!(
             commands,
-            [Command::Slack(Request::Post {
-                conversation: c("C2"),
+            [ask(Request::Post {
+                conversation: id("C2"),
                 thread: Some(seconds(5)),
                 text: "on it".into(),
                 id: 0,
@@ -1442,24 +2132,24 @@ mod tests {
             reply_to: Some(seconds(5)),
             ..message(7, "UME", RichText::plain("on it"))
         };
-        app.update(Event::Slack(Update::Posted {
+        app.update(slack(Update::Posted {
             id: 0,
-            conversation: c("C2"),
+            conversation: id("C2"),
             result: Ok(posted.clone()),
         }));
         // The live echo of the same Reply changes nothing.
         let echo = Update::Live(LiveEvent::Posted {
-            conversation: c("C2"),
+            conversation: id("C2"),
             message: posted,
         });
-        app.update(Event::Slack(echo));
+        app.update(slack(echo));
 
-        let workspace = app.workspace().unwrap();
+        let workspace = workspace(&app, W0);
         assert_eq!(
-            workspace.threads[&(c("C2"), seconds(5))].messages().len(),
+            workspace.threads[&(id("C2"), seconds(5))].messages().len(),
             2
         );
-        let parent = workspace.timelines[&c("C2")].get(seconds(5)).unwrap();
+        let parent = workspace.timelines[&id("C2")].get(seconds(5)).unwrap();
         assert_eq!(
             parent.thread.unwrap().replies,
             2,
@@ -1473,40 +2163,40 @@ mod tests {
         app.focus = Focus::Timeline;
         app.update(key(KeyCode::Enter));
         let result = Ok(vec![message(5, "U2", RichText::plain("hi")), reply(6, 5)]);
-        app.update(Event::Slack(Update::Replies {
-            conversation: c("C2"),
+        app.update(slack(Update::Replies {
+            conversation: id("C2"),
             parent: seconds(5),
             result,
         }));
-        let live = |event| Event::Slack(Update::Live(event));
+        let live = |event| slack(Update::Live(event));
 
         let edited = Message {
             edited: true,
             ..reply(6, 5)
         };
         app.update(live(LiveEvent::Edited {
-            conversation: c("C2"),
+            conversation: id("C2"),
             message: edited,
         }));
         let wave = slackers_model::Emoji::named("wave");
         app.update(live(LiveEvent::Reacted {
-            conversation: c("C2"),
+            conversation: id("C2"),
             ts: seconds(5),
             emoji: wave,
             mine: false,
             change: slackers_model::ReactionChange::Added,
         }));
-        let thread = |app: &App| app.workspace().unwrap().threads[&(c("C2"), seconds(5))].clone();
+        let thread = |app: &App| workspace(app, W0).threads[&(id("C2"), seconds(5))].clone();
         assert!(thread(&app).get(seconds(6)).unwrap().edited);
         assert_eq!(thread(&app).get(seconds(5)).unwrap().reactions.len(), 1);
-        let channel_parent = app.workspace().unwrap().timelines[&c("C2")]
+        let channel_parent = workspace(&app, W0).timelines[&id("C2")]
             .get(seconds(5))
             .unwrap()
             .clone();
         assert_eq!(channel_parent.reactions.len(), 1, "the channel's copy too");
 
         app.update(live(LiveEvent::Deleted {
-            conversation: c("C2"),
+            conversation: id("C2"),
             ts: seconds(6),
         }));
         assert!(thread(&app).get(seconds(6)).is_none());
@@ -1531,8 +2221,8 @@ mod tests {
             inlines.push(Inline::User(me.clone()));
         }
         let post = |conversation: &str, message: Message| {
-            Event::Slack(Update::Live(LiveEvent::Posted {
-                conversation: c(conversation),
+            slack(Update::Live(LiveEvent::Posted {
+                conversation: id(conversation),
                 message,
             }))
         };
@@ -1542,15 +2232,17 @@ mod tests {
 
         app.update(post("C1", message(12, "U2", mention)));
         app.update(post("D1", message(13, "U9", RichText::plain("dm"))));
-        let mentions = |app: &App, id: &str| app.workspace().unwrap().activity[&c(id)].mentions();
+        let mentions = |app: &App, conversation: &str| {
+            workspace(app, W0).activity[&id(conversation)].mentions()
+        };
         assert_eq!(mentions(&app, "C1"), 1);
         assert_eq!(mentions(&app, "D1"), 1, "DMs count as mentions");
 
         let marked = LiveEvent::Marked {
-            conversation: c("C1"),
+            conversation: id("C1"),
             up_to: seconds(12),
         };
-        app.update(Event::Slack(Update::Live(marked)));
+        app.update(slack(Update::Live(marked)));
         assert!(!unread(&app, "C1"));
     }
 
@@ -1568,8 +2260,8 @@ mod tests {
         let text = "hi :wave:\nthere".to_owned();
         assert_eq!(
             commands,
-            [Command::Slack(Request::Post {
-                conversation: c("C2"),
+            [ask(Request::Post {
+                conversation: id("C2"),
                 thread: None,
                 text,
                 id: 0
@@ -1595,18 +2287,18 @@ mod tests {
         app.update(key(KeyCode::Enter));
 
         let posted = message(9, "UME", RichText::plain("first"));
-        app.update(Event::Slack(Update::Posted {
+        app.update(slack(Update::Posted {
             id: 0,
-            conversation: c("C2"),
+            conversation: id("C2"),
             result: Ok(posted),
         }));
-        let timeline = &app.workspace().unwrap().timelines[&c("C2")];
+        let timeline = &workspace(&app, W0).timelines[&id("C2")];
         assert_eq!(timeline.newest(), Some(seconds(9)));
 
         keys(&mut app, "third");
-        app.update(Event::Slack(Update::Posted {
+        app.update(slack(Update::Posted {
             id: 1,
-            conversation: c("C2"),
+            conversation: id("C2"),
             result: Err(Error::SignedOut),
         }));
         assert!(app.outbox.is_empty());
@@ -1648,21 +2340,19 @@ mod tests {
         assert!(app.update(key(KeyCode::Enter)).is_empty());
         assert_eq!(app.notice.as_deref(), Some("not a command: :wq"));
 
-        keys(&mut app, ":q");
-        assert_eq!(app.update(key(KeyCode::Enter)), [Command::Quit]);
+        assert_eq!(command(&mut app, "q"), [Command::Quit]);
     }
 
     fn hit_names(app: &App) -> Vec<String> {
         let Mode::Search(search) = &app.mode else {
             panic!("not searching: {:?}", app.mode)
         };
-        let workspace = app.workspace().unwrap();
         search
             .hits
             .iter()
             .map(|hit| {
-                app.conversation_name(&workspace.conversations[hit.index])
-                    .to_owned()
+                let (workspace, found) = app.workspaces.conversation(&hit.conversation).unwrap();
+                workspace.conversation_name(found).to_owned()
             })
             .collect()
     }
@@ -1679,7 +2369,7 @@ mod tests {
             "everything, before typing"
         );
 
-        app.update(Event::Slack(Update::User(User {
+        app.update(slack(Update::User(User {
             id: UserId::new("U9"),
             name: "Rand Al'Thor".into(),
             avatar: None,
@@ -1695,12 +2385,12 @@ mod tests {
         let commands = app.update(key(KeyCode::Enter));
         assert_eq!(app.mode, Mode::Normal);
         assert_eq!(app.open, Some(c("D1")));
-        assert_eq!(app.selected, 2);
+        assert_eq!(selected(&app), Some(c("D1")));
         assert_eq!(app.focus, Focus::Timeline);
         assert_eq!(
             commands,
-            [Command::Slack(Request::History {
-                conversation: c("D1"),
+            [ask(Request::History {
+                conversation: id("D1"),
                 before: None
             })]
         );
@@ -1711,10 +2401,8 @@ mod tests {
         let (mut app, _) = ready_app();
         keys(&mut app, "/gen");
         app.update(key(KeyCode::Esc));
-        assert_eq!(
-            (&app.mode, app.selected, &app.open),
-            (&Mode::Normal, 1, &None)
-        );
+        assert_eq!((&app.mode, &app.open), (&Mode::Normal, &None));
+        assert_eq!(selected(&app), Some(c("C2")));
 
         keys(&mut app, "/g");
         app.update(key(KeyCode::Backspace));
@@ -1745,17 +2433,20 @@ mod tests {
         let (mut app, _) = ready_app();
         let mut custom = slackers_model::CustomEmojiSet::default();
         custom.insert_image("parrot", "https://e/p.gif");
-        app.update(Event::Slack(Update::CustomEmoji(custom)));
+        app.update(slack(Update::CustomEmoji(custom)));
 
         let wanted = || {
             Event::Drawn(Drawn {
-                wanted_pictures: vec!["https://e/p.gif".into()],
+                wanted_pictures: vec![WantedPicture {
+                    workspace: W0,
+                    url: "https://e/p.gif".into(),
+                }],
                 ..Drawn::default()
             })
         };
         assert_eq!(
             app.update(wanted()),
-            [Command::Slack(Request::Download {
+            [ask(Request::Download {
                 url: "https://e/p.gif".into()
             })]
         );
@@ -1765,7 +2456,7 @@ mod tests {
             result: Ok(vec![1, 2]),
         };
         assert_eq!(
-            app.update(Event::Slack(downloaded)),
+            app.update(slack(downloaded)),
             [Command::Prepare {
                 url: "https://e/p.gif".into(),
                 bytes: vec![1, 2],

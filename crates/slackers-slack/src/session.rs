@@ -121,6 +121,8 @@ pub struct Snapshot {
     pub workspace: WorkspaceId,
     /// The Workspace's name, as Slack shows it.
     pub name: String,
+    /// Where the Workspace's icon is, about 44 pixels square; `None` when it uses Slack's default.
+    pub icon: Option<String>,
     /// The signed-in user.
     pub me: UserId,
     /// The Conversations in the user's sidebar, with their Activity, in no particular order.
