@@ -11,9 +11,10 @@ use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, Borders, Paragraph, Wrap};
 use ratatui_textarea::TextArea;
+use slackers_gfx::{CellBox, Fit};
 use slackers_model::{
-    Activity, Author, Block as TextBlock, Broadcast, Conversation, ConversationKind, Emoji, Inline,
-    Message, RichText, Style as TextStyle, Timeline, Ts,
+    Activity, Author, Block as TextBlock, Broadcast, Conversation, ConversationKind, Emoji, File,
+    Image, Inline, Message, RichText, Style as TextStyle, Timeline, Ts,
 };
 use slackers_slack::Connection;
 use unicode_width::UnicodeWidthStr as _;
@@ -42,6 +43,9 @@ const SPLIT_AT: u16 = 120;
 
 /// Cells left of a Message's content, holding its author's avatar: two cells of picture and a space.
 const GUTTER: u16 = 3;
+
+/// The most room an image shared in a Message takes; one smaller than this shows at its own size.
+const IMAGE: CellBox = CellBox { cols: 60, rows: 15 };
 
 /// Messages by the same author less than this far apart share one header.
 const GROUP_WITHIN: u64 = 5 * 60 * 1_000_000;
@@ -367,6 +371,7 @@ fn workspace_marker(
                 drawn.wanted_pictures.push(WantedPicture {
                     workspace: key,
                     url: url.clone(),
+                    fit: Fit::Emoji,
                 });
             }
             fallback
@@ -501,8 +506,8 @@ struct Rendered {
     lines: Vec<Line<'static>>,
     /// How many of `lines` come before the Message itself, such as a day's rule; they aren't highlighted.
     leading: usize,
-    /// Pictures it would show, had they been loaded, by URL.
-    wanted: Vec<String>,
+    /// Pictures it would show, had they been loaded.
+    wanted: Vec<WantedPicture>,
     /// When one of its pictures next changes frame, as animation time.
     next_change: Option<Duration>,
 }
@@ -560,13 +565,7 @@ fn draw_pane(
         if range.end <= start || range.start >= end {
             continue;
         }
-        let workspace = view.place.conversation.workspace;
-        drawn.wanted_pictures.extend(
-            block
-                .wanted
-                .into_iter()
-                .map(|url| WantedPicture { workspace, url }),
-        );
+        drawn.wanted_pictures.extend(block.wanted);
         drawn.next_change = earliest(drawn.next_change, block.next_change);
         if block.ts.is_some() && block.ts == selected {
             let message = (range.start + block.leading).max(start)..range.end.min(end);
@@ -647,7 +646,7 @@ fn lay_out(
                 p.author == message.author
                     && message.ts.as_micros().saturating_sub(p.ts.as_micros()) < GROUP_WITHIN
             });
-        let mut renderer = Renderer::new(app, workspace, width, zone);
+        let mut renderer = Renderer::new(app, workspace, place.conversation.workspace, width, zone);
         renderer.in_thread = in_thread;
         lines.extend(renderer.message(message, grouped));
         rendered.push(Rendered {
@@ -675,7 +674,7 @@ fn lay_out(
         .iter()
         .filter(|outgoing| &outgoing.place == place)
     {
-        let mut renderer = Renderer::new(app, workspace, width, zone);
+        let mut renderer = Renderer::new(app, workspace, place.conversation.workspace, width, zone);
         let lines = renderer.sending(&outgoing.text);
         rendered.push(Rendered {
             ts: None,
@@ -728,11 +727,13 @@ fn draw_composer(
 struct Renderer<'a> {
     app: &'a App,
     workspace: &'a Workspace,
+    /// Where `workspace` is, to fetch its pictures through.
+    key: WorkspaceKey,
     /// Room for content, right of the gutter, in cells.
     width: u16,
     zone: &'a TimeZone,
-    /// Pictures it would show, had they been loaded, by URL.
-    wanted: Vec<String>,
+    /// Pictures it would show, had they been loaded.
+    wanted: Vec<WantedPicture>,
     /// When one of its pictures next changes frame, as animation time.
     next_change: Option<Duration>,
     now: Duration,
@@ -741,11 +742,18 @@ struct Renderer<'a> {
 }
 
 impl<'a> Renderer<'a> {
-    /// A renderer for lines `width` cells wide, gutter included.
-    fn new(app: &'a App, workspace: &'a Workspace, width: u16, zone: &'a TimeZone) -> Self {
+    /// A renderer for lines `width` cells wide, gutter included, of Messages in `workspace`, which is at `key`.
+    fn new(
+        app: &'a App,
+        workspace: &'a Workspace,
+        key: WorkspaceKey,
+        width: u16,
+        zone: &'a TimeZone,
+    ) -> Self {
         Self {
             app,
             workspace,
+            key,
             width: width.saturating_sub(GUTTER),
             zone,
             wanted: Vec::new(),
@@ -779,10 +787,7 @@ impl<'a> Renderer<'a> {
                 .push(Span::styled(format!(" {}", icons::EDITED), DIM));
         }
         for file in &message.files {
-            content.push(Line::from(vec![
-                Span::styled(icons::FILE, DIM),
-                Span::styled(file.name.clone(), DIM),
-            ]));
+            content.extend(self.file(file));
         }
         if !message.reactions.is_empty() {
             let mut pieces = Vec::new();
@@ -858,12 +863,54 @@ impl<'a> Renderer<'a> {
             }
             PictureState::Awaiting { requested } => {
                 if !requested {
-                    self.wanted.push(url.to_owned());
+                    self.want(url, Fit::Emoji);
                 }
                 fallback
             }
             PictureState::Failed => fallback,
         }
+    }
+
+    /// A shared file's lines: an image as its picture, once loaded, and until then as a line saying what's coming,
+    /// followed by as many blank ones as the picture will take; anything else, or an image that can't be shown, as
+    /// its name.
+    fn file(&mut self, file: &File) -> Vec<Line<'static>> {
+        let named = |icon| {
+            Line::from(vec![
+                Span::styled(icon, DIM),
+                Span::styled(file.name.clone(), DIM),
+            ])
+        };
+        let Some(Image { url, width, height }) = &file.image else {
+            return vec![named(icons::FILE)];
+        };
+        match self.app.pictures.state(url) {
+            PictureState::Ready(picture) => {
+                self.next_change = earliest(self.next_change, picture.next_change(self.now));
+                (0..picture.cells().rows)
+                    .map(|row| Line::from(picture.row(row, self.now)))
+                    .collect()
+            }
+            PictureState::Awaiting { requested } => {
+                if !requested {
+                    self.want(url, Fit::Within(IMAGE));
+                }
+                let rows = CellBox::fitting(*width, *height, IMAGE, self.app.cell).rows;
+                let mut lines = vec![named(icons::IMAGE)];
+                lines.resize(usize::from(rows).max(1), Line::default());
+                lines
+            }
+            PictureState::Failed => vec![named(icons::FILE)],
+        }
+    }
+
+    /// Notes that the picture at `url` should be fetched, to be drawn to `fit`.
+    fn want(&mut self, url: &str, fit: Fit) {
+        self.wanted.push(WantedPicture {
+            workspace: self.key,
+            url: url.to_owned(),
+            fit,
+        });
     }
 
     fn text(&mut self, text: &RichText) -> Vec<Line<'static>> {
@@ -973,7 +1020,7 @@ impl<'a> Renderer<'a> {
             }
             Drawable::Awaiting { url, requested } => {
                 if !requested {
-                    self.wanted.push(url.to_owned());
+                    self.want(url, Fit::Emoji);
                 }
                 Piece::Text(format!(":{}:", emoji.name), DIM)
             }
@@ -1153,6 +1200,10 @@ mod tests {
     }
 
     const WIDTH: u16 = 80;
+    const CELL: slackers_gfx::CellSize = slackers_gfx::CellSize {
+        width: 10,
+        height: 20,
+    };
     const HEIGHT: u16 = 12;
 
     fn press(app: &mut App, code: KeyCode, modifiers: KeyModifiers) {
@@ -1180,11 +1231,21 @@ mod tests {
 
     /// Draws `app` `width` cells wide, and returns the screen, what the draw reported, and the cells' styles.
     fn render_sized(app: &App, width: u16) -> (Vec<String>, Drawn, ratatui::buffer::Buffer) {
-        let mut terminal = Terminal::new(TestBackend::new(width, HEIGHT)).unwrap();
+        render_at(app, width, HEIGHT)
+    }
+
+    /// Draws `app` `width` cells wide and `height` tall, and returns the screen, what the draw reported, and the
+    /// cells' styles.
+    fn render_at(
+        app: &App,
+        width: u16,
+        height: u16,
+    ) -> (Vec<String>, Drawn, ratatui::buffer::Buffer) {
+        let mut terminal = Terminal::new(TestBackend::new(width, height)).unwrap();
         let mut drawn = Drawn::default();
         terminal.draw(|frame| drawn = draw(frame, app)).unwrap();
         let buffer = terminal.backend().buffer().clone();
-        let rows = (0..HEIGHT)
+        let rows = (0..height)
             .map(|y| (0..width).map(|x| buffer[(x, y)].symbol()).collect())
             .collect();
         (rows, drawn, buffer)
@@ -1230,7 +1291,7 @@ mod tests {
 
     /// An app with `#general` open, holding one Message.
     fn reading_general() -> App {
-        let mut app = App::new(vec!["test".into()], Vec::new());
+        let mut app = App::new(vec!["test".into()], Vec::new(), CELL);
         let snapshot = ready("Test", None, vec![channel("C1", "general")]);
         app.update(Event::Slack(w(0), snapshot));
         press(&mut app, KeyCode::Down, KeyModifiers::NONE);
@@ -1341,8 +1402,68 @@ mod tests {
         let ana = WantedPicture {
             workspace: w(0),
             url: "https://a/ana.png".into(),
+            fit: Fit::Emoji,
         };
         assert_eq!(drawn.wanted_pictures, [ana]);
+    }
+
+    #[test]
+    fn an_image_takes_its_room_before_it_loads_and_its_name_if_it_cant() {
+        let mut app = reading_general();
+        let shot = File {
+            name: "shot.png".into(),
+            mimetype: "image/png".into(),
+            image: Some(Image {
+                url: "https://f/shot.png".into(),
+                width: 300,
+                height: 200,
+            }),
+        };
+        let start = reading_general_message().ts.as_micros();
+        let later = |seconds: u64, text: &str, files| Message {
+            ts: Ts::from_micros(start + seconds * 1_000_000),
+            content: RichText::plain(text),
+            files,
+            ..reading_general_message()
+        };
+        for message in [
+            later(60, "look", vec![shot]),
+            later(120, "after", Vec::new()),
+        ] {
+            let posted = slackers_slack::LiveEvent::Posted {
+                conversation: ConversationId::new("C1"),
+                message,
+            };
+            app.update(Event::Slack(w(0), Update::Live(posted)));
+        }
+
+        let (rows, drawn, _) = render_at(&app, WIDTH, 24);
+        let row =
+            |rows: &[String], text: &str| rows.iter().position(|row| row.contains(text)).unwrap();
+        // 300 × 200 pixels on 10 × 20 pixel cells: 30 columns by 10 rows, kept free while it loads.
+        assert_eq!(
+            row(&rows, "after") - row(&rows, "shot.png"),
+            10,
+            "{rows:#?}"
+        );
+        assert!(rows[row(&rows, "shot.png")].contains(&format!("{}shot.png", icons::IMAGE)));
+        let wanted = WantedPicture {
+            workspace: w(0),
+            url: "https://f/shot.png".into(),
+            fit: Fit::Within(IMAGE),
+        };
+        assert!(
+            drawn.wanted_pictures.contains(&wanted),
+            "{:?}",
+            drawn.wanted_pictures
+        );
+
+        app.update(Event::PictureFailed {
+            url: "https://f/shot.png".into(),
+        });
+        let (rows, _, _) = render_at(&app, WIDTH, 24);
+        assert_eq!(row(&rows, "after") - row(&rows, "shot.png"), 1);
+        assert!(rows[row(&rows, "shot.png")].contains(&format!("{}shot.png", icons::FILE)));
     }
 
     /// `reading_general` with the only Message's Thread open, holding one Reply.
@@ -1483,7 +1604,11 @@ mod tests {
             name: "K".into(),
             channels: channels(&["test#random", "other#dev"]),
         }];
-        let mut app = App::new(vec!["test".into(), "other".into()], virtual_workspaces);
+        let mut app = App::new(
+            vec!["test".into(), "other".into()],
+            virtual_workspaces,
+            CELL,
+        );
         let unread = Activity::counted(Ts::from_micros(1), Ts::from_micros(5), true, 0);
         let random = (channel("C2", "random").0, unread);
         let test = ready("Test", None, vec![channel("C1", "general"), random]);
@@ -1527,13 +1652,14 @@ mod tests {
         let icon = WantedPicture {
             workspace: w(1),
             url: "https://i/other.png".into(),
+            fit: Fit::Emoji,
         };
         assert!(drawn.wanted_pictures.contains(&icon));
     }
 
     #[test]
     fn the_status_line_says_which_workspaces_arent_live() {
-        let mut app = App::new(vec!["test".into(), "other".into()], Vec::new());
+        let mut app = App::new(vec!["test".into(), "other".into()], Vec::new(), CELL);
         app.update(Event::Slack(w(0), ready("Test", None, Vec::new())));
         app.update(Event::Slack(w(0), Update::Connection(Connection::Live)));
         let status = screen(&app).pop().unwrap();
@@ -1551,7 +1677,7 @@ mod tests {
                 .any(|row| row.contains("couldn't sign in to other"))
         );
 
-        let mut app = App::new(vec!["test".into()], Vec::new());
+        let mut app = App::new(vec!["test".into()], Vec::new(), CELL);
         app.update(Event::Slack(w(0), ready("Test", None, Vec::new())));
         app.update(Event::Slack(w(0), Update::Connection(Connection::Live)));
         let status = screen(&app).pop().unwrap();

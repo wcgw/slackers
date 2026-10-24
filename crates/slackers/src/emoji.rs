@@ -111,7 +111,7 @@ mod tests {
             requested,
         };
         assert_eq!(emojis.drawable(&parrot, &pictures), awaiting(false));
-        pictures.request("https://e/parrot.gif");
+        pictures.request("https://e/parrot.gif", slackers_gfx::Fit::Emoji);
         assert_eq!(emojis.drawable(&parrot, &pictures), awaiting(true));
         pictures.failed("https://e/parrot.gif".into());
         assert_eq!(emojis.drawable(&parrot, &pictures), Drawable::Name);

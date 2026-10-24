@@ -18,7 +18,7 @@ base64 = "0.22.1"
 crossterm = { version = "0.29.0", features = ["event-stream"] }
 emojis = "0.9.1"
 futures-util = { version = "0.3.34", default-features = false, features = ["sink", "std"] }
-image = { version = "0.25.10", default-features = false, features = ["gif", "jpeg", "png"] }
+image = { version = "0.25.10", default-features = false, features = ["gif", "jpeg", "png", "webp"] }
 ratatui-textarea = "0.9.3"
 nucleo-matcher = "0.3.1"
 toml_edit = "0.25.17"

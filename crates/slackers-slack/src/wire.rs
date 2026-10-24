@@ -6,7 +6,7 @@ use serde::Deserialize;
 use serde_json::Value;
 use slackers_model::{
     Activity, Author, Block, Broadcast, Conversation, ConversationId, ConversationKind,
-    CustomEmojiSet, Emoji, File, Inline, Message, Reaction, ReactionChange, RichText, Style,
+    CustomEmojiSet, Emoji, File, Image, Inline, Message, Reaction, ReactionChange, RichText, Style,
     ThreadSummary, Ts, UserId, WorkspaceId,
 };
 
@@ -366,6 +366,53 @@ struct WireFile {
     name: String,
     #[serde(default)]
     mimetype: String,
+    /// Renditions of an image, by the longest side they fit in, with their sizes in pixels. Slack makes only those
+    /// smaller than the original.
+    #[serde(default)]
+    thumb_720: Option<String>,
+    #[serde(default)]
+    thumb_720_w: Option<u32>,
+    #[serde(default)]
+    thumb_720_h: Option<u32>,
+    #[serde(default)]
+    thumb_480: Option<String>,
+    #[serde(default)]
+    thumb_480_w: Option<u32>,
+    #[serde(default)]
+    thumb_480_h: Option<u32>,
+    #[serde(default)]
+    thumb_360: Option<String>,
+    #[serde(default)]
+    thumb_360_w: Option<u32>,
+    #[serde(default)]
+    thumb_360_h: Option<u32>,
+    /// A GIF's animated rendition, as big as `thumb_360`.
+    #[serde(default)]
+    thumb_360_gif: Option<String>,
+}
+
+impl WireFile {
+    /// The rendition to show inline: a GIF's animated one, else the largest still one up to 720 pixels, which
+    /// suits a terminal and is far smaller to fetch than the original. `None` when Slack made none: it isn't an
+    /// image, or it was deleted.
+    fn image(&self) -> Option<Image> {
+        let rendition = |url: &Option<String>, width: Option<u32>, height: Option<u32>| {
+            Some(Image {
+                url: url.clone()?,
+                width: width?,
+                height: height?,
+            })
+        };
+        let animated = if self.mimetype == "image/gif" {
+            rendition(&self.thumb_360_gif, self.thumb_360_w, self.thumb_360_h)
+        } else {
+            None
+        };
+        animated
+            .or_else(|| rendition(&self.thumb_720, self.thumb_720_w, self.thumb_720_h))
+            .or_else(|| rendition(&self.thumb_480, self.thumb_480_w, self.thumb_480_h))
+            .or_else(|| rendition(&self.thumb_360, self.thumb_360_w, self.thumb_360_h))
+    }
 }
 
 #[derive(Deserialize)]
@@ -420,6 +467,7 @@ fn message(value: Value, me: &UserId) -> Option<Message> {
         .files
         .into_iter()
         .map(|file| File {
+            image: file.image(),
             name: file.name,
             mimetype: file.mimetype,
         })
@@ -1165,6 +1213,50 @@ mod tests {
             None,
             "a DM with nobody"
         );
+    }
+
+    #[test]
+    fn image_files_show_their_best_rendition() {
+        let image = |file: Value| {
+            let posted =
+                message(json!({"ts": "1.0", "user": "U1", "files": [file]}), &me()).unwrap();
+            posted.files[0].image.clone()
+        };
+        let rendition = |url: &str, width, height| {
+            Some(Image {
+                url: url.into(),
+                width,
+                height,
+            })
+        };
+        let big = json!({
+            "name": "shot.png", "mimetype": "image/png",
+            "thumb_360": "https://f/360", "thumb_360_w": 360, "thumb_360_h": 203,
+            "thumb_480": "https://f/480", "thumb_480_w": 480, "thumb_480_h": 270,
+            "thumb_720": "https://f/720", "thumb_720_w": 720, "thumb_720_h": 405,
+            "thumb_1024": "https://f/1024", "thumb_1024_w": 1024, "thumb_1024_h": 576
+        });
+        assert_eq!(image(big), rendition("https://f/720", 720, 405));
+        let small = json!({
+            "name": "icon.png", "mimetype": "image/png",
+            "thumb_360": "https://f/360", "thumb_360_w": 300, "thumb_360_h": 300
+        });
+        assert_eq!(image(small), rendition("https://f/360", 300, 300));
+        let gif = json!({
+            "name": "party.gif", "mimetype": "image/gif",
+            "thumb_360": "https://f/360", "thumb_360_w": 360, "thumb_360_h": 360,
+            "thumb_360_gif": "https://f/360.gif",
+            "thumb_480": "https://f/480", "thumb_480_w": 480, "thumb_480_h": 480
+        });
+        assert_eq!(
+            image(gif),
+            rendition("https://f/360.gif", 360, 360),
+            "animated"
+        );
+        let document =
+            json!({"name": "notes.pdf", "mimetype": "application/pdf", "thumb_360": "https://f/p"});
+        assert_eq!(image(document), None, "no size, no image");
+        assert_eq!(image(json!({"name": "gone", "mode": "tombstone"})), None);
     }
 
     #[test]

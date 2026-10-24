@@ -62,6 +62,19 @@ pub struct File {
     pub name: String,
     /// Its media type, such as `image/png`; empty when Slack didn't say.
     pub mimetype: String,
+    /// How to show it inline; `None` unless it's an image Slack made a rendition of.
+    pub image: Option<Image>,
+}
+
+/// An image to show inline: where to fetch it, and how big it is.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Image {
+    /// Where it is.
+    pub url: String,
+    /// Its width, in pixels.
+    pub width: u32,
+    /// Its height, in pixels.
+    pub height: u32,
 }
 
 impl Message {

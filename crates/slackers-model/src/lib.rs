@@ -15,6 +15,6 @@ pub use activity::Activity;
 pub use conversation::{Conversation, ConversationKind};
 pub use emoji::{CustomEmoji, CustomEmojiSet, Emoji};
 pub use id::{ConversationId, ParseTsError, Ts, UserId, WorkspaceId};
-pub use message::{Author, File, Message, Reaction, ThreadSummary};
+pub use message::{Author, File, Image, Message, Reaction, ThreadSummary};
 pub use text::{Block, Broadcast, Inline, RichText, Style};
 pub use timeline::{ReactionChange, Timeline};

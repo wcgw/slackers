@@ -70,12 +70,12 @@ fn main() -> Result<()> {
         .iter()
         .map(|label| credentials::load(label))
         .collect();
-    let app = App::new(labels, config.virtual_workspaces);
     let runtime = tokio::runtime::Runtime::new()?;
 
     let mut terminal = ratatui::try_init()?;
     terminal_extras(true)?;
     let cell = CellSize::query();
+    let app = App::new(labels, config.virtual_workspaces, cell);
     let outcome = runtime.block_on(run(&mut terminal, app, credentials, config_path, cell));
     // Best effort on the way out: the terminal drops these with its screen anyway.
     let _ = terminal_extras(false);

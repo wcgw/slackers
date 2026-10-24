@@ -13,7 +13,7 @@ use std::time::{Duration, Instant};
 use crossterm::event::{Event as TerminalEvent, KeyCode, KeyEvent, KeyEventKind, KeyModifiers};
 use ratatui::style::Style;
 use ratatui_textarea::TextArea;
-use slackers_gfx::{Fit, Picture};
+use slackers_gfx::{CellSize, Fit, Picture};
 use slackers_model::{
     Activity, Author, Conversation, ConversationId, ConversationKind, Inline, Message, Timeline,
     Ts, UserId,
@@ -73,11 +73,13 @@ pub(crate) struct Drawn {
     pub(crate) thread: Option<Settled>,
 }
 
-/// A picture to fetch, and the Workspace to fetch it through: Slack serves a Workspace's files to its members only.
+/// A picture to fetch, the Workspace to fetch it through (Slack serves a Workspace's files to its members only), and
+/// how big to draw it.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) struct WantedPicture {
     pub(crate) workspace: WorkspaceKey,
     pub(crate) url: String,
+    pub(crate) fit: Fit,
 }
 
 /// Something for the runtime to do.
@@ -344,8 +346,10 @@ pub(crate) struct App {
     pub(crate) sidebar: Sidebar,
     /// The latest thing worth telling the user, usually a problem.
     pub(crate) notice: Option<String>,
-    /// Custom Emoji, avatars and Workspace icons, fetched as they come on screen.
+    /// Custom Emoji, avatars, Workspace icons and images, fetched as they come on screen.
     pub(crate) pictures: Pictures,
+    /// How big the terminal's cells are, so that a picture takes its room before it loads.
+    pub(crate) cell: CellSize,
     pub(crate) mode: Mode,
     pub(crate) open: Option<ConversationRef>,
     /// Where the user is in the open Conversation.
@@ -376,8 +380,13 @@ pub(crate) struct App {
 }
 
 impl App {
-    /// An app signing in to the Workspaces with these `labels`, in this order, and listing `virtual_workspaces`.
-    pub(crate) fn new(labels: Vec<String>, virtual_workspaces: Vec<VirtualWorkspace>) -> Self {
+    /// An app signing in to the Workspaces with these `labels`, in this order, and listing `virtual_workspaces`, on
+    /// a terminal with cells of `cell` pixels.
+    pub(crate) fn new(
+        labels: Vec<String>,
+        virtual_workspaces: Vec<VirtualWorkspace>,
+        cell: CellSize,
+    ) -> Self {
         let sign_ins = labels
             .into_iter()
             .map(|label| SignIn {
@@ -391,6 +400,7 @@ impl App {
             sidebar: Sidebar::default(),
             notice: None,
             pictures: Pictures::default(),
+            cell,
             mode: Mode::Normal,
             open: None,
             conversation_pane: Pane::default(),
@@ -465,7 +475,7 @@ impl App {
             }
             Event::Drawn(drawn) => {
                 for wanted in drawn.wanted_pictures {
-                    if self.pictures.request(&wanted.url) {
+                    if self.pictures.request(&wanted.url, wanted.fit) {
                         let request = Request::Download { url: wanted.url };
                         commands.push(Command::Slack(wanted.workspace, request));
                     }
@@ -1102,15 +1112,11 @@ impl App {
                 }
             }
             Update::Downloaded { url, result } => {
-                if !self.pictures.awaits(&url) {
+                let Some(fit) = self.pictures.awaited(&url) else {
                     return;
-                }
+                };
                 match result {
-                    Ok(bytes) => commands.push(Command::Prepare {
-                        url,
-                        bytes,
-                        fit: Fit::Emoji,
-                    }),
+                    Ok(bytes) => commands.push(Command::Prepare { url, bytes, fit }),
                     Err(error) => {
                         tracing::warn!(%error, "couldn't download a picture");
                         self.pictures.failed(url);
@@ -1458,6 +1464,10 @@ mod tests {
     use super::*;
 
     const W0: WorkspaceKey = WorkspaceKey(0);
+    const CELL: CellSize = CellSize {
+        width: 10,
+        height: 20,
+    };
     const W1: WorkspaceKey = WorkspaceKey(1);
 
     fn conversation(id: &str, kind: ConversationKind, name: &str) -> Conversation {
@@ -1604,7 +1614,7 @@ mod tests {
 
     /// An app signed in to one Workspace, `test`, which [`test_snapshot`] shows.
     fn ready_app() -> (App, Vec<Command>) {
-        let mut app = App::new(vec!["test".into()], Vec::new());
+        let mut app = App::new(vec!["test".into()], Vec::new(), CELL);
         let commands = app.update(slack(Update::Ready(Box::new(test_snapshot()))));
         (app, commands)
     }
@@ -1625,7 +1635,11 @@ mod tests {
                 },
             ],
         }];
-        let mut app = App::new(vec!["test".into(), "other".into()], virtual_workspaces);
+        let mut app = App::new(
+            vec!["test".into(), "other".into()],
+            virtual_workspaces,
+            CELL,
+        );
         app.update(slack(Update::Ready(Box::new(test_snapshot()))));
         let other = snapshot(
             "Other",
@@ -1706,7 +1720,7 @@ mod tests {
 
     #[test]
     fn workspaces_sign_in_on_their_own() {
-        let mut app = App::new(vec!["test".into(), "other".into()], Vec::new());
+        let mut app = App::new(vec!["test".into(), "other".into()], Vec::new(), CELL);
         assert_eq!(sidebar(&app), [">test", ">other"]);
         app.update(Event::CantSignIn {
             workspace: W1,
@@ -1763,6 +1777,7 @@ mod tests {
             wanted_pictures: vec![WantedPicture {
                 workspace: W1,
                 url: "https://e/p.png".into(),
+                fit: Fit::Emoji,
             }],
             ..Drawn::default()
         };
@@ -2261,7 +2276,7 @@ mod tests {
                 channel: "later".into(),
             }],
         };
-        let mut app = App::new(vec!["test".into()], vec![later]);
+        let mut app = App::new(vec!["test".into()], vec![later], CELL);
         app.update(slack(Update::Ready(Box::new(test_snapshot()))));
         let joined = |conversation| {
             slack(Update::Live(LiveEvent::Joined {
@@ -2525,11 +2540,14 @@ mod tests {
         custom.insert_image("parrot", "https://e/p.gif");
         app.update(slack(Update::CustomEmoji(custom)));
 
+        // Each picture is drawn to its own fit, which the request says.
+        let fit = Fit::Within(slackers_gfx::CellBox { cols: 4, rows: 2 });
         let wanted = || {
             Event::Drawn(Drawn {
                 wanted_pictures: vec![WantedPicture {
                     workspace: W0,
                     url: "https://e/p.gif".into(),
+                    fit,
                 }],
                 ..Drawn::default()
             })
@@ -2550,7 +2568,7 @@ mod tests {
             [Command::Prepare {
                 url: "https://e/p.gif".into(),
                 bytes: vec![1, 2],
-                fit: Fit::Emoji
+                fit
             }]
         );
     }

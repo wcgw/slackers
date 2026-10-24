@@ -52,8 +52,8 @@ impl CellBox {
     pub const EMOJI: Self = Self { cols: 2, rows: 1 };
 
     /// The smallest box showing a `width` × `height` pixel picture at its native size, shrunk (keeping the aspect
-    /// ratio) to fit within `max`.
-    fn fitting(width: u32, height: u32, max: CellBox, cell: CellSize) -> Self {
+    /// ratio) to fit within `max`, on cells of `cell` pixels: the box [`Fit::Within`] `max` draws it in.
+    pub fn fitting(width: u32, height: u32, max: CellBox, cell: CellSize) -> Self {
         let max = Self {
             cols: max.cols.clamp(1, kitty::MAX_CELLS),
             rows: max.rows.clamp(1, kitty::MAX_CELLS),
@@ -94,7 +94,7 @@ pub enum Fit {
 /// Why a picture couldn't be prepared.
 #[derive(Debug, thiserror::Error)]
 pub enum Error {
-    /// The bytes aren't an image in a format slackers reads (GIF, PNG, JPEG), or are corrupt.
+    /// The bytes aren't an image in a format slackers reads (GIF, PNG, JPEG, WebP), or are corrupt.
     #[error("couldn't decode the image")]
     Decode(#[from] image::ImageError),
     /// The image has no frames to show.
@@ -114,7 +114,7 @@ pub struct Prepared {
     picture: Picture,
 }
 
-/// Decodes `bytes` (every frame of a GIF; the single frame of a PNG or JPEG), sizes it to `fit` cells of `cell`
+/// Decodes `bytes` (every frame of a GIF; the single frame of a PNG, JPEG or WebP), sizes it to `fit` cells of `cell`
 /// pixels, and stages its frames for the terminal under fresh `ids`.
 ///
 /// Slow: it decodes, resizes and writes files. Call it off the UI thread.

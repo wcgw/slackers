@@ -17,6 +17,8 @@ pub(crate) const MENTION: &str = "\u{f486} ";
 pub(crate) const UNREAD: &str = "\u{f444} ";
 /// `oct-comment_discussion`: a Thread's Replies.
 pub(crate) const THREAD: &str = "\u{f442} ";
+/// `oct-image`: an image on its way.
+pub(crate) const IMAGE: &str = "\u{f4e5} ";
 /// `oct-paperclip`: a shared file.
 pub(crate) const FILE: &str = "\u{f4fb} ";
 /// `oct-pencil`: an edited Message.
