@@ -41,11 +41,20 @@ pub enum Request {
     Post {
         /// Where.
         conversation: ConversationId,
+        /// The Thread to reply in, by its parent; `None` to post at the top level.
+        thread: Option<Ts>,
         /// What, as typed: `mrkdwn` markup such as `*bold*` and `:emoji:` applies, but `&`, `<` and `>` are
         /// taken literally.
         text: String,
         /// Any number the caller picks, to match the answer to the request.
         id: u64,
+    },
+    /// A Thread, parent and Replies; answered by [`Update::Replies`].
+    Replies {
+        /// Where.
+        conversation: ConversationId,
+        /// The Thread's parent.
+        parent: Ts,
     },
     /// Moves the user's Read Marker. Slack confirms with a [`LiveEvent::Marked`]; failures are only logged.
     Mark {
@@ -74,6 +83,15 @@ pub enum Update {
     },
     /// The answer to [`Request::User`].
     User(User),
+    /// The answer to [`Request::Replies`].
+    Replies {
+        /// Where.
+        conversation: ConversationId,
+        /// The Thread's parent.
+        parent: Ts,
+        /// The parent and its Replies, oldest first, or why there are none.
+        result: Result<Vec<Message>, Error>,
+    },
     /// The answer to [`Request::Post`].
     Posted {
         /// The request's `id`.
@@ -139,7 +157,7 @@ pub enum LiveEvent {
         /// What.
         message: Message,
     },
-    /// A top-level Message was edited; it replaces the one with the same [`Message::ts`].
+    /// A Message or a Reply was edited; it replaces the one with the same [`Message::ts`].
     Edited {
         /// Where.
         conversation: ConversationId,
@@ -288,13 +306,25 @@ async fn serve(api: &Api, request: Request, me: &UserId, notify: &Notify) {
         }
         Request::Post {
             conversation,
+            thread,
             text,
             id,
         } => {
-            let result = api.post(&conversation, &text, me).await;
+            let result = api.post(&conversation, thread, &text, me).await;
             notify(Update::Posted {
                 id,
                 conversation,
+                result,
+            });
+        }
+        Request::Replies {
+            conversation,
+            parent,
+        } => {
+            let result = api.replies(&conversation, parent, me).await;
+            notify(Update::Replies {
+                conversation,
+                parent,
                 result,
             });
         }

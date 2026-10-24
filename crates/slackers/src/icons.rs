@@ -23,6 +23,8 @@ pub(crate) const FILE: &str = "\u{f4fb} ";
 pub(crate) const EDITED: &str = "\u{f448} ";
 /// `fa-slack`: the Workspace.
 pub(crate) const WORKSPACE: &str = "\u{f198} ";
+/// `oct-chevron_right`: between the parts of a pane's title, as in a breadcrumb.
+pub(crate) const CRUMB: &str = "\u{f460} ";
 /// `md-account_circle`: a person, until their avatar loads.
 pub(crate) const AVATAR: &str = "\u{f0009} ";
 /// `md-robot`: a bot, until its avatar loads.

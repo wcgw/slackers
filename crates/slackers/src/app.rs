@@ -1,8 +1,9 @@
 //! The app's state, and how events change it. No I/O here: every effect is a [`Command`] for the runtime to carry
 //! out, so that `update` can be tested on its own.
 //!
-//! Keys work as in vim: Normal mode moves around, `i` enters Insert mode to write in the open Conversation, and
-//! `:` enters Command mode (`:q` quits).
+//! Keys work as in vim: Normal mode moves around (`j`/`k` from Message to Message, `Enter` opens a Thread, `\`
+//! jumps to the sidebar), `i` enters Insert mode to write in the open Conversation or Thread, `/` searches the
+//! sidebar, and `:` enters Command mode (`:q` quits).
 
 use std::collections::{HashMap, HashSet};
 use std::time::{Duration, Instant};
@@ -13,11 +14,12 @@ use ratatui_textarea::TextArea;
 use slackers_gfx::{Fit, Picture};
 use slackers_model::{
     Activity, Author, Conversation, ConversationId, ConversationKind, Inline, Message, Timeline,
-    UserId,
+    Ts, UserId,
 };
 use slackers_slack::{Connection, Error, LiveEvent, Request, Snapshot, Update, User};
 
 use crate::emoji::Emojis;
+use crate::pane::{Pane, Settled};
 use crate::pictures::Pictures;
 use crate::search::{Finder, Hit};
 
@@ -39,7 +41,7 @@ pub(crate) enum Event {
     PicturesLost,
     /// The external editor asked for with [`Command::Edit`] finished: with the new draft, or why there's none.
     Edited {
-        conversation: ConversationId,
+        place: Place,
         outcome: Result<String, String>,
     },
     /// What the last draw found; see [`Drawn`].
@@ -51,12 +53,12 @@ pub(crate) enum Event {
 pub(crate) struct Drawn {
     /// Pictures it would have shown, had they been loaded, by URL.
     pub(crate) wanted_pictures: Vec<String>,
-    /// How far up the open Timeline can scroll, in lines.
-    pub(crate) max_scroll: usize,
-    /// How many lines of Timeline fit on screen.
-    pub(crate) page: usize,
     /// When something drawn next changes frame, as animation time; `None` when nothing animates.
     pub(crate) next_change: Option<Duration>,
+    /// Where the open Conversation's pane settled; `None` when it wasn't on screen.
+    pub(crate) conversation: Option<Settled>,
+    /// Where the open Thread's pane settled; `None` when it wasn't on screen.
+    pub(crate) thread: Option<Settled>,
 }
 
 /// Something for the runtime to do.
@@ -70,10 +72,10 @@ pub(crate) enum Command {
         bytes: Vec<u8>,
         fit: Fit,
     },
-    /// Hand the terminal to `$EDITOR` to edit `text`, the draft for `conversation`, then report back with
+    /// Hand the terminal to `$EDITOR` to edit `text`, the draft for `place`, then report back with
     /// [`Event::Edited`] and [`Event::PicturesLost`].
     Edit {
-        conversation: ConversationId,
+        place: Place,
         text: String,
     },
     Quit,
@@ -84,7 +86,7 @@ pub(crate) enum Command {
 pub(crate) enum Mode {
     /// Keys move around the pane in [`Focus`].
     Normal,
-    /// Keys write the open Conversation's draft.
+    /// Keys write the draft for the focused pane's [`Place`].
     Insert,
     /// Keys write a command, shown after `:` on the status line.
     Command(String),
@@ -106,7 +108,18 @@ pub(crate) struct Search {
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum Focus {
     Sidebar,
+    /// The open Conversation's Messages.
     Timeline,
+    /// The open Thread's Messages.
+    Thread,
+}
+
+/// Where a draft is written and a Message posted: a Conversation, or a Thread in it.
+#[derive(Clone, Debug, PartialEq, Eq, Hash)]
+pub(crate) struct Place {
+    pub(crate) conversation: ConversationId,
+    /// The Thread, by its parent; `None` for the Conversation itself.
+    pub(crate) thread: Option<Ts>,
 }
 
 /// Where signing in stands.
@@ -125,9 +138,14 @@ pub(crate) struct Workspace {
     /// The sidebar, in display order: Channels by name, then DMs, most recently active first.
     pub(crate) conversations: Vec<Conversation>,
     pub(crate) activity: HashMap<ConversationId, Activity>,
+    /// Conversations' top-level Messages.
     pub(crate) timelines: HashMap<ConversationId, Timeline>,
+    /// Threads, by their Conversation and parent.
+    pub(crate) threads: HashMap<(ConversationId, Ts), Timeline>,
     /// Conversations with a history request in flight.
     loading: HashSet<ConversationId>,
+    /// Threads with a request for their Replies in flight.
+    loading_threads: HashSet<(ConversationId, Ts)>,
 }
 
 /// A Message on its way to Slack.
@@ -135,7 +153,7 @@ pub(crate) struct Workspace {
 pub(crate) struct Outgoing {
     /// Matches the [`Request::Post`] to its [`Update::Posted`].
     id: u64,
-    pub(crate) conversation: ConversationId,
+    pub(crate) place: Place,
     /// As typed.
     pub(crate) text: String,
 }
@@ -149,7 +167,7 @@ pub(crate) struct App {
     pub(crate) connection: Option<Connection>,
     /// The latest thing worth telling the user, usually a problem.
     pub(crate) notice: Option<String>,
-    /// People's names, as far as they've been looked up.
+    /// People, as far as they've been looked up.
     pub(crate) users: HashMap<UserId, User>,
     requested_users: HashSet<UserId>,
     pub(crate) emojis: Emojis,
@@ -159,11 +177,17 @@ pub(crate) struct App {
     /// The sidebar entry under the cursor.
     pub(crate) selected: usize,
     pub(crate) open: Option<ConversationId>,
+    /// Where the user is in the open Conversation.
+    pub(crate) conversation_pane: Pane,
+    /// The open Thread, in the open Conversation, by its parent.
+    pub(crate) open_thread: Option<Ts>,
+    /// Where the user is in the open Thread.
+    pub(crate) thread_pane: Pane,
     pub(crate) focus: Focus,
-    /// How many lines the open Timeline is scrolled up from its newest Message.
-    pub(crate) scroll: usize,
-    /// Unsent text, per Conversation.
-    pub(crate) drafts: HashMap<ConversationId, TextArea<'static>>,
+    /// Whether the sidebar shows. `\` hides it from within it, and brings it back. Whenever focus is on it, it shows.
+    pub(crate) sidebar_shown: bool,
+    /// Unsent text, per Place.
+    pub(crate) drafts: HashMap<Place, TextArea<'static>>,
     /// Messages posted but not yet confirmed, oldest first.
     pub(crate) outbox: Vec<Outgoing>,
     next_post: u64,
@@ -171,9 +195,11 @@ pub(crate) struct App {
     awaiting_chord: bool,
     /// Whether the terminal window has focus. Messages count as read only while it does.
     focused: bool,
+    /// Whether the open Conversation's pane was on screen at the last draw; a Thread may cover it.
+    conversation_shown: bool,
     finder: Finder,
-    /// The last [`Drawn`] report.
-    drawn: Drawn,
+    /// When something drawn next changes frame, as animation time.
+    next_change: Option<Duration>,
     /// When animations started; every picture is drawn against it, so copies of one emoji animate in step.
     epoch: Instant,
 }
@@ -192,15 +218,19 @@ impl App {
             mode: Mode::Normal,
             selected: 0,
             open: None,
+            conversation_pane: Pane::default(),
+            open_thread: None,
+            thread_pane: Pane::default(),
             focus: Focus::Sidebar,
-            scroll: 0,
+            sidebar_shown: true,
             drafts: HashMap::new(),
             outbox: Vec::new(),
             next_post: 0,
             awaiting_chord: false,
             focused: true,
+            conversation_shown: false,
             finder: Finder::new(),
-            drawn: Drawn::default(),
+            next_change: None,
             epoch: Instant::now(),
         }
     }
@@ -212,7 +242,7 @@ impl App {
 
     /// When the screen next needs redrawing for animation alone, as animation time.
     pub(crate) fn next_change(&self) -> Option<Duration> {
-        self.drawn.next_change
+        self.next_change
     }
 
     pub(crate) fn workspace(&self) -> Option<&Workspace> {
@@ -242,9 +272,13 @@ impl App {
         conversation_name(&self.users, conversation)
     }
 
-    /// The open Conversation's draft, if it has one.
-    pub(crate) fn draft(&self) -> Option<&TextArea<'static>> {
-        self.drafts.get(self.open.as_ref()?)
+    /// Where Insert mode writes: the open Thread when its pane has focus, else the open Conversation.
+    pub(crate) fn writing_place(&self) -> Option<Place> {
+        let thread = self.open_thread.filter(|_| self.focus == Focus::Thread);
+        Some(Place {
+            conversation: self.open.clone()?,
+            thread,
+        })
     }
 
     /// Reacts to `event`, returning what the runtime should do.
@@ -261,12 +295,10 @@ impl App {
             Event::PictureReady { url, picture } => self.pictures.loaded(url, picture),
             Event::PictureFailed { url } => self.pictures.failed(url),
             Event::PicturesLost => self.pictures.forget_all(),
-            Event::Edited {
-                conversation,
-                outcome,
-            } => match outcome {
+            Event::Edited { place, outcome } => match outcome {
                 Ok(text) => {
-                    self.drafts.insert(conversation, draft_of(&text));
+                    let draft = draft_of(&text, &place);
+                    self.drafts.insert(place, draft);
                 }
                 Err(reason) => self.notice = Some(reason),
             },
@@ -276,10 +308,16 @@ impl App {
                         commands.push(Command::Slack(Request::Download { url: url.clone() }));
                     }
                 }
-                self.scroll = self.scroll.min(drawn.max_scroll);
-                self.drawn = drawn;
-                if self.scroll == self.drawn.max_scroll {
-                    self.load_older(&mut commands);
+                self.next_change = drawn.next_change;
+                self.conversation_shown = drawn.conversation.is_some();
+                if let Some(settled) = drawn.conversation {
+                    self.conversation_pane.adopt(settled);
+                    if settled.scroll == settled.max_scroll {
+                        self.load_older(&mut commands);
+                    }
+                }
+                if let Some(settled) = drawn.thread {
+                    self.thread_pane.adopt(settled);
                 }
             }
         }
@@ -309,30 +347,47 @@ impl App {
                 self.mode = Mode::Command(String::new());
                 return;
             }
+            (KeyCode::Char('\\'), false) => {
+                match self.focus {
+                    Focus::Sidebar if self.open.is_some() => {
+                        self.sidebar_shown = false;
+                        self.focus = Focus::Timeline;
+                    }
+                    Focus::Sidebar => self.notice = Some("open a conversation first".to_owned()),
+                    Focus::Timeline | Focus::Thread => self.focus_sidebar(),
+                }
+                return;
+            }
             (KeyCode::Char('/'), false) => {
                 self.mode = Mode::Search(Search {
                     query: String::new(),
                     hits: Vec::new(),
                     selected: 0,
                 });
-                self.focus = Focus::Sidebar;
+                self.focus_sidebar();
                 return;
             }
             (KeyCode::Char('i'), false) => {
-                if let Some(open) = self.open.clone() {
-                    self.drafts.entry(open).or_insert_with(|| draft_of(""));
-                    self.mode = Mode::Insert;
+                if self.focus == Focus::Sidebar {
                     self.focus = Focus::Timeline;
-                    self.scroll = 0;
-                } else {
-                    self.notice = Some("open a conversation first".to_owned());
+                }
+                match self.writing_place() {
+                    Some(place) => {
+                        self.drafts
+                            .entry(place.clone())
+                            .or_insert_with(|| draft_of("", &place));
+                        self.mode = Mode::Insert;
+                    }
+                    None => self.notice = Some("open a conversation first".to_owned()),
                 }
                 return;
             }
             (KeyCode::Tab, _) => {
                 self.focus = match self.focus {
                     Focus::Sidebar => Focus::Timeline,
-                    Focus::Timeline => Focus::Sidebar,
+                    Focus::Timeline if self.open_thread.is_some() => Focus::Thread,
+                    Focus::Timeline | Focus::Thread if self.sidebar_shown => Focus::Sidebar,
+                    Focus::Timeline | Focus::Thread => Focus::Timeline,
                 };
                 return;
             }
@@ -355,41 +410,57 @@ impl App {
                 }
                 _ => {}
             },
-            Focus::Timeline => match (key.code, control) {
-                (KeyCode::Char('u'), true) | (KeyCode::PageUp, _) => {
-                    self.scroll_by(self.half_page(), commands);
+            Focus::Timeline => match key.code {
+                KeyCode::Enter => self.open_selected_thread(commands),
+                KeyCode::Char('h') | KeyCode::Left | KeyCode::Esc => self.focus_sidebar(),
+                _ => {
+                    let (Some(open), Phase::Ready(workspace)) = (&self.open, &self.phase) else {
+                        return;
+                    };
+                    if let Some(timeline) = workspace.timelines.get(open) {
+                        move_in(&mut self.conversation_pane, timeline, key);
+                    }
                 }
-                (KeyCode::Char('d'), true) | (KeyCode::PageDown, _) => {
-                    self.scroll_by(-self.half_page(), commands);
+            },
+            Focus::Thread => match key.code {
+                KeyCode::Char('h') | KeyCode::Left | KeyCode::Esc => {
+                    self.open_thread = None;
+                    self.focus = Focus::Timeline;
                 }
-                (KeyCode::Char('k') | KeyCode::Up, _) => self.scroll_by(1, commands),
-                (KeyCode::Char('j') | KeyCode::Down, _) => self.scroll_by(-1, commands),
-                (KeyCode::Char('g') | KeyCode::Home, _) => self.scroll_by(isize::MAX, commands),
-                (KeyCode::Char('G') | KeyCode::End, _) => self.scroll = 0,
-                (KeyCode::Char('h') | KeyCode::Left | KeyCode::Esc, _) => {
-                    self.focus = Focus::Sidebar;
+                _ => {
+                    let (Some(open), Some(parent), Phase::Ready(workspace)) =
+                        (&self.open, self.open_thread, &self.phase)
+                    else {
+                        return;
+                    };
+                    if let Some(thread) = workspace.threads.get(&(open.clone(), parent)) {
+                        move_in(&mut self.thread_pane, thread, key);
+                    }
                 }
-                _ => {}
             },
         }
     }
 
     fn insert_key(&mut self, key: KeyEvent, commands: &mut Vec<Command>) {
-        let Some(open) = self.open.clone() else {
+        let Some(place) = self.writing_place() else {
             self.mode = Mode::Normal;
             return;
         };
         let control = key.modifiers.contains(KeyModifiers::CONTROL);
         let chord = std::mem::take(&mut self.awaiting_chord);
+        let draft = |drafts: &mut HashMap<Place, TextArea<'static>>, place: &Place| {
+            drafts
+                .entry(place.clone())
+                .or_insert_with(|| draft_of("", place))
+                .lines()
+                .join("\n")
+        };
         match (key.code, control) {
             (KeyCode::Esc, _) | (KeyCode::Char('c'), true) => self.mode = Mode::Normal,
             (KeyCode::Char('x'), true) => self.awaiting_chord = true,
             (KeyCode::Char('e'), true) if chord => {
-                let text = self.drafts.get(&open).map(|draft| draft.lines().join("\n"));
-                commands.push(Command::Edit {
-                    conversation: open,
-                    text: text.unwrap_or_default(),
-                });
+                let text = draft(&mut self.drafts, &place);
+                commands.push(Command::Edit { place, text });
             }
             // Shift+Enter needs the kitty keyboard protocol to tell it from Enter; Alt+Enter works without.
             (KeyCode::Enter, _)
@@ -398,15 +469,15 @@ impl App {
                     .intersects(KeyModifiers::SHIFT | KeyModifiers::ALT) =>
             {
                 self.drafts
-                    .entry(open)
-                    .or_insert_with(|| draft_of(""))
+                    .entry(place.clone())
+                    .or_insert_with(|| draft_of("", &place))
                     .insert_newline();
             }
-            (KeyCode::Enter, _) => self.send(open, commands),
+            (KeyCode::Enter, _) => self.send(place, commands),
             _ => {
                 self.drafts
-                    .entry(open)
-                    .or_insert_with(|| draft_of(""))
+                    .entry(place.clone())
+                    .or_insert_with(|| draft_of("", &place))
                     .input(key);
             }
         }
@@ -501,45 +572,64 @@ impl App {
         search.selected = search.selected.min(search.hits.len().saturating_sub(1));
     }
 
-    /// Posts the draft for `conversation`, unless it's blank, and empties it.
-    fn send(&mut self, conversation: ConversationId, commands: &mut Vec<Command>) {
-        let Some(draft) = self.drafts.get_mut(&conversation) else {
+    /// Opens the Thread of the open Conversation's selected Message, in its own pane, and asks for its Replies.
+    /// Any Message can start a Thread: one without Replies yet opens empty, ready for one.
+    fn open_selected_thread(&mut self, commands: &mut Vec<Command>) {
+        let (Some(open), Phase::Ready(workspace)) = (&self.open, &mut self.phase) else {
+            return;
+        };
+        let selected = workspace
+            .timelines
+            .get(open)
+            .and_then(|t| self.conversation_pane.selected(t));
+        let Some(parent) = selected else { return };
+        self.open_thread = Some(parent);
+        self.thread_pane = Pane::default();
+        self.focus = Focus::Thread;
+        let key = (open.clone(), parent);
+        if !workspace.threads.contains_key(&key) && workspace.loading_threads.insert(key) {
+            commands.push(Command::Slack(Request::Replies {
+                conversation: open.clone(),
+                parent,
+            }));
+        }
+    }
+
+    /// Posts the draft for `place`, unless it's blank, and empties it.
+    fn send(&mut self, place: Place, commands: &mut Vec<Command>) {
+        let Some(draft) = self.drafts.get_mut(&place) else {
             return;
         };
         let text = draft.lines().join("\n");
         if text.trim().is_empty() {
             return;
         }
-        *draft = draft_of("");
+        *draft = draft_of("", &place);
         let id = self.next_post;
         self.next_post += 1;
-        self.outbox.push(Outgoing {
-            id,
-            conversation: conversation.clone(),
-            text: text.clone(),
-        });
-        self.scroll = 0;
+        match place.thread {
+            Some(_) => self.thread_pane.newest(),
+            None => self.conversation_pane.newest(),
+        }
         commands.push(Command::Slack(Request::Post {
-            conversation,
-            text,
+            conversation: place.conversation.clone(),
+            thread: place.thread,
+            text: text.clone(),
             id,
         }));
+        self.outbox.push(Outgoing { id, place, text });
     }
 
-    /// Moves the open Conversation's Read Marker to its newest Message, if that's on screen: the window has focus
-    /// and the Timeline is scrolled to the bottom.
+    /// Moves the open Conversation's Read Marker to its newest Message, if that's on screen: the window has focus,
+    /// the Conversation's pane shows, and the newest Message is selected at the bottom.
     fn mark_seen(&mut self, commands: &mut Vec<Command>) {
-        if !self.focused || self.scroll != 0 {
+        if !self.focused || !self.conversation_shown || !self.conversation_pane.at_newest() {
             return;
         }
         let (Some(open), Phase::Ready(workspace)) = (&self.open, &mut self.phase) else {
             return;
         };
-        let newest = workspace
-            .timelines
-            .get(open)
-            .and_then(|t| t.messages().next_back())
-            .map(|m| m.ts);
+        let newest = workspace.timelines.get(open).and_then(Timeline::newest);
         let (Some(newest), Some(activity)) = (newest, workspace.activity.get_mut(open)) else {
             return;
         };
@@ -552,31 +642,21 @@ impl App {
         }
     }
 
+    /// Moves focus to the sidebar, showing it if it's hidden.
+    fn focus_sidebar(&mut self) {
+        self.sidebar_shown = true;
+        self.focus = Focus::Sidebar;
+    }
+
     fn select(&mut self, index: usize) {
         let count = self.workspace().map_or(0, |w| w.conversations.len());
         self.selected = index.min(count.saturating_sub(1));
     }
 
-    fn half_page(&self) -> isize {
-        isize::try_from(self.drawn.page / 2)
-            .unwrap_or(isize::MAX)
-            .max(1)
-    }
-
-    /// Scrolls the open Timeline `lines` up (or down, when negative), within what was last drawn.
-    fn scroll_by(&mut self, lines: isize, commands: &mut Vec<Command>) {
-        self.scroll = self
-            .scroll
-            .saturating_add_signed(lines)
-            .min(self.drawn.max_scroll);
-        if self.scroll == self.drawn.max_scroll {
-            self.load_older(commands);
-        }
-    }
-
     fn open(&mut self, id: ConversationId, commands: &mut Vec<Command>) {
-        self.scroll = 0;
-        self.drawn.max_scroll = 0;
+        self.conversation_pane = Pane::default();
+        self.conversation_shown = false;
+        self.open_thread = None;
         self.open = Some(id.clone());
         let Phase::Ready(workspace) = &mut self.phase else {
             return;
@@ -629,6 +709,29 @@ impl App {
                     Err(error) => self.notice = Some(describe(&error)),
                 }
             }
+            Update::Replies {
+                conversation,
+                parent,
+                result,
+            } => {
+                let Phase::Ready(workspace) = &mut self.phase else {
+                    return;
+                };
+                let key = (conversation, parent);
+                workspace.loading_threads.remove(&key);
+                match result {
+                    Ok(messages) => {
+                        let people: Vec<UserId> = messages.iter().flat_map(people_in).collect();
+                        let thread = workspace
+                            .threads
+                            .entry(key)
+                            .or_insert_with(|| Timeline::thread(parent));
+                        thread.add_history(messages, false);
+                        self.want_users(people, commands);
+                    }
+                    Err(error) => self.notice = Some(describe(&error)),
+                }
+            }
             Update::Posted {
                 id,
                 conversation,
@@ -644,28 +747,29 @@ impl App {
                             return;
                         };
                         // Slack moves the Read Marker past the user's own Message itself.
-                        if let Some(activity) = workspace.activity.get_mut(&conversation) {
+                        if message.reply_to.is_none()
+                            && let Some(activity) = workspace.activity.get_mut(&conversation)
+                        {
                             activity.mark_read(message.ts);
                         }
-                        if let Some(timeline) = workspace.timelines.get_mut(&conversation) {
-                            timeline.insert(message);
-                        }
+                        workspace.add(&conversation, message);
                     }
                     Err(error) => {
                         self.notice =
                             Some(format!("not sent, back in the draft: {}", describe(&error)));
                         // Put it back where it came from, ahead of anything typed since.
+                        let place = outgoing.place;
                         let draft = self
                             .drafts
-                            .entry(conversation)
-                            .or_insert_with(|| draft_of(""));
+                            .entry(place.clone())
+                            .or_insert_with(|| draft_of("", &place));
                         let typed_since = draft.lines().join("\n");
                         let restored = if typed_since.is_empty() {
                             outgoing.text
                         } else {
                             format!("{}\n{typed_since}", outgoing.text)
                         };
-                        *draft = draft_of(&restored);
+                        *draft = draft_of(&restored, &place);
                     }
                 }
             }
@@ -729,7 +833,9 @@ impl App {
             conversations: conversations.into_iter().map(|(c, _)| c).collect(),
             activity,
             timelines: HashMap::new(),
+            threads: HashMap::new(),
             loading: HashSet::new(),
+            loading_threads: HashSet::new(),
         }));
         self.want_users(partners, commands);
     }
@@ -755,9 +861,7 @@ impl App {
                     // Every DM Message counts as a Mention, as Slack's badges do.
                     activity.record(message.ts, is_dm || message.mentions(&workspace.me));
                 }
-                if let Some(timeline) = workspace.timelines.get_mut(&conversation) {
-                    timeline.insert(message);
-                }
+                workspace.add(&conversation, message);
                 self.want_users(people, commands);
             }
             LiveEvent::Edited {
@@ -765,11 +869,15 @@ impl App {
                 message,
             } => {
                 if let Some(timeline) = workspace.timelines.get_mut(&conversation) {
-                    timeline.insert(message);
+                    timeline.replace(message.clone());
+                }
+                let thread = (conversation, message.reply_to.unwrap_or(message.ts));
+                if let Some(thread) = workspace.threads.get_mut(&thread) {
+                    thread.replace(message);
                 }
             }
             LiveEvent::Deleted { conversation, ts } => {
-                if let Some(timeline) = workspace.timelines.get_mut(&conversation) {
+                for timeline in workspace.timelines_of(&conversation) {
                     timeline.remove(ts);
                 }
             }
@@ -780,7 +888,7 @@ impl App {
                 mine,
                 change,
             } => {
-                if let Some(timeline) = workspace.timelines.get_mut(&conversation) {
+                for timeline in workspace.timelines_of(&conversation) {
                     timeline.react(ts, &emoji, mine, change);
                 }
             }
@@ -809,8 +917,55 @@ impl App {
     }
 }
 
-/// What to call `conversation`, given the people known by name: a DM after the other person, anything else by its
-/// name.
+impl Workspace {
+    /// Adds a Message posted in `conversation` wherever it's held: its Timeline, which counts a Reply on its parent,
+    /// and its Thread's.
+    fn add(&mut self, conversation: &ConversationId, message: Message) {
+        if let Some(parent) = message.reply_to
+            && let Some(thread) = self.threads.get_mut(&(conversation.clone(), parent))
+        {
+            thread.insert(message.clone());
+        }
+        if let Some(timeline) = self.timelines.get_mut(conversation) {
+            timeline.insert(message);
+        }
+    }
+
+    /// `conversation`'s Timeline and those of its Threads, as far as they're held.
+    fn timelines_of<'a>(
+        &'a mut self,
+        conversation: &'a ConversationId,
+    ) -> impl Iterator<Item = &'a mut Timeline> {
+        let threads = self
+            .threads
+            .iter_mut()
+            .filter(move |((c, _), _)| c == conversation)
+            .map(|(_, t)| t);
+        self.timelines
+            .get_mut(conversation)
+            .into_iter()
+            .chain(threads)
+    }
+}
+
+/// Applies a key that moves around a pane of Messages to `pane`, over `timeline`: `j`/`k` from Message to Message,
+/// `g`/`G` to the oldest and newest, `Ctrl-e`/`Ctrl-y` a line, `Ctrl-d`/`Ctrl-u` half a page. Other keys do nothing.
+fn move_in(pane: &mut Pane, timeline: &Timeline, key: KeyEvent) {
+    let control = key.modifiers.contains(KeyModifiers::CONTROL);
+    match (key.code, control) {
+        (KeyCode::Char('e'), true) => pane.scroll_by(-1),
+        (KeyCode::Char('y'), true) => pane.scroll_by(1),
+        (KeyCode::Char('d'), true) | (KeyCode::PageDown, _) => pane.scroll_by(-pane.half_page()),
+        (KeyCode::Char('u'), true) | (KeyCode::PageUp, _) => pane.scroll_by(pane.half_page()),
+        (KeyCode::Char('j') | KeyCode::Down, false) => pane.down(timeline),
+        (KeyCode::Char('k') | KeyCode::Up, false) => pane.up(timeline),
+        (KeyCode::Char('g') | KeyCode::Home, false) => pane.oldest(timeline),
+        (KeyCode::Char('G') | KeyCode::End, false) => pane.newest(),
+        _ => {}
+    }
+}
+
+/// What to call `conversation`, given the people known: a DM after the other person, anything else by its name.
 fn conversation_name<'a>(
     users: &'a HashMap<UserId, User>,
     conversation: &'a Conversation,
@@ -823,11 +978,15 @@ fn conversation_name<'a>(
     }
 }
 
-/// A composer holding `text`, with the cursor at its end.
-fn draft_of(text: &str) -> TextArea<'static> {
+/// A composer for `place` holding `text`, with the cursor at its end.
+fn draft_of(text: &str, place: &Place) -> TextArea<'static> {
     let mut draft = TextArea::new(text.lines().map(str::to_owned).collect());
     draft.set_cursor_line_style(Style::default());
-    draft.set_placeholder_text("message");
+    draft.set_placeholder_text(if place.thread.is_some() {
+        "reply"
+    } else {
+        "message"
+    });
     draft.move_cursor(ratatui_textarea::CursorMove::Bottom);
     draft.move_cursor(ratatui_textarea::CursorMove::End);
     draft
@@ -858,7 +1017,7 @@ fn describe(error: &Error) -> String {
 
 #[cfg(test)]
 mod tests {
-    use slackers_model::{RichText, Ts, WorkspaceId};
+    use slackers_model::{RichText, WorkspaceId};
     use slackers_slack::HistoryPage;
 
     use super::*;
@@ -888,6 +1047,13 @@ mod tests {
         }
     }
 
+    fn reply(s: u64, parent: u64) -> Message {
+        Message {
+            reply_to: Some(seconds(parent)),
+            ..message(s, "U3", RichText::plain("reply"))
+        }
+    }
+
     fn key(code: KeyCode) -> Event {
         Event::Terminal(TerminalEvent::Key(KeyEvent::from(code)))
     }
@@ -907,6 +1073,27 @@ mod tests {
 
     fn c(id: &str) -> ConversationId {
         ConversationId::new(id)
+    }
+
+    fn place(conversation: &str, thread: Option<u64>) -> Place {
+        Place {
+            conversation: c(conversation),
+            thread: thread.map(seconds),
+        }
+    }
+
+    /// Reports a draw that showed the Conversation's pane, as tall as `height`, with everything fitting: the pane
+    /// adopts where it settled.
+    fn drawn(app: &mut App, height: usize) -> Vec<Command> {
+        let settled = Settled {
+            cursor: app.conversation_pane.cursor(),
+            height,
+            ..Settled::default()
+        };
+        app.update(Event::Drawn(Drawn {
+            conversation: Some(settled),
+            ..Drawn::default()
+        }))
     }
 
     /// An app signed in to a Workspace with two Channels and a DM, `#random` having unread Messages.
@@ -941,21 +1128,26 @@ mod tests {
         (app, commands)
     }
 
-    /// `ready_app` with `#random` open and its history loaded.
+    /// `ready_app` with `#random` open, drawn, and holding Messages at 2 and 5 seconds, the latter with a Reply.
     fn reading_random() -> App {
         let (mut app, _) = ready_app();
         app.update(key(KeyCode::Enter));
+        let parent = Message {
+            thread: Some(slackers_model::ThreadSummary {
+                replies: 1,
+                latest: seconds(6),
+            }),
+            ..message(5, "U2", RichText::plain("hi"))
+        };
         let page = HistoryPage {
-            messages: vec![
-                message(5, "U2", RichText::plain("hi")),
-                message(2, "U2", RichText::plain("hello")),
-            ],
+            messages: vec![parent, message(2, "U2", RichText::plain("hello"))],
             has_more: true,
         };
         app.update(Event::Slack(Update::History {
             conversation: c("C2"),
             result: Ok(page),
         }));
+        drawn(&mut app, 10);
         app
     }
 
@@ -980,7 +1172,7 @@ mod tests {
     }
 
     #[test]
-    fn opening_loads_history_asks_for_names_and_marks_it_read() {
+    fn opening_loads_history_asks_for_names_and_marks_it_read_once_shown() {
         let (mut app, _) = ready_app();
         assert_eq!(
             app.update(key(KeyCode::Enter)),
@@ -989,7 +1181,6 @@ mod tests {
                 before: None
             })]
         );
-        assert!(unread(&app, "C2"));
         let page = HistoryPage {
             messages: vec![message(5, "U2", RichText::plain("hi"))],
             has_more: false,
@@ -998,50 +1189,49 @@ mod tests {
             conversation: c("C2"),
             result: Ok(page),
         }));
+        assert_eq!(commands, [Command::Slack(Request::User(UserId::new("U2")))]);
+        assert!(unread(&app, "C2"), "not on screen yet");
+
         assert_eq!(
-            commands,
-            [
-                Command::Slack(Request::User(UserId::new("U2"))),
-                Command::Slack(Request::Mark {
-                    conversation: c("C2"),
-                    up_to: seconds(5)
-                }),
-            ]
+            drawn(&mut app, 10),
+            [Command::Slack(Request::Mark {
+                conversation: c("C2"),
+                up_to: seconds(5)
+            })]
         );
         assert!(!unread(&app, "C2"));
     }
 
     #[test]
-    fn nothing_is_marked_read_while_unfocused_or_scrolled_up() {
+    fn nothing_is_marked_read_while_unfocused_or_away_from_the_newest() {
         let (mut app, _) = ready_app();
         app.update(Event::Terminal(TerminalEvent::FocusLost));
         app.update(key(KeyCode::Enter));
         let page = HistoryPage {
-            messages: vec![message(5, "U2", RichText::plain("hi"))],
-            has_more: true,
+            messages: vec![
+                message(5, "U2", RichText::plain("hi")),
+                message(2, "U2", RichText::plain("ho")),
+            ],
+            has_more: false,
         };
         app.update(Event::Slack(Update::History {
             conversation: c("C2"),
             result: Ok(page),
         }));
+        drawn(&mut app, 10);
         assert!(unread(&app, "C2"));
 
-        app.update(Event::Drawn(Drawn {
-            max_scroll: 5,
-            page: 10,
-            ..Drawn::default()
-        }));
         app.update(key(KeyCode::Char('k')));
+        drawn(&mut app, 10);
         assert!(
             app.update(Event::Terminal(TerminalEvent::FocusGained))
                 .is_empty(),
-            "scrolled up"
+            "an older one is selected"
         );
         assert!(unread(&app, "C2"));
 
-        let commands = app.update(key(KeyCode::Char('G')));
         assert_eq!(
-            commands,
+            app.update(key(KeyCode::Char('G'))),
             [Command::Slack(Request::Mark {
                 conversation: c("C2"),
                 up_to: seconds(5)
@@ -1050,16 +1240,41 @@ mod tests {
     }
 
     #[test]
-    fn scrolling_to_the_top_loads_older_history_once() {
-        let mut app = reading_random();
-        app.update(Event::Drawn(Drawn {
-            max_scroll: 5,
-            page: 10,
-            ..Drawn::default()
+    fn reaching_the_top_loads_older_history_once() {
+        let (mut app, _) = ready_app();
+        app.update(key(KeyCode::Enter));
+        let page = HistoryPage {
+            messages: vec![
+                message(5, "U2", RichText::plain("hi")),
+                message(2, "U2", RichText::plain("ho")),
+            ],
+            has_more: true,
+        };
+        app.update(Event::Slack(Update::History {
+            conversation: c("C2"),
+            result: Ok(page),
         }));
-        assert!(app.update(key(KeyCode::Char('k'))).is_empty());
-        let commands = app.update(key(KeyCode::Char('g')));
-        assert_eq!(app.scroll, 5);
+        let drawn = |settled| {
+            Event::Drawn(Drawn {
+                conversation: Some(settled),
+                ..Drawn::default()
+            })
+        };
+        let midway = Settled {
+            scroll: 2,
+            max_scroll: 5,
+            height: 10,
+            ..Settled::default()
+        };
+        assert!(app.update(drawn(midway)).is_empty());
+
+        let at_top = Settled {
+            scroll: 5,
+            max_scroll: 5,
+            height: 10,
+            ..Settled::default()
+        };
+        let commands = app.update(drawn(at_top));
         assert_eq!(
             commands,
             [Command::Slack(Request::History {
@@ -1067,10 +1282,244 @@ mod tests {
                 before: Some(seconds(2))
             })]
         );
-        assert!(
-            app.update(key(KeyCode::Char('k'))).is_empty(),
-            "already on its way"
+        let again = app.update(Event::Drawn(Drawn {
+            conversation: Some(at_top),
+            ..Drawn::default()
+        }));
+        assert!(again.is_empty(), "already on its way");
+    }
+
+    #[test]
+    fn j_and_k_move_from_message_to_message() {
+        let mut app = reading_random();
+        app.focus = Focus::Timeline;
+        let selected = |app: &App| {
+            let timeline = &app.workspace().unwrap().timelines[&c("C2")];
+            app.conversation_pane.selected(timeline)
+        };
+        assert_eq!(selected(&app), Some(seconds(5)));
+        keys(&mut app, "k");
+        assert_eq!(selected(&app), Some(seconds(2)));
+        keys(&mut app, "j");
+        assert_eq!(selected(&app), Some(seconds(5)));
+    }
+
+    #[test]
+    fn enter_opens_the_selected_messages_thread_and_esc_closes_it() {
+        let mut app = reading_random();
+        app.focus = Focus::Timeline;
+        let commands = app.update(key(KeyCode::Enter));
+        assert_eq!(
+            (app.open_thread, app.focus),
+            (Some(seconds(5)), Focus::Thread)
         );
+        assert_eq!(
+            commands,
+            [Command::Slack(Request::Replies {
+                conversation: c("C2"),
+                parent: seconds(5)
+            })]
+        );
+
+        let replies = vec![message(5, "U2", RichText::plain("hi")), reply(6, 5)];
+        let result = Ok(replies);
+        let commands = app.update(Event::Slack(Update::Replies {
+            conversation: c("C2"),
+            parent: seconds(5),
+            result,
+        }));
+        assert_eq!(commands, [Command::Slack(Request::User(UserId::new("U3")))]);
+        let thread = &app.workspace().unwrap().threads[&(c("C2"), seconds(5))];
+        assert_eq!(thread.messages().len(), 2);
+
+        app.update(key(KeyCode::Esc));
+        assert_eq!((app.open_thread, app.focus), (None, Focus::Timeline));
+        app.update(key(KeyCode::Enter));
+        assert_eq!(
+            app.open_thread,
+            Some(seconds(5)),
+            "opens again without asking twice"
+        );
+    }
+
+    #[test]
+    fn backslash_jumps_to_the_sidebar_from_either_pane() {
+        let mut app = reading_random();
+        app.focus = Focus::Timeline;
+        keys(&mut app, "\\");
+        assert_eq!(app.focus, Focus::Sidebar);
+
+        app.update(key(KeyCode::Tab));
+        app.update(key(KeyCode::Enter));
+        assert_eq!(app.focus, Focus::Thread);
+        keys(&mut app, "\\");
+        assert_eq!(
+            (app.focus, app.open_thread),
+            (Focus::Sidebar, Some(seconds(5))),
+            "the thread stays open"
+        );
+    }
+
+    #[test]
+    fn backslash_in_the_sidebar_hides_it_and_brings_it_back() {
+        let mut app = reading_random();
+        app.focus = Focus::Sidebar;
+        keys(&mut app, "\\");
+        assert_eq!((app.sidebar_shown, app.focus), (false, Focus::Timeline));
+
+        app.update(key(KeyCode::Tab));
+        assert_eq!(app.focus, Focus::Timeline, "tab skips the hidden sidebar");
+        keys(&mut app, "\\");
+        assert_eq!((app.sidebar_shown, app.focus), (true, Focus::Sidebar));
+
+        keys(&mut app, "\\");
+        keys(&mut app, "/");
+        assert_eq!(
+            (app.sidebar_shown, app.focus),
+            (true, Focus::Sidebar),
+            "searching shows it"
+        );
+        app.update(key(KeyCode::Esc));
+        keys(&mut app, "\\");
+        app.update(key(KeyCode::Esc));
+        assert_eq!(
+            (app.sidebar_shown, app.focus),
+            (true, Focus::Sidebar),
+            "so does esc from the messages"
+        );
+    }
+
+    #[test]
+    fn the_sidebar_stays_while_nothing_is_open() {
+        let (mut app, _) = ready_app();
+        keys(&mut app, "\\");
+        assert_eq!((app.sidebar_shown, app.focus), (true, Focus::Sidebar));
+        assert_eq!(app.notice.as_deref(), Some("open a conversation first"));
+    }
+
+    #[test]
+    fn tab_visits_the_thread_pane_only_while_one_is_open() {
+        let mut app = reading_random();
+        app.focus = Focus::Sidebar;
+        app.update(key(KeyCode::Tab));
+        app.update(key(KeyCode::Tab));
+        assert_eq!(app.focus, Focus::Sidebar);
+        app.update(key(KeyCode::Tab));
+        app.update(key(KeyCode::Enter));
+        app.update(key(KeyCode::Tab));
+        assert_eq!(app.focus, Focus::Sidebar);
+        app.update(key(KeyCode::Tab));
+        app.update(key(KeyCode::Tab));
+        assert_eq!(app.focus, Focus::Thread);
+    }
+
+    #[test]
+    fn a_reply_written_in_the_thread_pane_posts_there_and_lands_in_both_panes() {
+        let mut app = reading_random();
+        app.focus = Focus::Timeline;
+        app.update(key(KeyCode::Enter));
+        let result = Ok(vec![message(5, "U2", RichText::plain("hi"))]);
+        app.update(Event::Slack(Update::Replies {
+            conversation: c("C2"),
+            parent: seconds(5),
+            result,
+        }));
+
+        keys(&mut app, "ion it");
+        let commands = app.update(key(KeyCode::Enter));
+        assert_eq!(
+            commands,
+            [Command::Slack(Request::Post {
+                conversation: c("C2"),
+                thread: Some(seconds(5)),
+                text: "on it".into(),
+                id: 0,
+            })]
+        );
+        assert_eq!(app.outbox[0].place, place("C2", Some(5)));
+
+        let posted = Message {
+            reply_to: Some(seconds(5)),
+            ..message(7, "UME", RichText::plain("on it"))
+        };
+        app.update(Event::Slack(Update::Posted {
+            id: 0,
+            conversation: c("C2"),
+            result: Ok(posted.clone()),
+        }));
+        // The live echo of the same Reply changes nothing.
+        let echo = Update::Live(LiveEvent::Posted {
+            conversation: c("C2"),
+            message: posted,
+        });
+        app.update(Event::Slack(echo));
+
+        let workspace = app.workspace().unwrap();
+        assert_eq!(
+            workspace.threads[&(c("C2"), seconds(5))].messages().len(),
+            2
+        );
+        let parent = workspace.timelines[&c("C2")].get(seconds(5)).unwrap();
+        assert_eq!(
+            parent.thread.unwrap().replies,
+            2,
+            "counted once: one from history, this one"
+        );
+    }
+
+    #[test]
+    fn live_edits_deletions_and_reactions_reach_open_threads() {
+        let mut app = reading_random();
+        app.focus = Focus::Timeline;
+        app.update(key(KeyCode::Enter));
+        let result = Ok(vec![message(5, "U2", RichText::plain("hi")), reply(6, 5)]);
+        app.update(Event::Slack(Update::Replies {
+            conversation: c("C2"),
+            parent: seconds(5),
+            result,
+        }));
+        let live = |event| Event::Slack(Update::Live(event));
+
+        let edited = Message {
+            edited: true,
+            ..reply(6, 5)
+        };
+        app.update(live(LiveEvent::Edited {
+            conversation: c("C2"),
+            message: edited,
+        }));
+        let wave = slackers_model::Emoji::named("wave");
+        app.update(live(LiveEvent::Reacted {
+            conversation: c("C2"),
+            ts: seconds(5),
+            emoji: wave,
+            mine: false,
+            change: slackers_model::ReactionChange::Added,
+        }));
+        let thread = |app: &App| app.workspace().unwrap().threads[&(c("C2"), seconds(5))].clone();
+        assert!(thread(&app).get(seconds(6)).unwrap().edited);
+        assert_eq!(thread(&app).get(seconds(5)).unwrap().reactions.len(), 1);
+        let channel_parent = app.workspace().unwrap().timelines[&c("C2")]
+            .get(seconds(5))
+            .unwrap()
+            .clone();
+        assert_eq!(channel_parent.reactions.len(), 1, "the channel's copy too");
+
+        app.update(live(LiveEvent::Deleted {
+            conversation: c("C2"),
+            ts: seconds(6),
+        }));
+        assert!(thread(&app).get(seconds(6)).is_none());
+    }
+
+    #[test]
+    fn opening_another_conversation_closes_the_thread() {
+        let mut app = reading_random();
+        app.focus = Focus::Timeline;
+        app.update(key(KeyCode::Enter));
+        keys(&mut app, "/gen");
+        app.update(key(KeyCode::Enter));
+        assert_eq!((app.open_thread, &app.open), (None, &Some(c("C1"))));
     }
 
     #[test]
@@ -1088,9 +1537,7 @@ mod tests {
             }))
         };
         app.update(post("C1", message(10, "UME", RichText::plain("mine"))));
-        let mut reply = message(11, "U2", RichText::plain("reply"));
-        reply.reply_to = Some(seconds(1));
-        app.update(post("C1", reply));
+        app.update(post("C1", reply(11, 1)));
         assert!(!unread(&app, "C1"));
 
         app.update(post("C1", message(12, "U2", mention)));
@@ -1123,12 +1570,13 @@ mod tests {
             commands,
             [Command::Slack(Request::Post {
                 conversation: c("C2"),
+                thread: None,
                 text,
                 id: 0
             })]
         );
         assert_eq!(app.outbox.len(), 1);
-        assert!(app.draft().unwrap().is_empty());
+        assert!(app.drafts[&place("C2", None)].is_empty());
         assert!(
             app.update(key(KeyCode::Enter)).is_empty(),
             "nothing to send"
@@ -1153,7 +1601,7 @@ mod tests {
             result: Ok(posted),
         }));
         let timeline = &app.workspace().unwrap().timelines[&c("C2")];
-        assert_eq!(timeline.messages().next_back().unwrap().ts, seconds(9));
+        assert_eq!(timeline.newest(), Some(seconds(9)));
 
         keys(&mut app, "third");
         app.update(Event::Slack(Update::Posted {
@@ -1162,7 +1610,7 @@ mod tests {
             result: Err(Error::SignedOut),
         }));
         assert!(app.outbox.is_empty());
-        assert_eq!(app.draft().unwrap().lines(), ["second", "third"]);
+        assert_eq!(app.drafts[&place("C2", None)].lines(), ["second", "third"]);
         assert!(app.notice.as_deref().unwrap().starts_with("not sent"));
     }
 
@@ -1174,15 +1622,15 @@ mod tests {
         assert_eq!(
             app.update(control('e')),
             [Command::Edit {
-                conversation: c("C2"),
+                place: place("C2", None),
                 text: "draft".into()
             }]
         );
         app.update(Event::Edited {
-            conversation: c("C2"),
+            place: place("C2", None),
             outcome: Ok("edited\ntext".into()),
         });
-        assert_eq!(app.draft().unwrap().lines(), ["edited", "text"]);
+        assert_eq!(app.drafts[&place("C2", None)].lines(), ["edited", "text"]);
     }
 
     #[test]

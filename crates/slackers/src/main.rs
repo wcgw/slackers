@@ -13,8 +13,10 @@ mod credentials;
 mod emoji;
 mod icons;
 mod layout;
+mod pane;
 mod pictures;
 mod search;
+mod theme;
 mod view;
 
 use std::fs::{self, OpenOptions};
@@ -37,12 +39,11 @@ use crossterm::terminal::{
 use futures_util::StreamExt as _;
 use ratatui::DefaultTerminal;
 use slackers_gfx::{CellSize, Ids, Prepared};
-use slackers_model::ConversationId;
 use slackers_slack::{Credentials, Session};
 use tokio::sync::mpsc;
 use tracing_subscriber::EnvFilter;
 
-use crate::app::{App, Command, Drawn, Event};
+use crate::app::{App, Command, Drawn, Event, Place};
 
 fn main() -> Result<()> {
     let label = std::env::args()
@@ -209,11 +210,11 @@ impl Effects {
                         let _ = inbox.send(Inbox::Prepared { url, result });
                     }));
                 }
-                Command::Edit { conversation, text } => {
+                Command::Edit { place, text } => {
                     // The old stream's reader thread would steal the editor's keystrokes: drop it now. The new
                     // one reads nothing until the loop polls it, after the editor exits.
                     *terminal_events = EventStream::new();
-                    self.edit(conversation, &text, terminal).await?;
+                    self.edit(place, &text, terminal).await?;
                 }
             }
         }
@@ -222,12 +223,7 @@ impl Effects {
 
     /// Hands the terminal to `$VISUAL` or `$EDITOR` (or `vi`) to edit `text`, and reports the outcome through the
     /// inbox.
-    async fn edit(
-        &self,
-        conversation: ConversationId,
-        text: &str,
-        terminal: &mut DefaultTerminal,
-    ) -> Result<()> {
+    async fn edit(&self, place: Place, text: &str, terminal: &mut DefaultTerminal) -> Result<()> {
         let path = std::env::temp_dir().join(format!("slackers-draft-{}.md", std::process::id()));
         execute!(
             io::stdout(),
@@ -250,10 +246,9 @@ impl Effects {
         slackers_gfx::forget_all(&mut io::stdout())?;
         let _ = self.inbox.send(Inbox::App(Event::PicturesLost));
         let outcome = outcome.map_err(|error| format!("{error:#}"));
-        let _ = self.inbox.send(Inbox::App(Event::Edited {
-            conversation,
-            outcome,
-        }));
+        let _ = self
+            .inbox
+            .send(Inbox::App(Event::Edited { place, outcome }));
         Ok(())
     }
 }

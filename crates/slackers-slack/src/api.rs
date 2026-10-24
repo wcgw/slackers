@@ -11,13 +11,16 @@ use slackers_model::{ConversationId, CustomEmojiSet, Message, Ts, UserId};
 use tokio::sync::Semaphore;
 
 use crate::session::{HistoryPage, Snapshot, User};
-use crate::wire::{AuthTest, Counts, EmojiList, History, Posted, UserBoot, UserInfo};
+use crate::wire::{AuthTest, Counts, EmojiList, History, Posted, Replies, UserBoot, UserInfo};
 use crate::{Credentials, Error};
 
 const BASE: &str = "https://slack.com/api";
 
 /// How many calls may be in flight at once, so that a burst of lookups doesn't trip Slack's rate limits.
 const IN_FLIGHT: usize = 6;
+
+/// The most Replies of one Thread fetched: enough for any Thread worth reading in a terminal.
+const MAX_REPLIES: usize = 1000;
 
 /// How many times a rate-limited call is retried, after waiting as long as Slack asks.
 const RATE_LIMIT_RETRIES: u32 = 3;
@@ -126,19 +129,52 @@ impl Api {
     pub(crate) async fn post(
         &self,
         conversation: &ConversationId,
+        thread: Option<Ts>,
         text: &str,
         me: &UserId,
     ) -> Result<Message, Error> {
         let text = crate::mrkdwn::escape(text);
-        let posted: Posted = self
-            .call(
-                "chat.postMessage",
-                &[("channel", conversation.as_str()), ("text", &text)],
-            )
-            .await?;
+        let parent = thread.map(|ts| ts.to_string());
+        let mut params = vec![("channel", conversation.as_str()), ("text", text.as_str())];
+        if let Some(parent) = &parent {
+            params.push(("thread_ts", parent));
+        }
+        let posted: Posted = self.call("chat.postMessage", &params).await?;
         posted
             .into_message(me)
             .ok_or_else(|| Error::refused("chat.postMessage", "unreadable_message"))
+    }
+
+    /// The Thread started by the Message at `parent`: the parent first, then its Replies, oldest first. Stops after
+    /// [`MAX_REPLIES`] Replies.
+    pub(crate) async fn replies(
+        &self,
+        conversation: &ConversationId,
+        parent: Ts,
+        me: &UserId,
+    ) -> Result<Vec<Message>, Error> {
+        let parent = parent.to_string();
+        let mut messages = Vec::new();
+        let mut cursor = String::new();
+        loop {
+            let page: Replies = self
+                .call(
+                    "conversations.replies",
+                    &[
+                        ("channel", conversation.as_str()),
+                        ("ts", &parent),
+                        ("limit", "200"),
+                        ("cursor", &cursor),
+                    ],
+                )
+                .await?;
+            let next = page.next_cursor().to_owned();
+            messages.extend(page.into_messages(me));
+            if next.is_empty() || messages.len() > MAX_REPLIES {
+                return Ok(messages);
+            }
+            cursor = next;
+        }
     }
 
     /// Moves the Read Marker of `conversation` to `up_to`.

@@ -162,6 +162,37 @@ fn group_dm_name(slack_name: &str) -> String {
     members.split("--").collect::<Vec<_>>().join(", ")
 }
 
+/// A page of `conversations.replies`.
+#[derive(Deserialize)]
+pub(crate) struct Replies {
+    #[serde(default)]
+    messages: Vec<Value>,
+    #[serde(default)]
+    response_metadata: Option<ResponseMetadata>,
+}
+
+#[derive(Deserialize)]
+struct ResponseMetadata {
+    #[serde(default)]
+    next_cursor: String,
+}
+
+impl Replies {
+    /// Where the next page starts; empty after the last one.
+    pub(crate) fn next_cursor(&self) -> &str {
+        self.response_metadata
+            .as_ref()
+            .map_or("", |metadata| metadata.next_cursor.as_str())
+    }
+
+    pub(crate) fn into_messages(self, me: &UserId) -> impl Iterator<Item = Message> {
+        let me = me.clone();
+        self.messages
+            .into_iter()
+            .filter_map(move |m| message(m, &me))
+    }
+}
+
 #[derive(Deserialize)]
 pub(crate) struct History {
     #[serde(default)]
@@ -658,10 +689,6 @@ pub(crate) fn socket_message(frame: &str, me: &UserId) -> SocketMessage {
                 let Some(edited) = message(event["message"].clone(), me) else {
                     return SocketMessage::Ignored;
                 };
-                // An edited Reply isn't shown in its Conversation, and mustn't count as a new Reply.
-                if edited.reply_to.is_some() {
-                    return SocketMessage::Ignored;
-                }
                 LiveEvent::Edited {
                     conversation: conversation(),
                     message: edited,
@@ -979,6 +1006,33 @@ mod tests {
             SocketMessage::Ignored
         );
         assert_eq!(socket_message("not json", &me()), SocketMessage::Ignored);
+    }
+
+    #[test]
+    fn a_replies_page_holds_the_parent_and_says_where_to_go_next() {
+        let page: Replies = serde_json::from_value(json!({
+            "messages": [
+                {"ts": "1.000000", "user": "U1", "text": "parent", "thread_ts": "1.000000", "reply_count": 1},
+                {"ts": "2.000000", "user": "U2", "text": "reply", "thread_ts": "1.000000"}
+            ],
+            "has_more": true,
+            "response_metadata": {"next_cursor": "abc"}
+        }))
+        .unwrap();
+        assert_eq!(page.next_cursor(), "abc");
+        let replies: Vec<Option<Ts>> = page.into_messages(&me()).map(|m| m.reply_to).collect();
+        assert_eq!(replies, [None, Some(seconds(1))]);
+    }
+
+    #[test]
+    fn an_edited_reply_is_passed_on() {
+        let frame = r#"{"type":"message","subtype":"message_changed","channel":"C1",
+            "message":{"ts":"2.000000","user":"U2","text":"fixed","thread_ts":"1.000000","edited":{"user":"U2","ts":"3.0"}}}"#;
+        let SocketMessage::Live(LiveEvent::Edited { message, .. }) = socket_message(frame, &me())
+        else {
+            panic!("expected an edit")
+        };
+        assert_eq!((message.reply_to, message.edited), (Some(seconds(1)), true));
     }
 
     #[test]
