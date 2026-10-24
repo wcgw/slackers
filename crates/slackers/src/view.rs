@@ -27,7 +27,7 @@ use crate::icons;
 use crate::layout::{Piece, wrap};
 use crate::pane::{self, Pane, Settled};
 use crate::pictures::PictureState;
-use crate::sidebar::{Row, Section};
+use crate::sidebar::{Item, Row, Section};
 use crate::theme::{
     self, ACCENT, ALERT, CODE, DIM, LINK, MATCH, MENTION, MENTION_ME, READ, SELECTED,
     SELECTED_UNFOCUSED,
@@ -154,15 +154,28 @@ fn draw_sidebar(frame: &mut Frame<'_>, area: Rect, app: &App, drawn: &mut Drawn)
                         Row::Header(section) => {
                             (header_row(app, section, list.width, drawn), false)
                         }
-                        Row::Conversation {
+                        Row::Item {
                             section,
-                            conversation,
+                            item: Item::Conversation(conversation),
                         } => {
-                            // A Virtual Workspace mixes Workspaces: mark each row with its own.
-                            let marked = matches!(section, Section::VirtualWorkspace(_));
+                            // Only a Workspace's own section needs no mark of the Workspace on each row.
+                            let marked = !matches!(section, Section::Workspace(_));
                             let line =
                                 conversation_row(app, conversation, marked, &[], list.width, drawn);
                             (line, app.open.as_ref() == Some(conversation))
+                        }
+                        Row::Item {
+                            item:
+                                Item::Thread {
+                                    conversation,
+                                    parent,
+                                },
+                            ..
+                        } => {
+                            let line = thread_row(app, conversation, *parent, list.width, drawn);
+                            let is_open = app.open.as_ref() == Some(conversation)
+                                && app.open_thread == Some(*parent);
+                            (line, is_open)
                         }
                     };
                     match (index == cursor, app.focus) {
@@ -194,6 +207,21 @@ impl Badge {
         }
     }
 
+    /// `item`'s: a Conversation's Activity, or a Followed Thread's.
+    fn of_item(app: &App, item: &Item) -> Self {
+        match item {
+            Item::Conversation(conversation) => Self::of(app.workspaces.activity(conversation)),
+            Item::Thread {
+                conversation,
+                parent,
+            } => Self::of(
+                app.workspaces
+                    .followed(conversation, *parent)
+                    .map(|followed| &followed.activity),
+            ),
+        }
+    }
+
     /// Both badges in one, as a section's header shows its rows'.
     fn plus(self, other: Self) -> Self {
         Self {
@@ -212,7 +240,7 @@ impl Badge {
     }
 }
 
-/// A section's header: whether it's folded, its icon and name, and the combined badge of its Conversations.
+/// A section's header: whether it's folded, its icon and name, and the combined badge of what it holds.
 fn header_row(app: &App, section: &Section, width: u16, drawn: &mut Drawn) -> Line<'static> {
     let fold = if app.sidebar.is_folded(section) {
         icons::FOLDED
@@ -221,9 +249,9 @@ fn header_row(app: &App, section: &Section, width: u16, drawn: &mut Drawn) -> Li
     };
     let badge = app
         .sidebar
-        .conversations_in(section)
+        .items_in(section)
         .iter()
-        .map(|conversation| Badge::of(app.workspaces.activity(conversation)))
+        .map(|item| Badge::of_item(app, item))
         .fold(Badge::default(), Badge::plus);
     let (icon, name) = section_title(app, section, drawn);
     let bold = Style::new().add_modifier(Modifier::BOLD);
@@ -237,9 +265,11 @@ fn header_row(app: &App, section: &Section, width: u16, drawn: &mut Drawn) -> Li
     )
 }
 
-/// A section's icon and name: a Virtual Workspace's, or a Workspace's, whose icon says how signing in to it went.
+/// A section's icon and name: the Threads', a Virtual Workspace's, or a Workspace's, whose icon says how signing in to
+/// it went.
 fn section_title(app: &App, section: &Section, drawn: &mut Drawn) -> (Span<'static>, String) {
     match section {
+        Section::Threads => (Span::styled(icons::THREAD, ACCENT), "Threads".to_owned()),
         Section::VirtualWorkspace(name) => {
             (Span::styled(icons::VIRTUAL_WORKSPACE, ACCENT), name.clone())
         }
@@ -286,6 +316,64 @@ fn conversation_row(
     };
     let lead = vec![marker, Span::styled(icon, icon_style)];
     entry(lead, name, name_style, matched, badge, width)
+}
+
+/// A Followed Thread's row: its Workspace's icon; a Thread icon; its Conversation's name and the gist of its parent
+/// (bold when there are Replies to read); and on the right its badge.
+fn thread_row(
+    app: &App,
+    conversation: &ConversationRef,
+    parent: Ts,
+    width: u16,
+    drawn: &mut Drawn,
+) -> Line<'static> {
+    let Some((workspace, found)) = app.workspaces.conversation(conversation) else {
+        return Line::default();
+    };
+    let followed = workspace.followed.get(&(conversation.id.clone(), parent));
+    let badge = Badge::of(followed.map(|followed| &followed.activity));
+    let (_, name) = label(workspace, found);
+    let parent_message = followed
+        .and_then(|followed| followed.parent.as_ref())
+        .or_else(|| workspace.timelines.get(&conversation.id)?.get(parent));
+    let text = match parent_message.map(|message| gist(workspace, &message.content)) {
+        Some(gist) if !gist.is_empty() => format!("{name}: {gist}"),
+        _ => name.to_owned(),
+    };
+    let (icon_style, name_style) = if badge.unread {
+        (ACCENT, Style::new().add_modifier(Modifier::BOLD))
+    } else {
+        (DIM, READ)
+    };
+    let marker = workspace_marker(app, conversation.workspace, workspace, drawn);
+    let lead = vec![marker, Span::styled(icons::THREAD, icon_style)];
+    entry(lead, &text, name_style, &[], badge, width)
+}
+
+/// `text` as one line of plain words: people, Channels and emoji by name, links by their label.
+fn gist(workspace: &Workspace, text: &RichText) -> String {
+    let mut gist = String::new();
+    for inline in text.inlines() {
+        match inline {
+            Inline::Text { text, .. } => gist.push_str(text),
+            Inline::Emoji(emoji) => gist.push_str(&format!(":{}:", emoji.name)),
+            Inline::User(id) => gist.push_str(&format!("@{}", workspace.user_name(id))),
+            Inline::Channel(id) => {
+                let name = workspace
+                    .conversation(id)
+                    .map_or(id.as_str(), |c| c.name.as_str());
+                gist.push_str(&format!("#{name}"));
+            }
+            Inline::Broadcast(broadcast) => gist.push_str(match broadcast {
+                Broadcast::Here => "@here",
+                Broadcast::Channel => "@channel",
+                Broadcast::Everyone => "@everyone",
+            }),
+            Inline::UserGroup(_) => gist.push_str("@group"),
+            Inline::Link { url, label } => gist.push_str(label.as_deref().unwrap_or(url)),
+        }
+    }
+    gist.split_whitespace().collect::<Vec<_>>().join(" ")
 }
 
 /// One sidebar row, `width` cells wide: `lead`, [`LEAD`] cells wide; `name` in `name_style`, its `matched`
@@ -1297,6 +1385,7 @@ mod tests {
             icon: icon.map(str::to_owned),
             me: UserId::new("UME"),
             conversations,
+            followed_threads: Vec::new(),
         }))
     }
 
@@ -1305,7 +1394,7 @@ mod tests {
         let mut app = App::new(vec!["test".into()], Vec::new(), CELL);
         let snapshot = ready("Test", None, vec![channel("C1", "general")]);
         app.update(Event::Slack(w(0), snapshot));
-        press(&mut app, KeyCode::Down, KeyModifiers::NONE);
+        type_text(&mut app, "/general");
         press(&mut app, KeyCode::Enter, KeyModifiers::NONE);
         let page = HistoryPage {
             messages: vec![reading_general_message()],
@@ -1611,9 +1700,11 @@ mod tests {
         let mut app = reading_general();
         press(&mut app, KeyCode::Tab, KeyModifiers::NONE);
         assert_eq!(app.focus, Focus::Sidebar);
+        let rows = screen(&app);
+        assert!(rows[0].starts_with(&format!("{}{}Threads", icons::UNFOLDED, icons::THREAD)));
         assert!(
-            screen(&app)[0].starts_with(&format!("{}T Test", icons::UNFOLDED)),
-            "the Workspace's section comes first"
+            rows[1].starts_with(&format!("{}T Test", icons::UNFOLDED)),
+            "then the Workspace's section"
         );
 
         type_text(&mut app, "\\");
@@ -1697,6 +1788,8 @@ mod tests {
                     .to_owned()
             })
             .collect();
+        // Below the Threads section, empty here.
+        let sidebar = &sidebar[1..];
         let header = format!("{}{}K", icons::UNFOLDED, icons::VIRTUAL_WORKSPACE);
         assert!(sidebar[0].starts_with(&header), "{sidebar:#?}");
         assert!(
@@ -1773,6 +1866,46 @@ mod tests {
             screen(&app)[0].starts_with(&breadcrumb),
             "{:?}",
             screen(&app)[0]
+        );
+    }
+
+    #[test]
+    fn a_followed_thread_with_replies_to_read_shows_its_gist_and_badge() {
+        let mut app = App::new(vec!["test".into()], Vec::new(), CELL);
+        let parent = Message {
+            content: RichText::plain("can   someone\nreview this?"),
+            ..reading_general_message()
+        };
+        let read = parent.ts;
+        let thread = slackers_slack::FollowedThread {
+            conversation: ConversationId::new("C1"),
+            activity: Activity::counted(read, Ts::from_micros(read.as_micros() + 1), true, 0),
+            parent,
+        };
+        let snapshot = Snapshot {
+            workspace: WorkspaceId::new("T1"),
+            name: "Test".into(),
+            icon: None,
+            me: UserId::new("UME"),
+            conversations: vec![channel("C1", "general")],
+            followed_threads: vec![thread],
+        };
+        app.update(Event::Slack(w(0), Update::Ready(Box::new(snapshot))));
+        let rows = screen(&app);
+        let row: String = rows[1].chars().take(29).collect();
+        // Its words run together on one line, cut to fit.
+        assert!(
+            row.starts_with(&format!("T {}general: can someone …", icons::THREAD)),
+            "{row:?}"
+        );
+        assert!(
+            row.trim_end().ends_with(icons::UNREAD.trim_end()),
+            "{row:?}"
+        );
+        let header: String = rows[0].chars().take(29).collect();
+        assert!(
+            header.trim_end().ends_with(icons::UNREAD.trim_end()),
+            "the header adds it up: {header:?}"
         );
     }
 

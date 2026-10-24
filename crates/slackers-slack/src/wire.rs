@@ -11,7 +11,7 @@ use slackers_model::{
 };
 
 use crate::mrkdwn;
-use crate::session::{HistoryPage, LiveEvent, Snapshot, User};
+use crate::session::{FollowedThread, HistoryPage, LiveEvent, Snapshot, User};
 
 /// Slack's timestamp text as a [`Ts`]; anything unparsable, such as an absent `latest`, reads as zero.
 fn ts(text: &str) -> Ts {
@@ -23,6 +23,59 @@ pub(crate) struct AuthTest {
     /// The team id, or the enterprise id for an org-level session.
     team_id: String,
     user_id: String,
+}
+
+impl AuthTest {
+    /// The signed-in user.
+    pub(crate) fn me(&self) -> UserId {
+        UserId::new(&self.user_id)
+    }
+}
+
+/// `subscriptions.thread.getView`'s reply: the Followed Threads with the latest Replies, newest first.
+#[derive(Deserialize)]
+pub(crate) struct ThreadView {
+    #[serde(default)]
+    threads: Vec<ViewThread>,
+}
+
+#[derive(Deserialize)]
+struct ViewThread {
+    /// The parent Message, with the Thread's state.
+    root_msg: Value,
+}
+
+/// The fields of a Thread's parent, as `subscriptions.thread.getView` lists it, that say where the Thread stands.
+#[derive(Deserialize)]
+struct ThreadState {
+    channel: String,
+    #[serde(default)]
+    last_read: String,
+    #[serde(default)]
+    latest_reply: String,
+    #[serde(default)]
+    subscribed: Option<bool>,
+}
+
+impl ThreadView {
+    /// The Threads the user follows; `me` decides which reactions are theirs.
+    pub(crate) fn into_followed(self, me: &UserId) -> Vec<FollowedThread> {
+        self.threads
+            .into_iter()
+            .filter_map(|thread| {
+                let state: ThreadState = serde_json::from_value(thread.root_msg.clone()).ok()?;
+                if state.subscribed == Some(false) {
+                    return None;
+                }
+                let (read, latest) = (ts(&state.last_read), ts(&state.latest_reply));
+                Some(FollowedThread {
+                    conversation: ConversationId::new(state.channel),
+                    parent: message(thread.root_msg, me)?,
+                    activity: Activity::counted(read, latest, latest > read, 0),
+                })
+            })
+            .collect()
+    }
 }
 
 #[derive(Deserialize)]
@@ -99,7 +152,12 @@ struct Count {
 
 /// The user's sidebar: the Conversations `client.counts` lists (as Slack's own sidebar does), named from
 /// `client.userBoot`, which also lists every group DM the user was ever in.
-pub(crate) fn snapshot(auth: AuthTest, boot: UserBoot, counts: Counts) -> Snapshot {
+pub(crate) fn snapshot(
+    auth: AuthTest,
+    boot: UserBoot,
+    counts: Counts,
+    followed_threads: Vec<FollowedThread>,
+) -> Snapshot {
     let channels: HashMap<&str, &BootChannel> =
         boot.channels.iter().map(|c| (c.id.as_str(), c)).collect();
     let ims: HashMap<&str, &BootIm> = boot.ims.iter().map(|im| (im.id.as_str(), im)).collect();
@@ -167,6 +225,7 @@ pub(crate) fn snapshot(auth: AuthTest, boot: UserBoot, counts: Counts) -> Snapsh
         icon,
         me: UserId::new(auth.user_id),
         conversations,
+        followed_threads,
     }
 }
 
@@ -876,6 +935,33 @@ pub(crate) fn socket_message(frame: &str, me: &UserId) -> SocketMessage {
             conversation: conversation(),
             up_to: ts(text("ts")),
         },
+        kind @ ("thread_marked" | "thread_subscribed" | "thread_unsubscribed") => {
+            let subscription = &event["subscription"];
+            let field = |name: &str| subscription[name].as_str().unwrap_or_default();
+            if field("type") != "thread" {
+                return SocketMessage::Ignored;
+            }
+            let (conversation, parent) = (
+                ConversationId::new(field("channel")),
+                ts(field("thread_ts")),
+            );
+            match kind {
+                "thread_marked" => LiveEvent::ThreadMarked {
+                    conversation,
+                    parent,
+                    up_to: ts(field("last_read")),
+                },
+                "thread_subscribed" => LiveEvent::ThreadFollowed {
+                    conversation,
+                    parent,
+                    read_up_to: ts(field("last_read")),
+                },
+                _ => LiveEvent::ThreadUnfollowed {
+                    conversation,
+                    parent,
+                },
+            }
+        }
         "channel_joined" | "group_joined" | "mpim_joined" | "im_created" | "im_open"
         | "mpim_open" => {
             // Some carry the Conversation, others only its id.
@@ -932,7 +1018,7 @@ mod tests {
         }))
         .unwrap();
 
-        let snapshot = snapshot(auth, boot, counts);
+        let snapshot = snapshot(auth, boot, counts, Vec::new());
         assert_eq!(
             (
                 snapshot.workspace.as_str(),
@@ -1303,6 +1389,72 @@ mod tests {
                 },
                 alt_text: "a dancing cat".into(),
             }]
+        );
+    }
+
+    #[test]
+    fn followed_threads_come_with_their_read_markers() {
+        let view: ThreadView = serde_json::from_value(json!({
+            "total_unread_replies": 1,
+            "threads": [
+                {"root_msg": {"ts": "10.000000", "thread_ts": "10.000000", "user": "U2", "text": "parent",
+                    "channel": "C1", "reply_count": 2, "latest_reply": "12.000000", "last_read": "11.000000",
+                    "subscribed": true},
+                 "latest_replies": []},
+                {"root_msg": {"ts": "20.000000", "user": "U2", "channel": "C1", "latest_reply": "21.000000",
+                    "last_read": "21.000000"}},
+                {"root_msg": {"ts": "30.000000", "user": "U2", "channel": "C1", "subscribed": false}},
+                {"root_msg": {"user": "U2", "channel": "C1"}}
+            ]
+        }))
+        .unwrap();
+        let followed = view.into_followed(&me());
+        let parents: Vec<Ts> = followed.iter().map(|thread| thread.parent.ts).collect();
+        assert_eq!(
+            parents,
+            [seconds(10), seconds(20)],
+            "subscribed and well-formed only"
+        );
+        assert_eq!(followed[0].conversation, ConversationId::new("C1"));
+        assert_eq!(followed[0].activity.read_up_to(), seconds(11));
+        assert!(followed[0].activity.has_unread());
+        assert!(!followed[1].activity.has_unread());
+    }
+
+    #[test]
+    fn thread_subscription_frames_become_live_events() {
+        let frame = |kind: &str, subscription_type: &str| {
+            format!(
+                r#"{{"type":"{kind}","subscription":{{"type":"{subscription_type}","channel":"C1","thread_ts":"10.000000","last_read":"12.000000","active":true}}}}"#
+            )
+        };
+        let (conversation, parent) = (ConversationId::new("C1"), seconds(10));
+        assert_eq!(
+            socket_message(&frame("thread_marked", "thread"), &me()),
+            SocketMessage::Live(LiveEvent::ThreadMarked {
+                conversation: conversation.clone(),
+                parent,
+                up_to: seconds(12)
+            })
+        );
+        assert_eq!(
+            socket_message(&frame("thread_subscribed", "thread"), &me()),
+            SocketMessage::Live(LiveEvent::ThreadFollowed {
+                conversation: conversation.clone(),
+                parent,
+                read_up_to: seconds(12)
+            })
+        );
+        assert_eq!(
+            socket_message(&frame("thread_unsubscribed", "thread"), &me()),
+            SocketMessage::Live(LiveEvent::ThreadUnfollowed {
+                conversation,
+                parent
+            })
+        );
+        assert_eq!(
+            socket_message(&frame("thread_marked", "channel"), &me()),
+            SocketMessage::Ignored
         );
     }
 

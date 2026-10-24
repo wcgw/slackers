@@ -12,7 +12,8 @@ use tokio::sync::Semaphore;
 
 use crate::session::{HistoryPage, Snapshot, User};
 use crate::wire::{
-    AuthTest, ConversationInfo, Counts, EmojiList, History, Posted, Replies, UserBoot, UserInfo,
+    AuthTest, ConversationInfo, Counts, EmojiList, History, Posted, Replies, ThreadView, UserBoot,
+    UserInfo,
 };
 use crate::{Credentials, Error};
 
@@ -95,14 +96,23 @@ impl Api {
         Err(Error::refused(method, "ratelimited"))
     }
 
-    /// Signs in and lists the user's Conversations with their Activity.
+    /// Signs in and lists the user's Conversations and Followed Threads with their Activity.
     pub(crate) async fn snapshot(&self) -> Result<Snapshot, Error> {
         let auth: AuthTest = self.call("auth.test", &[]).await?;
-        let (boot, counts): (UserBoot, Counts) = tokio::try_join!(
-            self.call("client.userBoot", &[]),
-            self.call("client.counts", &[])
-        )?;
-        Ok(crate::wire::snapshot(auth, boot, counts))
+        let (boot, counts, threads) = tokio::join!(
+            self.call::<UserBoot>("client.userBoot", &[]),
+            self.call::<Counts>("client.counts", &[]),
+            self.call::<ThreadView>("subscriptions.thread.getView", &[("limit", "50")]),
+        );
+        // Signing in can do without Followed Threads.
+        let followed = match threads {
+            Ok(view) => view.into_followed(&auth.me()),
+            Err(error) => {
+                tracing::warn!(%error, "couldn't list followed threads");
+                Vec::new()
+            }
+        };
+        Ok(crate::wire::snapshot(auth, boot?, counts?, followed))
     }
 
     /// Up to a page of Messages posted before `before` (or the newest ones, for `None`), newest first.
@@ -200,6 +210,24 @@ impl Api {
                 &[("channel", conversation.as_str()), ("ts", &up_to)],
             )
             .await?;
+        Ok(())
+    }
+
+    /// Moves the user's Read Marker in the Thread under `parent` to `up_to`.
+    pub(crate) async fn mark_thread(
+        &self,
+        conversation: &ConversationId,
+        parent: Ts,
+        up_to: Ts,
+    ) -> Result<(), Error> {
+        let (parent, up_to) = (parent.to_string(), up_to.to_string());
+        let params = [
+            ("channel", conversation.as_str()),
+            ("thread_ts", parent.as_str()),
+            ("ts", up_to.as_str()),
+            ("read", "1"),
+        ];
+        let _: serde::de::IgnoredAny = self.call("subscriptions.thread.mark", &params).await?;
         Ok(())
     }
 

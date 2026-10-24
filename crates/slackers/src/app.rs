@@ -7,6 +7,7 @@
 //! searches the sidebar, and `:` enters Command mode: `:q` quits, `:vw add NAME` puts the open Channel in the
 //! Virtual Workspace called NAME, and `:vw rm NAME` takes it out.
 
+use std::cmp::Reverse;
 use std::collections::{HashMap, HashSet};
 use std::time::{Duration, Instant};
 
@@ -25,7 +26,7 @@ use crate::emoji::Emojis;
 use crate::pane::{Pane, Settled};
 use crate::pictures::Pictures;
 use crate::search::Finder;
-use crate::sidebar::{Fold, Row, Section, Sidebar};
+use crate::sidebar::{Fold, Item, Section, Sidebar};
 
 /// Something that happened, for [`App::update`] to react to.
 #[derive(Debug)]
@@ -261,6 +262,28 @@ impl Workspaces {
             .get(&conversation.id)
     }
 
+    /// The Followed Thread under `parent` in `conversation`, if the user follows it.
+    pub(crate) fn followed(&self, conversation: &ConversationRef, parent: Ts) -> Option<&Followed> {
+        self.get(conversation.workspace)?
+            .followed
+            .get(&(conversation.id.clone(), parent))
+    }
+
+    /// Whether `item` has something unread: Messages in a Conversation, or Replies in a Followed Thread.
+    pub(crate) fn has_unread(&self, item: &Item) -> bool {
+        match item {
+            Item::Conversation(conversation) => self
+                .activity(conversation)
+                .is_some_and(Activity::has_unread),
+            Item::Thread {
+                conversation,
+                parent,
+            } => self
+                .followed(conversation, *parent)
+                .is_some_and(|followed| followed.activity.has_unread()),
+        }
+    }
+
     /// The Channel `channel` names, once its Workspace is signed in to and lists it.
     fn resolve(&self, channel: &ChannelRef) -> Option<ConversationRef> {
         let (key, _) = self
@@ -325,6 +348,17 @@ pub(crate) struct Workspace {
     loading: HashSet<ConversationId>,
     /// Threads with a request for their Replies in flight.
     loading_threads: HashSet<(ConversationId, Ts)>,
+    /// Followed Threads, by their Conversation and parent.
+    pub(crate) followed: HashMap<(ConversationId, Ts), Followed>,
+}
+
+/// A Followed Thread.
+#[derive(Debug)]
+pub(crate) struct Followed {
+    /// Its Replies past its Read Marker, and the Mentions among them.
+    pub(crate) activity: Activity,
+    /// The Message that started it; `None` when it hasn't been seen.
+    pub(crate) parent: Option<Message>,
 }
 
 /// A Message on its way to Slack.
@@ -372,6 +406,8 @@ pub(crate) struct App {
     focused: bool,
     /// Whether the open Conversation's pane was on screen at the last draw; a Thread may cover it.
     conversation_shown: bool,
+    /// Whether the open Thread's pane was on screen at the last draw.
+    thread_shown: bool,
     finder: Finder,
     /// When something drawn next changes frame, as animation time.
     next_change: Option<Duration>,
@@ -414,6 +450,7 @@ impl App {
             pending: None,
             focused: true,
             conversation_shown: false,
+            thread_shown: false,
             finder: Finder::new(),
             next_change: None,
             epoch: Instant::now(),
@@ -482,6 +519,7 @@ impl App {
                 }
                 self.next_change = drawn.next_change;
                 self.conversation_shown = drawn.conversation.is_some();
+                self.thread_shown = drawn.thread.is_some();
                 if let Some(settled) = drawn.conversation {
                     self.conversation_pane.adopt(settled);
                     if settled.scroll == settled.max_scroll {
@@ -494,6 +532,10 @@ impl App {
             }
         }
         self.mark_seen(&mut commands);
+        self.mark_thread_seen(&mut commands);
+        // Replies come and go unread, and the open Thread stays listed: keep the Threads section current.
+        let threads = self.followed_items();
+        self.sidebar.set(&Section::Threads, threads);
         // People's names keep arriving: keep a search's hits current.
         self.refresh_search();
         commands
@@ -589,10 +631,17 @@ impl App {
                 KeyCode::Char('g') | KeyCode::Home => self.sidebar.first(),
                 KeyCode::Char('G') | KeyCode::End => self.sidebar.last(),
                 KeyCode::Enter | KeyCode::Char('l') | KeyCode::Right => {
-                    match self.sidebar.selected().map(Row::conversation) {
-                        Some(Some(conversation)) => {
-                            self.open(conversation.clone(), commands);
+                    match self.sidebar.selected().map(|row| row.item().cloned()) {
+                        Some(Some(Item::Conversation(conversation))) => {
+                            self.open(conversation, commands);
                             self.focus = Focus::Timeline;
+                        }
+                        Some(Some(Item::Thread {
+                            conversation,
+                            parent,
+                        })) => {
+                            self.open(conversation, commands);
+                            self.open_thread(parent, commands);
                         }
                         Some(None) => self.sidebar.fold(Fold::Toggle),
                         None => {}
@@ -862,21 +911,31 @@ impl App {
         search.selected = search.selected.min(search.hits.len().saturating_sub(1));
     }
 
-    /// Opens the Thread of the open Conversation's selected Message, in its own pane, and asks for its Replies.
-    /// Any Message can start a Thread: one without Replies yet opens empty, ready for one.
+    /// Opens the Thread of the open Conversation's selected Message. Any Message can start a Thread: one without
+    /// Replies yet opens empty, ready for one.
     fn open_selected_thread(&mut self, commands: &mut Vec<Command>) {
         let Some(open) = &self.open else { return };
+        let selected = self
+            .workspaces
+            .get(open.workspace)
+            .and_then(|workspace| workspace.timelines.get(&open.id))
+            .and_then(|timeline| self.conversation_pane.selected(timeline));
+        if let Some(parent) = selected {
+            self.open_thread(parent, commands);
+        }
+    }
+
+    /// Opens the Thread under `parent` in the open Conversation, in its own pane with focus, and asks for its
+    /// Replies unless they're held or on their way.
+    fn open_thread(&mut self, parent: Ts, commands: &mut Vec<Command>) {
+        let Some(open) = &self.open else { return };
+        self.open_thread = Some(parent);
+        self.thread_pane = Pane::default();
+        self.thread_shown = false;
+        self.focus = Focus::Thread;
         let Some(workspace) = self.workspaces.get_mut(open.workspace) else {
             return;
         };
-        let selected = workspace
-            .timelines
-            .get(&open.id)
-            .and_then(|t| self.conversation_pane.selected(t));
-        let Some(parent) = selected else { return };
-        self.open_thread = Some(parent);
-        self.thread_pane = Pane::default();
-        self.focus = Focus::Thread;
         let thread = (open.id.clone(), parent);
         if !workspace.threads.contains_key(&thread) && workspace.loading_threads.insert(thread) {
             let request = Request::Replies {
@@ -937,6 +996,34 @@ impl App {
         }
     }
 
+    /// Moves the open Thread's Read Marker to its newest Reply, if the user follows it and that's on screen: the
+    /// window has focus, the Thread's pane shows, and the newest Reply is selected at the bottom.
+    fn mark_thread_seen(&mut self, commands: &mut Vec<Command>) {
+        if !self.focused || !self.thread_shown || !self.thread_pane.at_newest() {
+            return;
+        }
+        let (Some(open), Some(parent)) = (&self.open, self.open_thread) else {
+            return;
+        };
+        let Some(workspace) = self.workspaces.get_mut(open.workspace) else {
+            return;
+        };
+        let thread = (open.id.clone(), parent);
+        let newest = workspace.threads.get(&thread).and_then(Timeline::newest);
+        let (Some(newest), Some(followed)) = (newest, workspace.followed.get_mut(&thread)) else {
+            return;
+        };
+        if newest > followed.activity.read_up_to() {
+            followed.activity.mark_read(newest);
+            let request = Request::MarkThread {
+                conversation: open.id.clone(),
+                parent,
+                up_to: newest,
+            };
+            commands.push(Command::Slack(open.workspace, request));
+        }
+    }
+
     /// Moves focus to the sidebar, showing it if it's hidden.
     fn focus_sidebar(&mut self) {
         self.sidebar_shown = true;
@@ -947,6 +1034,7 @@ impl App {
         self.conversation_pane = Pane::default();
         self.conversation_shown = false;
         self.open_thread = None;
+        self.thread_shown = false;
         if let Some(workspace) = self.workspaces.get_mut(conversation.workspace)
             && !workspace.timelines.contains_key(&conversation.id)
             && workspace.loading.insert(conversation.id.clone())
@@ -978,11 +1066,11 @@ impl App {
         }
     }
 
-    /// Lists the sidebar's sections afresh: each Virtual Workspace with its Channels, in the config's order, then each
-    /// Workspace with its Conversations in no Virtual Workspace.
+    /// Lists the sidebar's sections afresh: the Followed Threads with Replies to read, then each Virtual Workspace
+    /// with its Channels, in the config's order, then each Workspace with its Conversations in no Virtual Workspace.
     fn list_sidebar(&mut self) {
         let mut in_virtual_workspaces = HashSet::new();
-        let mut sections = Vec::new();
+        let mut sections = vec![(Section::Threads, self.followed_items())];
         for virtual_workspace in &self.virtual_workspaces {
             let channels: Vec<ConversationRef> = virtual_workspace
                 .channels
@@ -991,7 +1079,10 @@ impl App {
                 .collect();
             in_virtual_workspaces.extend(channels.iter().cloned());
             let section = Section::VirtualWorkspace(virtual_workspace.name.clone());
-            sections.push((section, channels));
+            sections.push((
+                section,
+                channels.into_iter().map(Item::Conversation).collect(),
+            ));
         }
         for (key, sign_in) in self.workspaces.iter() {
             let conversations = match &sign_in.phase {
@@ -1003,12 +1094,53 @@ impl App {
                         id: c.id.clone(),
                     })
                     .filter(|c| !in_virtual_workspaces.contains(c))
+                    .map(Item::Conversation)
                     .collect(),
                 Phase::SigningIn | Phase::Failed(_) => Vec::new(),
             };
             sections.push((Section::Workspace(key), conversations));
         }
         self.sidebar.list(sections);
+    }
+
+    /// The Followed Threads the Threads section lists: those with Replies to read, and the open one, so that it
+    /// doesn't go as soon as it's read; the newest Reply first.
+    fn followed_items(&self) -> Vec<Item> {
+        let mut threads = Vec::new();
+        for (key, sign_in) in self.workspaces.iter() {
+            let Phase::Ready(workspace) = &sign_in.phase else {
+                continue;
+            };
+            for ((id, parent), followed) in &workspace.followed {
+                let conversation = ConversationRef {
+                    workspace: key,
+                    id: id.clone(),
+                };
+                let is_open =
+                    self.open.as_ref() == Some(&conversation) && self.open_thread == Some(*parent);
+                if (followed.activity.has_unread() || is_open)
+                    && workspace.conversation(id).is_some()
+                {
+                    threads.push((followed.activity.latest(), key.0, *parent, conversation));
+                }
+            }
+        }
+        // Newest first; the rest only makes the order the same every time.
+        threads.sort_by_cached_key(|(latest, index, parent, conversation)| {
+            (
+                Reverse(*latest),
+                *index,
+                *parent,
+                conversation.id.to_string(),
+            )
+        });
+        threads
+            .into_iter()
+            .map(|(_, _, parent, conversation)| Item::Thread {
+                conversation,
+                parent,
+            })
+            .collect()
     }
 
     fn slack(&mut self, key: WorkspaceKey, update: Update, commands: &mut Vec<Command>) {
@@ -1080,10 +1212,13 @@ impl App {
                             return;
                         };
                         // Slack moves the Read Marker past the user's own Message itself.
-                        if message.reply_to.is_none()
-                            && let Some(activity) = workspace.activity.get_mut(&conversation)
-                        {
-                            activity.mark_read(message.ts);
+                        match message.reply_to {
+                            Some(parent) => workspace.count_reply(&conversation, parent, &message),
+                            None => {
+                                if let Some(activity) = workspace.activity.get_mut(&conversation) {
+                                    activity.mark_read(message.ts);
+                                }
+                            }
                         }
                         workspace.add(&conversation, message);
                     }
@@ -1168,14 +1303,11 @@ impl App {
         }
 
         self.list_sidebar();
-        // Put the cursor on the first Conversation with something unread, without opening it: opening marks it
-        // read, which the user should choose.
+        // Put the cursor on the first row with something unread, without opening it: opening marks it read, which
+        // the user should choose.
         let workspaces = &self.workspaces;
-        self.sidebar.suggest(|row| {
-            row.conversation()
-                .and_then(|conversation| workspaces.activity(conversation))
-                .is_some_and(Activity::has_unread)
-        });
+        self.sidebar
+            .suggest(|row| row.item().is_some_and(|item| workspaces.has_unread(item)));
     }
 
     fn live(&mut self, key: WorkspaceKey, event: LiveEvent, commands: &mut Vec<Command>) {
@@ -1205,8 +1337,9 @@ impl App {
                 let is_dm = workspace
                     .conversation(&conversation)
                     .is_some_and(|c| matches!(c.kind, ConversationKind::Dm { .. }));
-                if message.reply_to.is_none()
-                    && !message.is_by(&workspace.me)
+                if let Some(parent) = message.reply_to {
+                    workspace.count_reply(&conversation, parent, &message);
+                } else if !message.is_by(&workspace.me)
                     && let Some(activity) = workspace.activity.get_mut(&conversation)
                 {
                     // Every DM Message counts as a Mention, as Slack's badges do.
@@ -1251,6 +1384,26 @@ impl App {
                     activity.mark_read(up_to);
                 }
             }
+            LiveEvent::ThreadFollowed {
+                conversation,
+                parent,
+                read_up_to,
+            } => workspace.follow(conversation, parent, read_up_to),
+            LiveEvent::ThreadUnfollowed {
+                conversation,
+                parent,
+            } => {
+                workspace.followed.remove(&(conversation, parent));
+            }
+            LiveEvent::ThreadMarked {
+                conversation,
+                parent,
+                up_to,
+            } => {
+                if let Some(followed) = workspace.followed.get_mut(&(conversation, parent)) {
+                    followed.activity.mark_read(up_to);
+                }
+            }
         }
         if joined {
             self.list_sidebar();
@@ -1262,6 +1415,18 @@ impl Workspace {
     /// The Workspace `snapshot` shows, with its Conversations in sidebar order: Channels by name, then DMs with the
     /// most recent first, as Slack's sidebar does by default.
     fn new(snapshot: Snapshot) -> Self {
+        let followed = snapshot
+            .followed_threads
+            .into_iter()
+            .map(|thread| {
+                let key = (thread.conversation, thread.parent.ts);
+                let followed = Followed {
+                    activity: thread.activity,
+                    parent: Some(thread.parent),
+                };
+                (key, followed)
+            })
+            .collect();
         let mut conversations = snapshot.conversations;
         conversations.sort_by(|(a, a_activity), (b, b_activity)| {
             is_dm(a).cmp(&is_dm(b)).then_with(|| {
@@ -1290,7 +1455,52 @@ impl Workspace {
             threads: HashMap::new(),
             loading: HashSet::new(),
             loading_threads: HashSet::new(),
+            followed,
         }
+    }
+
+    /// Counts `reply`, posted under `parent` in `conversation`, on its Followed Thread. Replying to a Thread follows
+    /// it, as in Slack; so does being mentioned in one here, so that the Mention isn't missed.
+    fn count_reply(&mut self, conversation: &ConversationId, parent: Ts, reply: &Message) {
+        let thread = (conversation.clone(), parent);
+        let mine = reply.is_by(&self.me);
+        let mentions_me = reply.mentions(&self.me);
+        if !(self.followed.contains_key(&thread) || mine || mentions_me) {
+            return;
+        }
+        let held = self.held_parent(conversation, parent);
+        let followed = self.followed.entry(thread).or_insert_with(|| Followed {
+            activity: Activity::default(),
+            parent: held,
+        });
+        if mine {
+            followed.activity.mark_read(reply.ts);
+        } else {
+            followed.activity.record(reply.ts, mentions_me);
+        }
+    }
+
+    /// Follows the Thread under `parent` in `conversation`, read up to `read_up_to`. Its newest Reply is known only if
+    /// its parent is held.
+    fn follow(&mut self, conversation: ConversationId, parent: Ts, read_up_to: Ts) {
+        let held = self.held_parent(&conversation, parent);
+        let latest = held
+            .as_ref()
+            .and_then(|parent| parent.thread)
+            .map_or(read_up_to, |summary| summary.latest.max(read_up_to));
+        let followed = self
+            .followed
+            .entry((conversation, parent))
+            .or_insert_with(|| Followed {
+                activity: Activity::counted(read_up_to, latest, latest > read_up_to, 0),
+                parent: held,
+            });
+        followed.activity.mark_read(read_up_to);
+    }
+
+    /// The Message at `parent` in `conversation`, if it's held.
+    fn held_parent(&self, conversation: &ConversationId, parent: Ts) -> Option<Message> {
+        self.timelines.get(conversation)?.get(parent).cloned()
     }
 
     /// Lists `conversation`, which just appeared, with its `activity`: a Channel among the Channels by name, a DM
@@ -1462,6 +1672,7 @@ mod tests {
     use slackers_slack::HistoryPage;
 
     use super::*;
+    use crate::sidebar::Row;
 
     const W0: WorkspaceKey = WorkspaceKey(0);
     const CELL: CellSize = CellSize {
@@ -1564,7 +1775,10 @@ mod tests {
 
     /// The Conversation under the sidebar's cursor.
     fn selected(app: &App) -> Option<ConversationRef> {
-        app.sidebar.selected()?.conversation().cloned()
+        match app.sidebar.selected()?.item()? {
+            Item::Conversation(conversation) => Some(conversation.clone()),
+            Item::Thread { .. } => None,
+        }
     }
 
     /// Reports a draw that showed the Conversation's pane, as tall as `height`, with everything fitting: the pane
@@ -1588,6 +1802,7 @@ mod tests {
             icon: None,
             me: UserId::new("UME"),
             conversations,
+            followed_threads: Vec::new(),
         }
     }
 
@@ -1652,20 +1867,34 @@ mod tests {
         app
     }
 
-    /// The sidebar, as `>` and a section's name for a header, else the Conversation's name.
+    /// The sidebar, as `>` and a section's name for a header, a Conversation's name, and for a Thread its
+    /// Conversation's name, `/`, and its parent's time in seconds.
     fn sidebar(app: &App) -> Vec<String> {
+        let name = |conversation: &ConversationRef| {
+            let (workspace, found) = app.workspaces.conversation(conversation).unwrap();
+            workspace.conversation_name(found).to_owned()
+        };
         app.sidebar
             .rows()
             .iter()
             .map(|row| match row {
+                Row::Header(Section::Threads) => ">threads".to_owned(),
                 Row::Header(Section::VirtualWorkspace(name)) => format!(">{name}"),
                 Row::Header(Section::Workspace(key)) => {
                     format!(">{}", app.workspaces.sign_in(*key).unwrap().label)
                 }
-                Row::Conversation { conversation, .. } => {
-                    let (workspace, found) = app.workspaces.conversation(conversation).unwrap();
-                    workspace.conversation_name(found).to_owned()
-                }
+                Row::Item {
+                    item: Item::Conversation(conversation),
+                    ..
+                } => name(conversation),
+                Row::Item {
+                    item:
+                        Item::Thread {
+                            conversation,
+                            parent,
+                        },
+                    ..
+                } => format!("{}/{}", name(conversation), parent.as_micros() / 1_000_000),
             })
             .collect()
     }
@@ -1700,7 +1929,10 @@ mod tests {
     #[test]
     fn signing_in_sorts_the_sidebar_and_selects_the_first_unread_without_opening_it() {
         let (app, commands) = ready_app();
-        assert_eq!(sidebar(&app), [">test", "general", "random", "U9"]);
+        assert_eq!(
+            sidebar(&app),
+            [">threads", ">test", "general", "random", "U9"]
+        );
         assert_eq!(selected(&app), Some(c("C2")));
         assert_eq!(app.open, None);
         assert_eq!(commands, [ask(Request::User(UserId::new("U9")))]);
@@ -1712,7 +1944,7 @@ mod tests {
         assert_eq!(
             sidebar(&app),
             [
-                ">K", "random", "dev", ">test", "general", "U9", ">other", "general"
+                ">threads", ">K", "random", "dev", ">test", "general", "U9", ">other", "general"
             ]
         );
         assert_eq!(selected(&app), Some(c("C2")), "the unread one, in K");
@@ -1721,7 +1953,7 @@ mod tests {
     #[test]
     fn workspaces_sign_in_on_their_own() {
         let mut app = App::new(vec!["test".into(), "other".into()], Vec::new(), CELL);
-        assert_eq!(sidebar(&app), [">test", ">other"]);
+        assert_eq!(sidebar(&app), [">threads", ">test", ">other"]);
         app.update(Event::CantSignIn {
             workspace: W1,
             reason: "no token".into(),
@@ -1731,7 +1963,7 @@ mod tests {
         assert!(matches!(other, Phase::Failed(reason) if reason == "no token"));
         assert_eq!(
             sidebar(&app),
-            [">test", "general", "random", "U9", ">other"]
+            [">threads", ">test", "general", "random", "U9", ">other"]
         );
     }
 
@@ -1807,14 +2039,14 @@ mod tests {
         assert_eq!(
             sidebar(&app),
             [
-                ">K", "random", "dev", "general", ">test", "U9", ">other", "general"
+                ">threads", ">K", "random", "dev", "general", ">test", "U9", ">other", "general"
             ]
         );
-        assert_eq!(app.sidebar.cursor(), 3, "the cursor follows it");
+        assert_eq!(app.sidebar.cursor(), 4, "the cursor follows it");
 
         command(&mut app, "vw add Gateway API");
         assert_eq!(app.virtual_workspaces[1].name, "Gateway API");
-        assert_eq!(sidebar(&app)[4..7], [">Gateway API", "general", ">test"]);
+        assert_eq!(sidebar(&app)[5..8], [">Gateway API", "general", ">test"]);
 
         assert!(command(&mut app, "vw add K").is_empty());
         assert_eq!(app.notice.as_deref(), Some("#general is in K already"));
@@ -1832,18 +2064,18 @@ mod tests {
         assert_eq!(
             sidebar(&app),
             [
-                ">K", "dev", ">test", "general", "random", "U9", ">other", "general"
+                ">threads", ">K", "dev", ">test", "general", "random", "U9", ">other", "general"
             ]
         );
 
         assert!(command(&mut app, "vw rm K").is_empty());
         assert_eq!(app.notice.as_deref(), Some("#random isn't in K"));
         keys(&mut app, "\\");
-        keys(&mut app, "gj");
+        keys(&mut app, "gjj");
         app.update(key(KeyCode::Enter));
         command(&mut app, "vw rm K");
         assert!(app.virtual_workspaces.is_empty());
-        assert_eq!(sidebar(&app)[0], ">test");
+        assert_eq!(sidebar(&app)[1], ">test");
     }
 
     #[test]
@@ -1868,20 +2100,25 @@ mod tests {
         keys(&mut app, "zc");
         assert_eq!(
             sidebar(&app),
-            [">K", ">test", "general", "U9", ">other", "general"]
+            [
+                ">threads", ">K", ">test", "general", "U9", ">other", "general"
+            ]
         );
-        assert_eq!(app.sidebar.cursor(), 0);
+        assert_eq!(app.sidebar.cursor(), 1);
         app.update(key(KeyCode::Enter));
-        assert_eq!(sidebar(&app).len(), 8, "enter on a header unfolds it");
+        assert_eq!(sidebar(&app).len(), 9, "enter on a header unfolds it");
 
         keys(&mut app, "zM");
-        assert_eq!(sidebar(&app), [">K", ">test", ">other"]);
+        assert_eq!(sidebar(&app), [">threads", ">K", ">test", ">other"]);
         keys(&mut app, "jza");
-        assert_eq!(sidebar(&app), [">K", ">test", "general", "U9", ">other"]);
+        assert_eq!(
+            sidebar(&app),
+            [">threads", ">K", ">test", "general", "U9", ">other"]
+        );
         keys(&mut app, "zR");
-        assert_eq!(sidebar(&app).len(), 8);
+        assert_eq!(sidebar(&app).len(), 9);
         assert!(keys(&mut app, "zx").is_empty(), "not a fold command");
-        assert_eq!(app.sidebar.cursor(), 3, "and no move either");
+        assert_eq!(app.sidebar.cursor(), 4, "and no move either");
     }
 
     #[test]
@@ -2291,7 +2528,7 @@ mod tests {
         assert_eq!(commands, [ask(Request::User(UserId::new("U8")))]);
         assert_eq!(
             sidebar(&app),
-            [">K", ">test", "general", "random", "U8", "U9"]
+            [">threads", ">K", ">test", "general", "random", "U8", "U9"]
         );
 
         app.update(joined(channel("C3", "alpha")));
@@ -2299,7 +2536,7 @@ mod tests {
         assert_eq!(
             sidebar(&app),
             [
-                ">K", "later", ">test", "alpha", "general", "random", "U8", "U9"
+                ">threads", ">K", "later", ">test", "alpha", "general", "random", "U8", "U9"
             ],
             "into its virtual workspace, as the config says"
         );
@@ -2307,7 +2544,7 @@ mod tests {
             app.update(joined(conversation("D7", dm, ""))).is_empty(),
             "only once"
         );
-        assert_eq!(sidebar(&app).len(), 8);
+        assert_eq!(sidebar(&app).len(), 9);
 
         let posted = LiveEvent::Posted {
             conversation: id("D7"),
@@ -2315,6 +2552,170 @@ mod tests {
         };
         app.update(slack(Update::Live(posted)));
         assert_eq!(workspace(&app, W0).activity[&id("D7")].mentions(), 1);
+    }
+
+    /// `ready_app`, also following two Threads in `#random`: one under the Message at 10 seconds with a Reply to
+    /// read, at 12; one under the Message at 20, read.
+    fn following_threads() -> (App, Vec<Command>) {
+        let mut app = App::new(vec!["test".into()], Vec::new(), CELL);
+        let followed = |parent: u64, read: u64, latest: u64| slackers_slack::FollowedThread {
+            conversation: id("C2"),
+            parent: message(parent, "U2", RichText::plain("a question")),
+            activity: Activity::counted(seconds(read), seconds(latest), latest > read, 0),
+        };
+        let snapshot = Snapshot {
+            followed_threads: vec![followed(20, 21, 21), followed(10, 11, 12)],
+            ..test_snapshot()
+        };
+        let commands = app.update(slack(Update::Ready(Box::new(snapshot))));
+        (app, commands)
+    }
+
+    /// Reports a draw that showed the Thread's pane, as tall as `height`, with everything fitting.
+    fn thread_drawn(app: &mut App, height: usize) -> Vec<Command> {
+        let settled = Settled {
+            height,
+            ..Settled::default()
+        };
+        app.update(Event::Drawn(Drawn {
+            thread: Some(settled),
+            ..Drawn::default()
+        }))
+    }
+
+    #[test]
+    fn followed_threads_with_replies_to_read_head_the_sidebar() {
+        let (app, _) = following_threads();
+        assert_eq!(
+            sidebar(&app),
+            [">threads", "random/10", ">test", "general", "random", "U9"]
+        );
+        assert_eq!(app.sidebar.cursor(), 1, "the first thing unread");
+    }
+
+    #[test]
+    fn replies_count_on_followed_threads_and_a_mention_follows_one() {
+        let (mut app, _) = following_threads();
+        let reply = |s: u64, parent: u64, author: &str, text: RichText| {
+            let message = Message {
+                reply_to: Some(seconds(parent)),
+                ..message(s, author, text)
+            };
+            slack(Update::Live(LiveEvent::Posted {
+                conversation: id("C2"),
+                message,
+            }))
+        };
+        app.update(reply(30, 20, "U2", RichText::plain("an answer")));
+        assert_eq!(
+            sidebar(&app)[..3],
+            [">threads", "random/20", "random/10"],
+            "newest Reply first"
+        );
+
+        app.update(reply(31, 40, "U2", RichText::plain("elsewhere")));
+        assert_eq!(
+            sidebar(&app)[..4],
+            [">threads", "random/20", "random/10", ">test"]
+        );
+
+        let mut mention = RichText::plain("ping ");
+        if let slackers_model::Block::Paragraph(inlines) = &mut mention.blocks[0] {
+            inlines.push(Inline::User(UserId::new("UME")));
+        }
+        app.update(reply(32, 50, "U2", mention));
+        assert_eq!(sidebar(&app)[..2], [">threads", "random/50"]);
+        let followed = app.workspaces.followed(&c("C2"), seconds(50)).unwrap();
+        assert_eq!(followed.activity.mentions(), 1);
+
+        app.update(reply(33, 60, "UME", RichText::plain("mine")));
+        let mine = app.workspaces.followed(&c("C2"), seconds(60)).unwrap();
+        assert!(
+            !mine.activity.has_unread(),
+            "replying follows a thread, read"
+        );
+        assert!(
+            unread(&app, "C2"),
+            "replies leave the channel's own badge alone"
+        );
+    }
+
+    #[test]
+    fn a_thread_row_opens_its_thread_which_is_marked_read_once_shown() {
+        let (mut app, _) = following_threads();
+        let commands = app.update(key(KeyCode::Enter));
+        assert_eq!(
+            commands,
+            [
+                ask(Request::History {
+                    conversation: id("C2"),
+                    before: None
+                }),
+                ask(Request::Replies {
+                    conversation: id("C2"),
+                    parent: seconds(10)
+                })
+            ]
+        );
+        assert_eq!(
+            (&app.open, app.open_thread, app.focus),
+            (&Some(c("C2")), Some(seconds(10)), Focus::Thread)
+        );
+        let replies = vec![
+            message(10, "U2", RichText::plain("a question")),
+            reply(11, 10),
+            reply(12, 10),
+        ];
+        app.update(slack(Update::Replies {
+            conversation: id("C2"),
+            parent: seconds(10),
+            result: Ok(replies),
+        }));
+        assert_eq!(
+            thread_drawn(&mut app, 10),
+            [ask(Request::MarkThread {
+                conversation: id("C2"),
+                parent: seconds(10),
+                up_to: seconds(12)
+            })]
+        );
+        assert_eq!(sidebar(&app)[1], "random/10", "it stays while it's open");
+
+        keys(&mut app, "\\");
+        keys(&mut app, "G");
+        app.update(key(KeyCode::Enter));
+        assert_eq!(sidebar(&app)[1], ">test", "and goes once something else is");
+    }
+
+    #[test]
+    fn thread_events_follow_unfollow_and_mark() {
+        let mut app = reading_random();
+        let live = |event| slack(Update::Live(event));
+        // The parent at 5 seconds is held, and its summary says its newest Reply is at 6.
+        app.update(live(LiveEvent::ThreadFollowed {
+            conversation: id("C2"),
+            parent: seconds(5),
+            read_up_to: seconds(5),
+        }));
+        let followed = |app: &App| {
+            app.workspaces
+                .followed(&c("C2"), seconds(5))
+                .map(|followed| followed.activity.has_unread())
+        };
+        assert_eq!(followed(&app), Some(true));
+
+        app.update(live(LiveEvent::ThreadMarked {
+            conversation: id("C2"),
+            parent: seconds(5),
+            up_to: seconds(6),
+        }));
+        assert_eq!(followed(&app), Some(false));
+
+        app.update(live(LiveEvent::ThreadUnfollowed {
+            conversation: id("C2"),
+            parent: seconds(5),
+        }));
+        assert_eq!(followed(&app), None);
     }
 
     #[test]

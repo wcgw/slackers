@@ -64,6 +64,16 @@ pub enum Request {
         /// The newest Message read.
         up_to: Ts,
     },
+    /// Moves the user's Read Marker in a Followed Thread. Slack confirms with a [`LiveEvent::ThreadMarked`];
+    /// failures are only logged.
+    MarkThread {
+        /// Where.
+        conversation: ConversationId,
+        /// The Thread's parent.
+        parent: Ts,
+        /// The newest Reply read.
+        up_to: Ts,
+    },
 }
 
 /// What a [`Session`] learned.
@@ -128,6 +138,20 @@ pub struct Snapshot {
     pub me: UserId,
     /// The Conversations in the user's sidebar, with their Activity, in no particular order.
     pub conversations: Vec<(Conversation, Activity)>,
+    /// The Followed Threads with the latest Replies; possibly not all of them.
+    pub followed_threads: Vec<FollowedThread>,
+}
+
+/// A Followed Thread, as signing in finds it.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct FollowedThread {
+    /// Where.
+    pub conversation: ConversationId,
+    /// The Message that started it.
+    pub parent: Message,
+    /// Its Replies past its Read Marker. Mentions in them aren't counted: Slack only counts them across every
+    /// Thread.
+    pub activity: Activity,
 }
 
 /// A page of a Conversation's history.
@@ -199,6 +223,31 @@ pub enum LiveEvent {
     Marked {
         /// Where.
         conversation: ConversationId,
+        /// The new Read Marker.
+        up_to: Ts,
+    },
+    /// The user follows a Thread now: they started it, replied to it, or chose to.
+    ThreadFollowed {
+        /// Where.
+        conversation: ConversationId,
+        /// The Thread's parent.
+        parent: Ts,
+        /// Its Read Marker.
+        read_up_to: Ts,
+    },
+    /// The user no longer follows a Thread.
+    ThreadUnfollowed {
+        /// Where.
+        conversation: ConversationId,
+        /// The Thread's parent.
+        parent: Ts,
+    },
+    /// The user's Read Marker in a Followed Thread moved, in this or another client.
+    ThreadMarked {
+        /// Where.
+        conversation: ConversationId,
+        /// The Thread's parent.
+        parent: Ts,
         /// The new Read Marker.
         up_to: Ts,
     },
@@ -414,6 +463,15 @@ async fn serve(api: &Api, request: Request, me: &UserId, notify: &Notify) {
         } => {
             if let Err(error) = api.mark(&conversation, up_to).await {
                 tracing::warn!(%error, %conversation, "couldn't move the read marker");
+            }
+        }
+        Request::MarkThread {
+            conversation,
+            parent,
+            up_to,
+        } => {
+            if let Err(error) = api.mark_thread(&conversation, parent, up_to).await {
+                tracing::warn!(%error, %conversation, "couldn't move a thread's read marker");
             }
         }
     }

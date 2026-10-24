@@ -1,20 +1,44 @@
-//! What the sidebar lists: sections of Conversations, under headers that fold them, and the cursor moving through
-//! them.
+//! What the sidebar lists: sections of Conversations and Threads, under headers that fold them, and the cursor
+//! moving through them.
 //!
 //! The app decides which sections there are and what each holds; the sidebar keeps track of which are folded, and
 //! keeps the cursor on the same row as sections fill and change.
 
 use std::collections::HashSet;
 
+use slackers_model::Ts;
+
 use crate::app::{ConversationRef, WorkspaceKey};
 
 /// A part of the sidebar, under a header that folds it.
 #[derive(Clone, Debug, PartialEq, Eq, Hash)]
 pub(crate) enum Section {
+    /// Followed Threads with Replies to read, from every Workspace.
+    Threads,
     /// A Virtual Workspace's Channels; it's known by name.
     VirtualWorkspace(String),
     /// A Workspace's Conversations that aren't in any Virtual Workspace.
     Workspace(WorkspaceKey),
+}
+
+/// What a row under a header shows.
+#[derive(Clone, Debug, PartialEq, Eq, Hash)]
+pub(crate) enum Item {
+    Conversation(ConversationRef),
+    /// A Thread, by its Conversation and parent.
+    Thread {
+        conversation: ConversationRef,
+        parent: Ts,
+    },
+}
+
+impl Item {
+    /// The Conversation it is, or holds.
+    pub(crate) fn conversation(&self) -> &ConversationRef {
+        match self {
+            Self::Conversation(conversation) | Self::Thread { conversation, .. } => conversation,
+        }
+    }
 }
 
 /// One line of the sidebar.
@@ -22,26 +46,23 @@ pub(crate) enum Section {
 pub(crate) enum Row {
     /// A section's header.
     Header(Section),
-    /// A Conversation in a section. The same Conversation can be in several.
-    Conversation {
-        section: Section,
-        conversation: ConversationRef,
-    },
+    /// An item in a section. The same one can be in several.
+    Item { section: Section, item: Item },
 }
 
 impl Row {
-    /// The Conversation on this row; `None` on a header.
-    pub(crate) fn conversation(&self) -> Option<&ConversationRef> {
+    /// The item on this row; `None` on a header.
+    pub(crate) fn item(&self) -> Option<&Item> {
         match self {
             Self::Header(_) => None,
-            Self::Conversation { conversation, .. } => Some(conversation),
+            Self::Item { item, .. } => Some(item),
         }
     }
 
     /// The section this row heads or belongs to.
     fn section(&self) -> &Section {
         match self {
-            Self::Header(section) | Self::Conversation { section, .. } => section,
+            Self::Header(section) | Self::Item { section, .. } => section,
         }
     }
 }
@@ -64,10 +85,10 @@ pub(crate) enum Fold {
 /// The sidebar's sections, which of them are folded, and where the cursor is.
 #[derive(Debug, Default)]
 pub(crate) struct Sidebar {
-    /// Each section, top to bottom, with its Conversations in order, folded or not.
-    sections: Vec<(Section, Vec<ConversationRef>)>,
+    /// Each section, top to bottom, with its items in order, folded or not.
+    sections: Vec<(Section, Vec<Item>)>,
     folded: HashSet<Section>,
-    /// What shows: each section's header, followed by its Conversations unless it's folded.
+    /// What shows: each section's header, followed by its items unless it's folded.
     rows: Vec<Row>,
     /// The row under the cursor, as a position in `rows`.
     cursor: usize,
@@ -76,14 +97,30 @@ pub(crate) struct Sidebar {
 }
 
 impl Sidebar {
-    /// Lists `sections`, top to bottom, each with its Conversations in order, in place of what it listed. The
-    /// cursor stays on its row if that's still there, else goes to the same Conversation in another section, else
-    /// to its section's header, else stays where it was.
-    pub(crate) fn list(&mut self, sections: Vec<(Section, Vec<ConversationRef>)>) {
+    /// Lists `sections`, top to bottom, each with its items in order, in place of what it listed. The cursor stays
+    /// on its row if that's still there, else goes to the same item in another section, else to its section's
+    /// header, else stays where it was.
+    pub(crate) fn list(&mut self, sections: Vec<(Section, Vec<Item>)>) {
         self.sections = sections;
         self.folded
             .retain(|folded| self.sections.iter().any(|(section, _)| section == folded));
         self.relist();
+    }
+
+    /// Lists `items` in `section` in place of what it held, keeping the cursor as [`Sidebar::list`] does. Does
+    /// nothing if `section` isn't listed or already holds `items`.
+    pub(crate) fn set(&mut self, section: &Section, items: Vec<Item>) {
+        let Some((_, held)) = self
+            .sections
+            .iter_mut()
+            .find(|(listed, _)| listed == section)
+        else {
+            return;
+        };
+        if *held != items {
+            *held = items;
+            self.relist();
+        }
     }
 
     /// The rows showing, top to bottom.
@@ -105,34 +142,39 @@ impl Sidebar {
         self.folded.contains(section)
     }
 
-    /// The Conversations in `section`, folded or not, in order.
-    pub(crate) fn conversations_in(&self, section: &Section) -> &[ConversationRef] {
+    /// The items in `section`, folded or not, in order.
+    pub(crate) fn items_in(&self, section: &Section) -> &[Item] {
         self.sections
             .iter()
             .find(|(listed, _)| listed == section)
-            .map_or(&[], |(_, conversations)| conversations.as_slice())
+            .map_or(&[], |(_, items)| items.as_slice())
     }
 
-    /// The section `conversation` is listed in: the cursor's, if it's on `conversation`, else the first that holds it,
-    /// folded or not; `None` when none does.
+    /// The section `conversation` is listed in: the cursor's, if it's on `conversation` or one of its Threads, else
+    /// the first that holds `conversation`, folded or not; `None` when none does.
     pub(crate) fn section_of(&self, conversation: &ConversationRef) -> Option<&Section> {
         let selected = self
             .selected()
-            .filter(|row| row.conversation() == Some(conversation));
+            .filter(|row| row.item().map(Item::conversation) == Some(conversation));
         selected.map(Row::section).or_else(|| {
+            let wanted = Item::Conversation(conversation.clone());
             self.sections
                 .iter()
-                .find(|(_, conversations)| conversations.contains(conversation))
+                .find(|(_, items)| items.contains(&wanted))
                 .map(|(section, _)| section)
         })
     }
 
-    /// Every Conversation listed, folded or not, each once, in order.
+    /// Every Conversation listed, folded or not, each once, in order. Threads aren't Conversations.
     pub(crate) fn conversations(&self) -> Vec<&ConversationRef> {
         let mut seen = HashSet::new();
         self.sections
             .iter()
-            .flat_map(|(_, conversations)| conversations)
+            .flat_map(|(_, items)| items)
+            .filter_map(|item| match item {
+                Item::Conversation(conversation) => Some(conversation),
+                Item::Thread { .. } => None,
+            })
             .filter(|conversation| seen.insert(*conversation))
             .collect()
     }
@@ -169,20 +211,18 @@ impl Sidebar {
     /// Moves the cursor to `conversation`, unfolding the first section that holds it if need be. Does nothing when
     /// no section does.
     pub(crate) fn select(&mut self, conversation: &ConversationRef) {
+        let wanted = Item::Conversation(conversation.clone());
         let holding = self
             .sections
             .iter()
-            .find(|(_, conversations)| conversations.contains(conversation));
+            .find(|(_, items)| items.contains(&wanted));
         let Some((section, _)) = holding else {
             return;
         };
         if self.folded.remove(section) {
             self.relist();
         }
-        let showing = self
-            .rows
-            .iter()
-            .position(|row| row.conversation() == Some(conversation));
+        let showing = self.rows.iter().position(|row| row.item() == Some(&wanted));
         if let Some(at) = showing {
             self.cursor = at;
             self.moved = true;
@@ -210,7 +250,7 @@ impl Sidebar {
             }
         }
         self.relist();
-        // Rather than to the same Conversation in another section, which `relist` would pick.
+        // Rather than to the same item in another section, which `relist` would pick.
         if self.folded.contains(&section) {
             self.cursor = self
                 .rows
@@ -228,30 +268,28 @@ impl Sidebar {
         self.rows = self
             .sections
             .iter()
-            .flat_map(|(section, conversations)| {
+            .flat_map(|(section, items)| {
                 let shown = if self.folded.contains(section) {
                     &[][..]
                 } else {
-                    conversations.as_slice()
+                    items.as_slice()
                 };
                 let header = Row::Header(section.clone());
-                let rows = shown.iter().map(|conversation| Row::Conversation {
+                let rows = shown.iter().map(|item| Row::Item {
                     section: section.clone(),
-                    conversation: conversation.clone(),
+                    item: item.clone(),
                 });
                 std::iter::once(header).chain(rows)
             })
             .collect();
         let found = was.and_then(|was| {
             let same = |row: &Row| *row == was;
-            let same_conversation = |row: &Row| {
-                row.conversation().is_some() && row.conversation() == was.conversation()
-            };
+            let same_item = |row: &Row| row.item().is_some() && row.item() == was.item();
             let header = Row::Header(was.section().clone());
             self.rows
                 .iter()
                 .position(same)
-                .or_else(|| self.rows.iter().position(same_conversation))
+                .or_else(|| self.rows.iter().position(same_item))
                 .or_else(|| self.rows.iter().position(|row| *row == header))
         });
         self.cursor = found
@@ -273,6 +311,17 @@ mod tests {
         }
     }
 
+    fn item(workspace: usize, id: &str) -> Item {
+        Item::Conversation(conversation(workspace, id))
+    }
+
+    fn thread(workspace: usize, id: &str, parent: u64) -> Item {
+        Item::Thread {
+            conversation: conversation(workspace, id),
+            parent: Ts::from_micros(parent),
+        }
+    }
+
     fn virtual_workspace(name: &str) -> Section {
         Section::VirtualWorkspace(name.to_owned())
     }
@@ -285,33 +334,46 @@ mod tests {
     fn listed() -> Sidebar {
         let mut sidebar = Sidebar::default();
         sidebar.list(vec![
-            (
-                virtual_workspace("K"),
-                vec![conversation(0, "C1"), conversation(1, "C1")],
-            ),
-            (workspace(0), vec![conversation(0, "C2")]),
-            (workspace(1), vec![conversation(1, "D1")]),
+            (virtual_workspace("K"), vec![item(0, "C1"), item(1, "C1")]),
+            (workspace(0), vec![item(0, "C2")]),
+            (workspace(1), vec![item(1, "D1")]),
         ]);
         sidebar
     }
 
-    /// The rows, as `>` for a header followed by the section, or the Conversation as `workspace:id`.
+    /// The rows, as `>` for a header followed by the section, a Conversation as `workspace:id`, and a Thread as
+    /// `workspace:id/parent`.
     fn shown(sidebar: &Sidebar) -> Vec<String> {
         sidebar
             .rows()
             .iter()
             .map(|row| match row {
+                Row::Header(Section::Threads) => ">threads".to_owned(),
                 Row::Header(Section::VirtualWorkspace(name)) => format!(">{name}"),
                 Row::Header(Section::Workspace(key)) => format!(">{}", key.index()),
-                Row::Conversation { conversation, .. } => {
-                    format!("{}:{}", conversation.workspace.index(), conversation.id)
-                }
+                Row::Item {
+                    item: Item::Conversation(conversation),
+                    ..
+                } => format!("{}:{}", conversation.workspace.index(), conversation.id),
+                Row::Item {
+                    item:
+                        Item::Thread {
+                            conversation,
+                            parent,
+                        },
+                    ..
+                } => format!(
+                    "{}:{}/{}",
+                    conversation.workspace.index(),
+                    conversation.id,
+                    parent.as_micros()
+                ),
             })
             .collect()
     }
 
     #[test]
-    fn sections_list_their_header_then_their_conversations() {
+    fn sections_list_their_header_then_their_items() {
         let sidebar = listed();
         assert_eq!(
             shown(&sidebar),
@@ -330,14 +392,14 @@ mod tests {
     }
 
     #[test]
-    fn folding_hides_a_sections_conversations_and_brings_the_cursor_to_its_header() {
+    fn folding_hides_a_sections_items_and_brings_the_cursor_to_its_header() {
         let mut sidebar = listed();
         sidebar.move_by(2);
         sidebar.fold(Fold::Toggle);
         assert_eq!(shown(&sidebar), [">K", ">0", "0:C2", ">1", "1:D1"]);
         assert_eq!(sidebar.cursor(), 0);
         assert!(sidebar.is_folded(&virtual_workspace("K")));
-        assert_eq!(sidebar.conversations_in(&virtual_workspace("K")).len(), 2);
+        assert_eq!(sidebar.items_in(&virtual_workspace("K")).len(), 2);
 
         sidebar.fold(Fold::Toggle);
         assert_eq!(shown(&sidebar).len(), 7);
@@ -355,8 +417,8 @@ mod tests {
     fn folding_keeps_the_cursor_in_its_section_though_its_conversation_shows_in_another() {
         let mut sidebar = Sidebar::default();
         sidebar.list(vec![
-            (virtual_workspace("K"), vec![conversation(0, "C1")]),
-            (virtual_workspace("L"), vec![conversation(0, "C1")]),
+            (virtual_workspace("K"), vec![item(0, "C1")]),
+            (virtual_workspace("L"), vec![item(0, "C1")]),
         ]);
         sidebar.move_by(1);
         sidebar.fold(Fold::Close);
@@ -370,31 +432,25 @@ mod tests {
     fn the_cursor_keeps_its_row_as_sections_change() {
         let mut sidebar = listed();
         sidebar.move_by(4);
-        assert_eq!(
-            sidebar.selected().and_then(Row::conversation),
-            Some(&conversation(0, "C2"))
-        );
+        assert_eq!(sidebar.selected().and_then(Row::item), Some(&item(0, "C2")));
 
         // A Workspace above signs in: the cursor stays on its row.
         sidebar.list(vec![
-            (
-                workspace(2),
-                vec![conversation(2, "C9"), conversation(2, "C8")],
-            ),
-            (workspace(0), vec![conversation(0, "C2")]),
+            (workspace(2), vec![item(2, "C9"), item(2, "C8")]),
+            (workspace(0), vec![item(0, "C2")]),
         ]);
         assert_eq!(sidebar.cursor(), 4);
 
         // Its Conversation moves to a Virtual Workspace: the cursor follows it.
         sidebar.list(vec![
-            (virtual_workspace("K"), vec![conversation(0, "C2")]),
+            (virtual_workspace("K"), vec![item(0, "C2")]),
             (workspace(0), Vec::new()),
         ]);
         assert_eq!(
             sidebar.selected(),
-            Some(&Row::Conversation {
+            Some(&Row::Item {
                 section: virtual_workspace("K"),
-                conversation: conversation(0, "C2"),
+                item: item(0, "C2"),
             })
         );
 
@@ -404,12 +460,52 @@ mod tests {
     }
 
     #[test]
+    fn setting_a_section_relists_only_what_changed() {
+        let mut sidebar = Sidebar::default();
+        sidebar.list(vec![
+            (Section::Threads, Vec::new()),
+            (workspace(0), vec![item(0, "C1")]),
+        ]);
+        sidebar.move_by(2);
+        sidebar.set(
+            &Section::Threads,
+            vec![thread(0, "C1", 5), thread(0, "C1", 3)],
+        );
+        assert_eq!(
+            shown(&sidebar),
+            [">threads", "0:C1/5", "0:C1/3", ">0", "0:C1"]
+        );
+        assert_eq!(sidebar.cursor(), 4, "still on #C1");
+        assert_eq!(
+            sidebar.conversations().len(),
+            1,
+            "threads aren't conversations"
+        );
+
+        // A Thread is read and leaves: the cursor on it goes to the header.
+        sidebar.move_by(-3);
+        sidebar.set(&Section::Threads, vec![thread(0, "C1", 3)]);
+        assert_eq!(sidebar.selected(), Some(&Row::Header(Section::Threads)));
+        assert_eq!(
+            sidebar.section_of(&conversation(0, "C1")),
+            Some(&workspace(0)),
+            "the header isn't on it"
+        );
+        sidebar.move_by(1);
+        assert_eq!(
+            sidebar.section_of(&conversation(0, "C1")),
+            Some(&Section::Threads),
+            "the cursor is on one of its Threads"
+        );
+    }
+
+    #[test]
     fn a_suggestion_moves_the_cursor_only_until_the_user_does() {
         let mut sidebar = listed();
-        sidebar.suggest(|row| row.conversation() == Some(&conversation(1, "D1")));
+        sidebar.suggest(|row| row.item() == Some(&item(1, "D1")));
         assert_eq!(sidebar.cursor(), 6);
         sidebar.move_by(-1);
-        sidebar.suggest(|row| row.conversation().is_some());
+        sidebar.suggest(|row| row.item().is_some());
         assert_eq!(sidebar.cursor(), 5);
     }
 
@@ -424,9 +520,9 @@ mod tests {
         sidebar.select(&conversation(1, "C1"));
         assert_eq!(
             sidebar.selected(),
-            Some(&Row::Conversation {
+            Some(&Row::Item {
                 section: virtual_workspace("K"),
-                conversation: conversation(1, "C1"),
+                item: item(1, "C1"),
             }),
             "the first section holding it"
         );
