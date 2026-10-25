@@ -34,7 +34,7 @@ of history calls weren't rate limited.
   knowledge of them inside the Slack adapter, so that switching to a documented method or an app token stays a local
   change. Don't "fix" them back to the documented methods: on Red Hat's Grid those are refused.
 - The credentials grant full access as the user. Treat them as a password: never log them, and never store them in
-  plain config. They live in the Secret Service keyring.
+  plain config. They live in the system keyring: the Secret Service on Linux, the login Keychain on macOS.
 - The credentials belong to a browser session. Signing in to another Workspace in that browser replaces its `d` cookie
   and invalidates the stored one; logging out does too. The tokens survive, so refreshing the cookie is enough.
   slackers must detect `invalid_auth` and ask for fresh credentials instead of failing. Later, slackers could get a
