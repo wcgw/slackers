@@ -16,7 +16,8 @@
 //! Followed Threads shows a desktop notification.
 //!
 //! A Draft starting with `/` and a word runs that slash command rather than posting: `/` brings up the Workspace's
-//! commands to choose from, as `@` does people. Starting it with a space posts it as text instead.
+//! commands to choose from, as `@` does people. Starting it with a space posts it as text instead. When the command
+//! posts for the user elsewhere, as `/dm @someone hi` does, slackers follows it there.
 //!
 //! On one of the user's Messages, `e` edits it in its pane's composer, as `↑` does in an empty one for their newest
 //! there: `Enter` saves the edit and `Esc` gives it up, bringing back what was being written before.
@@ -30,7 +31,7 @@
 
 use std::cmp::Reverse;
 use std::collections::{HashMap, HashSet};
-use std::time::{Duration, Instant};
+use std::time::{Duration, Instant, SystemTime};
 
 use crossterm::event::{Event as TerminalEvent, KeyCode, KeyEvent, KeyEventKind, KeyModifiers};
 use slackers_gfx::{CellSize, Fit, Picture};
@@ -65,6 +66,13 @@ const HELD_NOTIFICATIONS: usize = 20;
 
 /// The most pages of history loaded to reach a Message an Activity item opens.
 const JUMP_PAGES: u32 = 10;
+
+/// How long after running a slash command a Message the user posts elsewhere counts as the command's doing, in
+/// microseconds.
+const COMMAND_POSTS_WITHIN: u64 = 15 * 1_000_000;
+
+/// How far Slack's clock, which times Messages, may be behind this one, in microseconds.
+const CLOCK_SKEW: u64 = 5 * 1_000_000;
 
 /// Something that happened, for [`App::update`] to react to.
 #[derive(Debug)]
@@ -606,6 +614,8 @@ pub(crate) struct App {
     pub(crate) outbox: Vec<Outgoing>,
     /// Slash commands run but not yet answered, by request id, to put back in their Drafts should they fail.
     commands_sent: Vec<(u64, Place, Written)>,
+    /// The slash command run last, while it may yet post for the user elsewhere: slackers follows it there.
+    following: Option<Following>,
     /// Edits being written, by where: in that Place's Draft, set aside meanwhile.
     editing: HashMap<Place, Editing>,
     /// Edits saved but not yet confirmed, to put back should Slack refuse them.
@@ -665,6 +675,7 @@ impl App {
             suggestions: None,
             outbox: Vec::new(),
             commands_sent: Vec::new(),
+            following: None,
             editing: HashMap::new(),
             edits_sent: Vec::new(),
             next_post: 0,
@@ -1750,6 +1761,10 @@ impl App {
                 id,
             };
             commands.push(Command::Slack(place.conversation.workspace, request));
+            self.following = Some(Following {
+                from: place.conversation.clone(),
+                at: now(),
+            });
             self.commands_sent.push((id, place, written));
             return;
         }
@@ -1875,18 +1890,23 @@ impl App {
         }
     }
 
-    /// Opens the selected Activity item's Message, selected: in its Thread if it's a Reply, else in its
-    /// Conversation, loading older history as far as [`JUMP_PAGES`] pages to reach it.
+    /// Opens the selected Activity item's Message, as [`App::go_to`] does.
     fn open_activity_item(&mut self, commands: &mut Vec<Command>) {
         let Some(entry) = self.activity.selected_entry() else {
             return;
         };
         let key = entry.workspace;
-        let at = entry.item.message.clone();
-        let thread = at.thread.or(match self.activity_message(key, &at) {
+        let mut at = entry.item.message.clone();
+        at.thread = at.thread.or(match self.activity_message(key, &at) {
             Fetched::Got(message) => message.reply_to,
             Fetched::Unasked | Fetched::Fetching | Fetched::Unavailable => None,
         });
+        self.go_to(key, at, commands);
+    }
+
+    /// Opens the Message at `at` in the Workspace at `key`, selected: in its Thread if it's a Reply, else in its
+    /// Conversation, loading older history as far as [`JUMP_PAGES`] pages to reach it.
+    fn go_to(&mut self, key: WorkspaceKey, at: MessageRef, commands: &mut Vec<Command>) {
         let conversation = ConversationRef {
             workspace: key,
             id: at.conversation,
@@ -1897,7 +1917,7 @@ impl App {
         }
         self.sidebar.select(&conversation);
         self.open(conversation, commands);
-        match thread {
+        match at.thread {
             Some(parent) => {
                 self.open_thread(parent, commands);
                 self.thread_pane.select(at.ts);
@@ -2099,6 +2119,13 @@ impl App {
                     }
                     Ok(None) => {}
                     Err(error) => {
+                        if self
+                            .following
+                            .as_ref()
+                            .is_some_and(|following| following.from == place.conversation)
+                        {
+                            self.following = None;
+                        }
                         let command = written
                             .command()
                             .map(|(command, _)| command)
@@ -2423,6 +2450,8 @@ impl App {
             return;
         };
         let mut joined = false;
+        // Where a slash command the user ran posted for them.
+        let mut landed = None;
         // Whether it may add to the user's Activity, or change it.
         let mut touches_activity = false;
         // A Message to notify the user of.
@@ -2447,6 +2476,18 @@ impl App {
                 conversation,
                 message,
             } => {
+                if message.is_by(&workspace.me)
+                    && self
+                        .following
+                        .as_ref()
+                        .is_some_and(|following| following.led_to(key, &conversation, message.ts))
+                {
+                    landed = Some(MessageRef {
+                        conversation: conversation.clone(),
+                        ts: message.ts,
+                        thread: message.reply_to,
+                    });
+                }
                 workspace.want_names_in(key, [&message], commands);
                 let kind = workspace.conversation(&conversation).map(|c| &c.kind);
                 let is_dm = matches!(kind, Some(ConversationKind::Dm { .. }));
@@ -2545,6 +2586,16 @@ impl App {
         if joined {
             self.list_sidebar();
         }
+        if let Some(at) = landed {
+            self.following = None;
+            let there = ConversationRef {
+                workspace: key,
+                id: at.conversation.clone(),
+            };
+            if self.open_conversation() != Some(&there) {
+                self.go_to(key, at, commands);
+            }
+        }
         if touches_activity {
             self.refresh_activity(key, commands);
         }
@@ -2556,6 +2607,35 @@ impl App {
             self.notify_held(key, commands);
         }
     }
+}
+
+/// A slash command just run, which may post for the user elsewhere, as `/dm` does.
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct Following {
+    /// Where it was run.
+    from: ConversationRef,
+    /// When, by this machine's clock.
+    at: Ts,
+}
+
+impl Following {
+    /// Whether the user's Message at `ts`, in `conversation` of the Workspace at `key`, is the command posting for
+    /// them elsewhere: in another Conversation of its Workspace, soon after it ran.
+    fn led_to(&self, key: WorkspaceKey, conversation: &ConversationId, ts: Ts) -> bool {
+        let at = self.at.as_micros();
+        let soon = at.saturating_sub(CLOCK_SKEW)..=at.saturating_add(COMMAND_POSTS_WITHIN);
+        key == self.from.workspace
+            && *conversation != self.from.id
+            && soon.contains(&ts.as_micros())
+    }
+}
+
+/// The time now, by this machine's clock, as Slack times Messages.
+fn now() -> Ts {
+    let micros = SystemTime::UNIX_EPOCH
+        .elapsed()
+        .map_or(0, |since| since.as_micros());
+    Ts::from_micros(u64::try_from(micros).unwrap_or(u64::MAX))
 }
 
 impl Workspace {
@@ -5410,6 +5490,128 @@ mod tests {
             text,
             id: request,
         })
+    }
+
+    /// A Message posted live in `conversation` at `ts`, by `author`.
+    fn posted_at(conversation: &str, ts: Ts, author: &str) -> Event {
+        slack(Update::Live(LiveEvent::Posted {
+            conversation: id(conversation),
+            message: Message {
+                ts,
+                ..message(1, author, RichText::plain("hi"))
+            },
+        }))
+    }
+
+    /// `seconds` from now, by this machine's clock; negative for the past.
+    fn from_now(seconds: i64) -> Ts {
+        Ts::from_micros(now().as_micros().saturating_add_signed(seconds * 1_000_000))
+    }
+
+    #[test]
+    fn a_command_that_posts_for_the_user_elsewhere_is_followed_there() {
+        let mut app = reading_random();
+        app.focus = Focus::Timeline;
+        keys(&mut app, "i/dm hi");
+        app.update(key(KeyCode::Enter));
+        let soon = from_now(1);
+
+        for (conversation, ts, author, what) in [
+            ("C2", soon, "UME", "where it ran"),
+            ("D1", soon, "U9", "someone else's"),
+            ("D1", from_now(-60), "UME", "before it ran"),
+            ("D1", from_now(60), "UME", "long after"),
+        ] {
+            app.update(posted_at(conversation, ts, author));
+            assert_eq!(app.open_conversation(), Some(&c("C2")), "{what}");
+        }
+
+        // Slack's clock, which times it, may be a little behind.
+        let just_before = from_now(-2);
+        app.update(posted_at("D1", just_before, "UME"));
+        assert_eq!(app.open_conversation(), Some(&c("D1")));
+        assert_eq!(
+            app.conversation_pane.cursor(),
+            Some(just_before),
+            "on the post"
+        );
+        assert_eq!(app.mode, Mode::Insert, "writing on, there");
+        assert_eq!(app.writing_place(), Some(place("D1", None)));
+
+        app.update(posted_at("C1", soon, "UME"));
+        assert_eq!(app.open_conversation(), Some(&c("D1")), "only once");
+    }
+
+    #[test]
+    fn a_command_is_followed_into_a_thread_but_not_where_the_user_went_already() {
+        let mut app = reading_random();
+        app.focus = Focus::Timeline;
+        keys(&mut app, "i/msg hi");
+        app.update(key(KeyCode::Enter));
+        app.update(slack(Update::Live(LiveEvent::Posted {
+            conversation: id("C1"),
+            message: Message {
+                ts: from_now(1),
+                reply_to: Some(seconds(3)),
+                ..message(1, "UME", RichText::plain("hi"))
+            },
+        })));
+        assert_eq!(app.open_conversation(), Some(&c("C1")));
+        assert_eq!(app.open_thread, Some(seconds(3)), "a Reply, in its Thread");
+
+        let mut app = reading_random();
+        app.focus = Focus::Timeline;
+        keys(&mut app, "i/dm hi");
+        app.update(key(KeyCode::Enter));
+        app.open(c("D1"), &mut Vec::new());
+        app.update(posted_at("D1", from_now(1), "UME"));
+        assert_eq!(app.open_conversation(), Some(&c("D1")));
+        assert_eq!(
+            app.conversation_pane.cursor(),
+            None,
+            "the user got there first: left as it is"
+        );
+    }
+
+    #[test]
+    fn a_command_is_followed_within_its_workspace_only() {
+        let mut app = two_workspaces();
+        app.update(key(KeyCode::Enter));
+        assert_eq!(app.open_conversation(), Some(&c("C2")));
+        app.focus = Focus::Timeline;
+        keys(&mut app, "i/dm hi");
+        app.update(key(KeyCode::Enter));
+        app.update(Event::Slack(
+            W1,
+            Update::Live(LiveEvent::Posted {
+                conversation: id("C5"),
+                message: Message {
+                    ts: from_now(1),
+                    ..message(1, "UME", RichText::plain("hi"))
+                },
+            }),
+        ));
+        assert_eq!(app.open_conversation(), Some(&c("C2")));
+    }
+
+    #[test]
+    fn a_command_that_failed_isnt_followed() {
+        let mut app = reading_random();
+        app.focus = Focus::Timeline;
+        keys(&mut app, "i/dm hi");
+        let sent = app.update(key(KeyCode::Enter));
+        let [Command::Slack(_, Request::RunCommand { id: request, .. })] = sent.as_slice() else {
+            panic!("{sent:?}");
+        };
+        app.update(slack(Update::RanCommand {
+            id: *request,
+            result: Err(Error::Refused {
+                method: "chat.command",
+                code: "invalid_command".into(),
+            }),
+        }));
+        app.update(posted_at("D1", from_now(1), "UME"));
+        assert_eq!(app.open_conversation(), Some(&c("C2")));
     }
 
     #[test]
