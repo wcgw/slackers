@@ -3,6 +3,7 @@ name = "slackers-slack"
 description = "slackers' Slack adapter: signs in with session credentials and speaks the web client's protocol"
 version.workspace = true
 edition.workspace = true
+license.workspace = true
 publish.workspace = true
 
 [dependencies]

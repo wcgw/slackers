@@ -3,6 +3,7 @@ name = "slackers"
 description = "A terminal Slack client that groups Conversations by subject across Workspaces"
 version.workspace = true
 edition.workspace = true
+license.workspace = true
 publish.workspace = true
 
 [dependencies]

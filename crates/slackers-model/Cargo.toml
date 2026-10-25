@@ -3,6 +3,7 @@ name = "slackers-model"
 description = "slackers' domain model: Workspaces, Conversations, Messages and their Activity"
 version.workspace = true
 edition.workspace = true
+license.workspace = true
 publish.workspace = true
 
 [lints]
