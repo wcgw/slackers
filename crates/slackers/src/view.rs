@@ -9,8 +9,7 @@ use ratatui::Frame;
 use ratatui::layout::{Alignment, Constraint, Layout, Margin, Rect};
 use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span};
-use ratatui::widgets::{Block, Borders, Paragraph, Wrap};
-use ratatui_textarea::TextArea;
+use ratatui::widgets::{Block, Borders, Clear, Paragraph, Wrap};
 use slackers_gfx::{CellBox, Fit};
 use slackers_model::{
     Activity, Author, Block as TextBlock, Broadcast, Conversation, ConversationKind, Emoji, File,
@@ -20,8 +19,10 @@ use slackers_slack::Connection;
 use unicode_width::UnicodeWidthStr as _;
 
 use crate::app::{
-    App, ConversationRef, Drawn, Focus, Mode, Phase, Place, WantedPicture, Workspace, WorkspaceKey,
+    App, ConversationRef, Drawn, Focus, Mode, Phase, Place, Suggestions, WantedPicture, Workspace,
+    WorkspaceKey,
 };
+use crate::draft::{Draft, Mentioned};
 use crate::emoji::Drawable;
 use crate::icons;
 use crate::layout::{Piece, wrap};
@@ -46,6 +47,9 @@ const GUTTER: u16 = 3;
 
 /// The most room an image shared in a Message takes; one smaller than this shows at its own size.
 const IMAGE: CellBox = CellBox { cols: 60, rows: 15 };
+
+/// The widest the list of whom to @-mention gets, in cells.
+const SUGGESTIONS_WIDTH: u16 = 48;
 
 /// Messages by the same author less than this far apart share one header.
 const GROUP_WITHIN: u64 = 5 * 60 * 1_000_000;
@@ -393,29 +397,8 @@ fn entry(
     } else {
         room
     };
-    let styled = |matched: bool| {
-        if matched {
-            name_style.patch(MATCH)
-        } else {
-            name_style
-        }
-    };
-    // The name, in runs of matched and unmatched characters.
-    let (mut run, mut run_matched, mut used) = (String::new(), false, 0);
-    for (index, c) in name.chars().enumerate() {
-        let cells = unicode_width::UnicodeWidthChar::width(c).unwrap_or(0);
-        if used + cells > limit {
-            break;
-        }
-        let is_match = matched.binary_search(&index).is_ok();
-        if is_match != run_matched && !run.is_empty() {
-            lead.push(Span::styled(std::mem::take(&mut run), styled(run_matched)));
-        }
-        run_matched = is_match;
-        run.push(c);
-        used += cells;
-    }
-    lead.push(Span::styled(run, styled(run_matched)));
+    let (spans, mut used) = highlighted(name, name_style, matched, limit);
+    lead.extend(spans);
     if limit < room {
         lead.push(Span::styled("…", name_style));
         used += 1;
@@ -423,6 +406,34 @@ fn entry(
     lead.push(Span::raw(" ".repeat(room.saturating_sub(used) + 1)));
     lead.push(badge);
     Line::from(lead)
+}
+
+/// As much of `text` in `style` as fits in `limit` cells, its `matched` characters (by char index, ascending)
+/// highlighted; and how many cells that takes.
+fn highlighted(
+    text: &str,
+    style: Style,
+    matched: &[usize],
+    limit: usize,
+) -> (Vec<Span<'static>>, usize) {
+    let styled = |matched: bool| if matched { style.patch(MATCH) } else { style };
+    // Runs of matched and unmatched characters.
+    let (mut spans, mut run, mut run_matched, mut used) = (Vec::new(), String::new(), false, 0);
+    for (index, c) in text.chars().enumerate() {
+        let cells = unicode_width::UnicodeWidthChar::width(c).unwrap_or(0);
+        if used + cells > limit {
+            break;
+        }
+        let is_match = matched.binary_search(&index).is_ok();
+        if is_match != run_matched && !run.is_empty() {
+            spans.push(Span::styled(std::mem::take(&mut run), styled(run_matched)));
+        }
+        run_matched = is_match;
+        run.push(c);
+        used += cells;
+    }
+    spans.push(Span::styled(run, styled(run_matched)));
+    (spans, used)
 }
 
 /// The Workspace at `key`'s icon, two cells wide: its picture once loaded, else its initial.
@@ -618,12 +629,16 @@ fn draw_pane(
     });
     let inserting = app.mode == Mode::Insert && app.writing_place().as_ref() == Some(&view.place);
     let body = draw_composer(frame, body, app.drafts.get(&view.place), inserting);
+    let suggestions = app.suggestions.as_ref().filter(|_| inserting);
     let Some(timeline) = view.timeline else {
         let loading = Line::from(vec![
             Span::styled(icons::LOADING, ACCENT),
             Span::styled("loading…", DIM),
         ]);
         frame.render_widget(Paragraph::new(loading), body);
+        if let Some(suggestions) = suggestions {
+            draw_suggestions(frame, body, suggestions);
+        }
         return None;
     };
 
@@ -693,7 +708,60 @@ fn draw_pane(
             },
         );
     }
+    if let Some(suggestions) = suggestions {
+        draw_suggestions(frame, body, suggestions);
+    }
     Some(settled)
+}
+
+/// Draws the list of whom to @-mention over the bottom left of `area`, just above the draft, the selected one
+/// highlighted.
+fn draw_suggestions(frame: &mut Frame<'_>, area: Rect, suggestions: &Suggestions) {
+    let rows = u16::try_from(suggestions.items.len()).unwrap_or(u16::MAX);
+    let height = rows.saturating_add(2).min(area.height);
+    let width = area.width.min(SUGGESTIONS_WIDTH);
+    let list = Rect {
+        y: area.bottom() - height,
+        height,
+        width,
+        ..area
+    };
+    let block = Block::bordered().border_style(DIM);
+    let inner = block.inner(list);
+    frame.render_widget(Clear, list);
+    frame.render_widget(block, list);
+    // Keep the selected one in view.
+    let skip = (suggestions.selected + 1).saturating_sub(usize::from(inner.height));
+    let lines: Vec<Line<'static>> = suggestions
+        .items
+        .iter()
+        .enumerate()
+        .skip(skip)
+        .map(|(index, suggestion)| {
+            let icon = match suggestion.mentioned {
+                Mentioned::Person(_) => icons::AVATAR,
+                Mentioned::Broadcast(_) => icons::BROADCAST,
+            };
+            let mut spans = vec![Span::styled(icon, ACCENT)];
+            let (name, _) = highlighted(
+                &suggestion.name,
+                Style::new(),
+                &suggestion.positions,
+                usize::MAX,
+            );
+            spans.extend(name);
+            if !suggestion.detail.is_empty() {
+                spans.push(Span::styled(format!("  {}", suggestion.detail), DIM));
+            }
+            let line = Line::from(spans);
+            if index == suggestions.selected {
+                line.patch_style(SELECTED)
+            } else {
+                line
+            }
+        })
+        .collect();
+    frame.render_widget(Paragraph::new(lines), inner);
 }
 
 /// Lays out `timeline`'s Messages for `place`, `width` cells wide, followed by those still being sent there. A
@@ -763,7 +831,7 @@ fn lay_out(
         .filter(|outgoing| &outgoing.place == place)
     {
         let mut renderer = Renderer::new(app, workspace, place.conversation.workspace, width, zone);
-        let lines = renderer.sending(&outgoing.text);
+        let lines = renderer.sending(&outgoing.written.text);
         rendered.push(Rendered {
             ts: None,
             lines,
@@ -776,11 +844,12 @@ fn lay_out(
 }
 
 /// Draws `draft` at the bottom of `area`: editable when `inserting`, dimmed otherwise, and not at all when there's
-/// none, or it's empty and not being written. Returns what's left of `area` above it.
+/// none, or it's empty and not being written. Its top rule names whom it @-mentions. Returns what's left of `area`
+/// above it.
 fn draw_composer(
     frame: &mut Frame<'_>,
     area: Rect,
-    draft: Option<&TextArea<'static>>,
+    draft: Option<&Draft>,
     inserting: bool,
 ) -> Rect {
     let Some(draft) = draft.filter(|draft| inserting || !draft.is_empty()) else {
@@ -790,9 +859,13 @@ fn draw_composer(
     let height = lines.saturating_add(1).clamp(2, (area.height / 3).max(2));
     let [above, composer] =
         Layout::vertical([Constraint::Fill(1), Constraint::Length(height)]).areas(area);
-    let block = Block::new()
+    let mentions: Vec<&str> = draft.mentions().collect();
+    let mut block = Block::new()
         .borders(Borders::TOP)
         .border_style(if inserting { ACCENT } else { DIM });
+    if !mentions.is_empty() {
+        block = block.title(Line::styled(format!(" {} ", mentions.join(" · ")), MENTION));
+    }
     let inner = block.inner(composer);
     frame.render_widget(block, composer);
     if inserting {
@@ -1162,6 +1235,7 @@ fn draw_status(frame: &mut Frame<'_>, area: Rect, app: &App) {
         ]);
     }
     let hints = match (&app.mode, app.focus) {
+        (Mode::Insert, _) if app.suggestions.is_some() => "↑/↓ choose · ⇥/⏎ mention · esc normal",
         (Mode::Insert, _) => "⏎ send · ⇧⏎ new line · ^x^e $EDITOR · esc normal",
         (_, Focus::Sidebar) => {
             "j/k select · ⏎ open · za fold · / search · \\ hide · i write · :q quit"
@@ -1434,6 +1508,34 @@ mod tests {
         let rows = screen(&app);
         assert!(rows.iter().any(|row| row.contains("hello")));
         assert!(!rows.last().unwrap().contains("INSERT"));
+    }
+
+    #[test]
+    fn whom_to_mention_shows_over_the_messages_and_the_draft_names_whom_it_mentions() {
+        let mut app = reading_general();
+        type_text(&mut app, "i@");
+        let (rows, _, buffer) = render_sized(&app, WIDTH);
+        let row_of = |text: &str| rows.iter().position(|row| row.contains(text)).unwrap();
+        let (here, channel, draft) = (row_of("here"), row_of("channel"), row_of("@"));
+        assert!(here < channel && channel + 2 < draft, "{rows:#?}");
+        let column = rows[here].find("here").unwrap();
+        let x = u16::try_from(rows[here][..column].chars().count()).unwrap();
+        let y = u16::try_from(here).unwrap();
+        assert_eq!(
+            buffer[(x, y)].bg,
+            SELECTED.bg.unwrap(),
+            "the first is selected"
+        );
+        assert!(rows.last().unwrap().contains("⇥/⏎ mention"), "{rows:#?}");
+
+        press(&mut app, KeyCode::Tab, KeyModifiers::NONE);
+        let rows = screen(&app);
+        let draft = rows.iter().position(|row| row.contains("│ @here")).unwrap();
+        assert!(!rows.iter().any(|row| row.contains("channel")), "{rows:#?}");
+        assert!(
+            rows[draft - 1].contains(" @here ─"),
+            "the rule names it: {rows:#?}"
+        );
     }
 
     #[test]

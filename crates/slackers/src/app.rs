@@ -5,28 +5,31 @@
 //! beside it, `Enter` opens a Conversation or a Thread, `za`, `zo`, `zc`, `zM` and `zR` fold the sidebar's
 //! sections, `\` jumps to the sidebar), `i` enters Insert mode to write in the open Conversation or Thread, `/`
 //! searches the sidebar, and `:` enters Command mode: `:q` quits, `:vw add NAME` puts the open Channel in the
-//! Virtual Workspace called NAME, and `:vw rm NAME` takes it out.
+//! Virtual Workspace called NAME, and `:vw rm NAME` takes it out. In Insert mode, a word starting with `@` brings
+//! up people and broadcasts to @-mention: `↑`/`↓` choose one, `Tab` or `Enter` picks it.
 
 use std::cmp::Reverse;
 use std::collections::{HashMap, HashSet};
 use std::time::{Duration, Instant};
 
 use crossterm::event::{Event as TerminalEvent, KeyCode, KeyEvent, KeyEventKind, KeyModifiers};
-use ratatui::style::Style;
-use ratatui_textarea::TextArea;
 use slackers_gfx::{CellSize, Fit, Picture};
 use slackers_model::{
-    Activity, Author, Conversation, ConversationId, ConversationKind, Inline, Message, Timeline,
-    Ts, UserId,
+    Activity, Author, Broadcast, Conversation, ConversationId, ConversationKind, Inline, Message,
+    Timeline, Ts, UserId,
 };
-use slackers_slack::{Connection, Error, LiveEvent, Request, Snapshot, Update, User};
+use slackers_slack::{Connection, Error, LiveEvent, Person, Request, Snapshot, Update, User};
 
 use crate::config::{ChannelRef, VirtualWorkspace};
+use crate::draft::{Draft, Mentioned, Written};
 use crate::emoji::Emojis;
 use crate::pane::{Pane, Settled};
 use crate::pictures::Pictures;
-use crate::search::Finder;
+use crate::search::{self, Finder};
 use crate::sidebar::{Fold, Item, Section, Sidebar};
+
+/// The most people and broadcasts offered to @-mention at once.
+const SUGGESTIONS: usize = 8;
 
 /// Something that happened, for [`App::update`] to react to.
 #[derive(Debug)]
@@ -160,6 +163,27 @@ pub(crate) struct Search {
 pub(crate) struct Found {
     pub(crate) conversation: ConversationRef,
     /// Which characters of its name matched, by char index, ascending.
+    pub(crate) positions: Vec<usize>,
+}
+
+/// People and broadcasts to @-mention, offered in Insert mode while the word being written starts with `@`.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) struct Suggestions {
+    /// Best first; never empty.
+    pub(crate) items: Vec<Suggestion>,
+    /// The one `Tab` or `Enter` picks.
+    pub(crate) selected: usize,
+}
+
+/// Someone, or some broadcast, to @-mention.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) struct Suggestion {
+    pub(crate) mentioned: Mentioned,
+    /// What the @-mention calls them.
+    pub(crate) name: String,
+    /// More to tell them apart by, such as their full name; empty when there's nothing more.
+    pub(crate) detail: String,
+    /// Which characters of `name` match the name being written, by char index, ascending.
     pub(crate) positions: Vec<usize>,
 }
 
@@ -350,6 +374,10 @@ pub(crate) struct Workspace {
     loading_threads: HashSet<(ConversationId, Ts)>,
     /// Followed Threads, by their Conversation and parent.
     pub(crate) followed: HashMap<(ConversationId, Ts), Followed>,
+    /// Whom Slack found by name, by the name searched for, in lower case. A failed search found no one.
+    found: HashMap<String, Vec<Person>>,
+    /// The name Slack is searching for, if any.
+    finding: Option<String>,
 }
 
 /// A Followed Thread.
@@ -367,8 +395,7 @@ pub(crate) struct Outgoing {
     /// Matches the [`Request::Post`] to its [`Update::Posted`].
     id: u64,
     pub(crate) place: Place,
-    /// As typed.
-    pub(crate) text: String,
+    pub(crate) written: Written,
 }
 
 /// Everything slackers shows. Only [`App::update`] changes it; the view reads it.
@@ -396,7 +423,9 @@ pub(crate) struct App {
     /// Whether the sidebar shows. `\` hides it from within it, and brings it back. Whenever focus is on it, it shows.
     pub(crate) sidebar_shown: bool,
     /// Unsent text, per Place.
-    pub(crate) drafts: HashMap<Place, TextArea<'static>>,
+    pub(crate) drafts: HashMap<Place, Draft>,
+    /// Whom to @-mention in the Draft being written, while a name starting with `@` is.
+    pub(crate) suggestions: Option<Suggestions>,
     /// Messages posted but not yet confirmed, oldest first.
     pub(crate) outbox: Vec<Outgoing>,
     next_post: u64,
@@ -445,6 +474,7 @@ impl App {
             focus: Focus::Sidebar,
             sidebar_shown: true,
             drafts: HashMap::new(),
+            suggestions: None,
             outbox: Vec::new(),
             next_post: 0,
             pending: None,
@@ -501,10 +531,7 @@ impl App {
             Event::PictureFailed { url } => self.pictures.failed(url),
             Event::PicturesLost => self.pictures.forget_all(),
             Event::Edited { place, outcome } => match outcome {
-                Ok(text) => {
-                    let draft = draft_of(&text, &place);
-                    self.drafts.insert(place, draft);
-                }
+                Ok(text) => self.draft(&place).set_text(&text),
                 Err(reason) => self.notice = Some(reason),
             },
             Event::SaveFailed(reason) => {
@@ -538,6 +565,7 @@ impl App {
         self.sidebar.set(&Section::Threads, threads);
         // People's names keep arriving: keep a search's hits current.
         self.refresh_search();
+        self.refresh_suggestions(&mut commands);
         commands
     }
 
@@ -603,9 +631,7 @@ impl App {
                 }
                 match self.writing_place() {
                     Some(place) => {
-                        self.drafts
-                            .entry(place.clone())
-                            .or_insert_with(|| draft_of("", &place));
+                        self.draft(&place);
                         self.mode = Mode::Insert;
                     }
                     None => self.notice = Some("open a conversation first".to_owned()),
@@ -690,39 +716,47 @@ impl App {
             return;
         };
         let control = key.modifiers.contains(KeyModifiers::CONTROL);
-        let draft = |drafts: &mut HashMap<Place, TextArea<'static>>, place: &Place| {
-            drafts
-                .entry(place.clone())
-                .or_insert_with(|| draft_of("", place))
-                .lines()
-                .join("\n")
-        };
+        // Shift+Enter needs the kitty keyboard protocol to tell it from Enter; Alt+Enter works without.
+        let new_line = key
+            .modifiers
+            .intersects(KeyModifiers::SHIFT | KeyModifiers::ALT);
+        if let Some(suggestions) = &mut self.suggestions {
+            let count = suggestions.items.len();
+            match (key.code, control) {
+                (KeyCode::Down, _) | (KeyCode::Char('n'), true) => {
+                    suggestions.selected = (suggestions.selected + 1) % count;
+                    return;
+                }
+                (KeyCode::Up | KeyCode::BackTab, _) | (KeyCode::Char('p'), true) => {
+                    suggestions.selected = (suggestions.selected + count - 1) % count;
+                    return;
+                }
+                (KeyCode::Tab, _) | (KeyCode::Enter, _) if !new_line => {
+                    let picked = suggestions.items[suggestions.selected].clone();
+                    self.draft(&place).pick(picked.mentioned, &picked.name);
+                    return;
+                }
+                _ => {}
+            }
+        }
         match (key.code, control) {
             (KeyCode::Esc, _) | (KeyCode::Char('c'), true) => self.mode = Mode::Normal,
             (KeyCode::Char('x'), true) => self.pending = Some(Prefix::CtrlX),
             (KeyCode::Char('e'), true) if pending == Some(Prefix::CtrlX) => {
-                let text = draft(&mut self.drafts, &place);
+                let text = self.draft(&place).text();
                 commands.push(Command::Edit { place, text });
             }
-            // Shift+Enter needs the kitty keyboard protocol to tell it from Enter; Alt+Enter works without.
-            (KeyCode::Enter, _)
-                if key
-                    .modifiers
-                    .intersects(KeyModifiers::SHIFT | KeyModifiers::ALT) =>
-            {
-                self.drafts
-                    .entry(place.clone())
-                    .or_insert_with(|| draft_of("", &place))
-                    .insert_newline();
-            }
+            (KeyCode::Enter, _) if new_line => self.draft(&place).insert_newline(),
             (KeyCode::Enter, _) => self.send(place, commands),
-            _ => {
-                self.drafts
-                    .entry(place.clone())
-                    .or_insert_with(|| draft_of("", &place))
-                    .input(key);
-            }
+            _ => self.draft(&place).input(key),
         }
+    }
+
+    /// The Draft for `place`, empty if there was none.
+    fn draft(&mut self, place: &Place) -> &mut Draft {
+        self.drafts
+            .entry(place.clone())
+            .or_insert_with(|| Draft::new(place))
     }
 
     fn command_key(&mut self, key: KeyEvent, commands: &mut Vec<Command>) {
@@ -911,6 +945,39 @@ impl App {
         search.selected = search.selected.min(search.hits.len().saturating_sub(1));
     }
 
+    /// Offers whom to @-mention while the Draft being written ends a word starting with `@`, keeping the selected
+    /// one selected, and asks Slack whom it knows by that name.
+    fn refresh_suggestions(&mut self, commands: &mut Vec<Command>) {
+        let place = self.writing_place().filter(|_| self.mode == Mode::Insert);
+        let writing = place.and_then(|place| {
+            let name = self.drafts.get(&place)?.mentioning()?.to_owned();
+            Some((place, name))
+        });
+        let Some((place, name)) = writing else {
+            self.suggestions = None;
+            return;
+        };
+        let key = place.conversation.workspace;
+        let Some(workspace) = self.workspaces.get_mut(key) else {
+            self.suggestions = None;
+            return;
+        };
+        workspace.find_people(key, &name, commands);
+        let items = workspace.suggest(&place, &name);
+        let was_selected = self
+            .suggestions
+            .as_ref()
+            .and_then(|old| old.items.get(old.selected));
+        let selected = was_selected
+            .and_then(|old| {
+                items
+                    .iter()
+                    .position(|item| item.mentioned == old.mentioned)
+            })
+            .unwrap_or(0);
+        self.suggestions = (!items.is_empty()).then_some(Suggestions { items, selected });
+    }
+
     /// Opens the Thread of the open Conversation's selected Message. Any Message can start a Thread: one without
     /// Replies yet opens empty, ready for one.
     fn open_selected_thread(&mut self, commands: &mut Vec<Command>) {
@@ -948,14 +1015,9 @@ impl App {
 
     /// Posts the draft for `place`, unless it's blank, and empties it.
     fn send(&mut self, place: Place, commands: &mut Vec<Command>) {
-        let Some(draft) = self.drafts.get_mut(&place) else {
+        let Some(written) = self.drafts.get_mut(&place).and_then(Draft::take) else {
             return;
         };
-        let text = draft.lines().join("\n");
-        if text.trim().is_empty() {
-            return;
-        }
-        *draft = draft_of("", &place);
         let id = self.next_post;
         self.next_post += 1;
         match place.thread {
@@ -965,11 +1027,11 @@ impl App {
         let request = Request::Post {
             conversation: place.conversation.id.clone(),
             thread: place.thread,
-            text: text.clone(),
+            text: written.parts(),
             id,
         };
         commands.push(Command::Slack(place.conversation.workspace, request));
-        self.outbox.push(Outgoing { id, place, text });
+        self.outbox.push(Outgoing { id, place, written });
     }
 
     /// Moves the open Conversation's Read Marker to its newest Message, if that's on screen: the window has focus,
@@ -1220,24 +1282,15 @@ impl App {
                                 }
                             }
                         }
+                        // It may @-mention people found by name, whose names are known only to the search.
+                        let people = people_in(&message);
                         workspace.add(&conversation, message);
+                        workspace.want_users(key, people, commands);
                     }
                     Err(error) => {
                         self.notice =
                             Some(format!("not sent, back in the draft: {}", describe(&error)));
-                        // Put it back where it came from, ahead of anything typed since.
-                        let place = outgoing.place;
-                        let draft = self
-                            .drafts
-                            .entry(place.clone())
-                            .or_insert_with(|| draft_of("", &place));
-                        let typed_since = draft.lines().join("\n");
-                        let restored = if typed_since.is_empty() {
-                            outgoing.text
-                        } else {
-                            format!("{}\n{typed_since}", outgoing.text)
-                        };
-                        *draft = draft_of(&restored, &place);
+                        self.draft(&outgoing.place).put_back(outgoing.written);
                     }
                 }
             }
@@ -1245,6 +1298,18 @@ impl App {
                 if let Some(workspace) = self.workspaces.get_mut(key) {
                     workspace.users.insert(user.id.clone(), user);
                 }
+            }
+            Update::FoundPeople { query, result } => {
+                let Some(workspace) = self.workspaces.get_mut(key) else {
+                    return;
+                };
+                workspace.finding = None;
+                // Counted as finding no one, so as not to ask again with every key.
+                let people = result.unwrap_or_else(|error| {
+                    tracing::warn!(%error, "couldn't search for people");
+                    Vec::new()
+                });
+                workspace.found.insert(query, people);
             }
             Update::Downloaded { url, result } => {
                 let Some(fit) = self.pictures.awaited(&url) else {
@@ -1456,6 +1521,8 @@ impl Workspace {
             loading: HashSet::new(),
             loading_threads: HashSet::new(),
             followed,
+            found: HashMap::new(),
+            finding: None,
         }
     }
 
@@ -1550,6 +1617,94 @@ impl Workspace {
         }
     }
 
+    /// Asks Slack, through this Workspace at `key`, whom it knows by `name`, unless it was asked already. One search
+    /// at a time: the next waits for the answer, by which time the name has likely grown.
+    fn find_people(&mut self, key: WorkspaceKey, name: &str, commands: &mut Vec<Command>) {
+        let query = name.to_lowercase();
+        if query.is_empty() || self.finding.is_some() || self.found.contains_key(&query) {
+            return;
+        }
+        self.finding = Some(query.clone());
+        commands.push(Command::Slack(key, Request::FindPeople { query }));
+    }
+
+    /// Whom to offer for an @-mention of `name` written at `place`, best first. First, those known here whose names
+    /// `name` starts a word of, those it starts first: the people who wrote there most recently, then in a Channel
+    /// its broadcasts, then everyone else. After them, whom Slack found by that name, which may be more loosely.
+    fn suggest(&self, place: &Place, name: &str) -> Vec<Suggestion> {
+        let conversation = &place.conversation.id;
+        let timeline = match place.thread {
+            Some(parent) => self.threads.get(&(conversation.clone(), parent)),
+            None => self.timelines.get(conversation),
+        };
+        let writers = timeline
+            .into_iter()
+            .flat_map(|timeline| timeline.messages().rev())
+            .filter_map(|message| match &message.author {
+                Author::User(id) => Some(id),
+                Author::Bot { .. } => None,
+            });
+        let mut everyone: Vec<&User> = self.users.values().collect();
+        everyone.sort_by(|a, b| a.name.cmp(&b.name).then_with(|| a.id.cmp(&b.id)));
+        let mut seen = HashSet::from([&self.me]);
+        let mut known = |id: &UserId| -> Option<(Mentioned, String)> {
+            let user = self.users.get(id)?;
+            seen.insert(&user.id)
+                .then(|| (Mentioned::Person(user.id.clone()), user.name.clone()))
+        };
+        let mut candidates: Vec<(Mentioned, String)> = writers.filter_map(&mut known).collect();
+        let in_channel = self
+            .conversation(conversation)
+            .is_some_and(|c| matches!(c.kind, ConversationKind::Channel { .. }));
+        if in_channel {
+            candidates.extend([
+                (Mentioned::Broadcast(Broadcast::Here), "here".to_owned()),
+                (
+                    Mentioned::Broadcast(Broadcast::Channel),
+                    "channel".to_owned(),
+                ),
+            ]);
+        }
+        candidates.extend(everyone.iter().filter_map(|user| known(&user.id)));
+        let mut suggestions: Vec<Suggestion> = candidates
+            .into_iter()
+            .filter_map(|(mentioned, candidate)| {
+                let positions = search::word_start(&candidate, name)?;
+                Some(Suggestion {
+                    mentioned,
+                    name: candidate,
+                    detail: String::new(),
+                    positions,
+                })
+            })
+            .collect();
+        // Stable: those equally good keep their order.
+        suggestions.sort_by_key(|s| s.positions.first().is_some_and(|&at| at > 0));
+        for person in self.found.get(&name.to_lowercase()).into_iter().flatten() {
+            if person.id == self.me {
+                continue;
+            }
+            let detail = if person.full_name.eq_ignore_ascii_case(&person.name) {
+                String::new()
+            } else {
+                person.full_name.clone()
+            };
+            let mentioned = Mentioned::Person(person.id.clone());
+            match suggestions.iter_mut().find(|s| s.mentioned == mentioned) {
+                // Known already: Slack can still tell them apart by their full name.
+                Some(known) => known.detail = detail,
+                None => suggestions.push(Suggestion {
+                    mentioned,
+                    name: person.name.clone(),
+                    detail,
+                    positions: Vec::new(),
+                }),
+            }
+        }
+        suggestions.truncate(SUGGESTIONS);
+        suggestions
+    }
+
     /// Asks this Workspace, at `key`, for the names of `people` not known or asked for yet.
     fn want_users(
         &mut self,
@@ -1629,20 +1784,6 @@ fn same_name(a: &str, b: &str) -> bool {
     a.to_lowercase() == b.to_lowercase()
 }
 
-/// A composer for `place` holding `text`, with the cursor at its end.
-fn draft_of(text: &str, place: &Place) -> TextArea<'static> {
-    let mut draft = TextArea::new(text.lines().map(str::to_owned).collect());
-    draft.set_cursor_line_style(Style::default());
-    draft.set_placeholder_text(if place.thread.is_some() {
-        "reply"
-    } else {
-        "message"
-    });
-    draft.move_cursor(ratatui_textarea::CursorMove::Bottom);
-    draft.move_cursor(ratatui_textarea::CursorMove::End);
-    draft
-}
-
 /// Everyone a Message names: its author and the people it mentions.
 fn people_in(message: &Message) -> Vec<UserId> {
     let author = match &message.author {
@@ -1669,7 +1810,7 @@ fn describe(error: &Error) -> String {
 #[cfg(test)]
 mod tests {
     use slackers_model::{RichText, WorkspaceId};
-    use slackers_slack::HistoryPage;
+    use slackers_slack::{HistoryPage, Part};
 
     use super::*;
     use crate::sidebar::Row;
@@ -2414,7 +2555,7 @@ mod tests {
             [ask(Request::Post {
                 conversation: id("C2"),
                 thread: Some(seconds(5)),
-                text: "on it".into(),
+                text: vec![Part::Text("on it".into())],
                 id: 0,
             })]
         );
@@ -2763,7 +2904,7 @@ mod tests {
         keys(&mut app, "there");
 
         let commands = app.update(key(KeyCode::Enter));
-        let text = "hi :wave:\nthere".to_owned();
+        let text = vec![Part::Text("hi :wave:\nthere".into())];
         assert_eq!(
             commands,
             [ask(Request::Post {
@@ -2782,6 +2923,171 @@ mod tests {
 
         app.update(key(KeyCode::Esc));
         assert_eq!(app.mode, Mode::Normal);
+    }
+
+    /// The names offered to @-mention, best first.
+    fn suggested(app: &App) -> Vec<String> {
+        app.suggestions
+            .iter()
+            .flat_map(|s| &s.items)
+            .map(|item| item.name.clone())
+            .collect()
+    }
+
+    fn person(id: &str, name: &str, full_name: &str) -> Person {
+        Person {
+            id: UserId::new(id),
+            name: name.into(),
+            full_name: full_name.into(),
+        }
+    }
+
+    #[test]
+    fn an_at_offers_whom_to_mention_and_tab_or_enter_picks_one() {
+        let mut app = reading_random();
+        for (id, name) in [("U2", "Ada"), ("U3", "Bob"), ("UME", "Me")] {
+            app.update(slack(Update::User(User {
+                id: UserId::new(id),
+                name: name.into(),
+                avatar: None,
+            })));
+        }
+        keys(&mut app, "ihi ");
+        assert_eq!(app.suggestions, None);
+        assert!(keys(&mut app, "@").is_empty(), "nothing to search for yet");
+        // Who wrote here, the Channel's broadcasts, then everyone else known; never the user.
+        assert_eq!(suggested(&app), ["Ada", "here", "channel", "Bob"]);
+
+        let commands = keys(&mut app, "a");
+        assert_eq!(commands, [ask(Request::FindPeople { query: "a".into() })]);
+        assert_eq!(suggested(&app), ["Ada"]);
+        let found = vec![
+            person("U2", "Ada", "Ada Lovelace"),
+            person("U4", "Alan", "Alan Turing"),
+            person("UME", "Me", "Me"),
+        ];
+        app.update(slack(Update::FoundPeople {
+            query: "a".into(),
+            result: Ok(found),
+        }));
+        assert_eq!(suggested(&app), ["Ada", "Alan"]);
+        let details: Vec<&str> = app
+            .suggestions
+            .as_ref()
+            .unwrap()
+            .items
+            .iter()
+            .map(|s| s.detail.as_str())
+            .collect();
+        assert_eq!(details, ["Ada Lovelace", "Alan Turing"]);
+
+        app.update(key(KeyCode::Down));
+        assert!(app.update(key(KeyCode::Tab)).is_empty());
+        assert_eq!(app.suggestions, None);
+        keys(&mut app, "and @b");
+        assert_eq!(suggested(&app), ["Bob"]);
+        assert!(app.update(key(KeyCode::Enter)).is_empty(), "Enter picks");
+        assert_eq!(app.drafts[&place("C2", None)].text(), "hi @Alan and @Bob ");
+
+        let commands = app.update(key(KeyCode::Enter));
+        let text = vec![
+            Part::Text("hi ".into()),
+            Part::User(UserId::new("U4")),
+            Part::Text(" and ".into()),
+            Part::User(UserId::new("U3")),
+            Part::Text(" ".into()),
+        ];
+        assert_eq!(
+            commands,
+            [ask(Request::Post {
+                conversation: id("C2"),
+                thread: None,
+                text,
+                id: 0
+            })]
+        );
+
+        // Alan was found by name only: once posted, his name is looked up for the Message to show it.
+        let mentioning = RichText {
+            blocks: vec![slackers_model::Block::Paragraph(vec![Inline::User(
+                UserId::new("U4"),
+            )])],
+        };
+        let commands = app.update(slack(Update::Posted {
+            id: 0,
+            conversation: id("C2"),
+            result: Ok(message(9, "UME", mentioning)),
+        }));
+        assert_eq!(commands, [ask(Request::User(UserId::new("U4")))]);
+    }
+
+    #[test]
+    fn a_name_starting_with_what_is_written_beats_a_later_word_and_who_wrote_last() {
+        let mut app = reading_random();
+        for (id, name) in [
+            ("U2", "Brad Adams"),
+            ("U3", "Ada"),
+            ("U4", "Benjamin Dolan"),
+        ] {
+            app.update(slack(Update::User(User {
+                id: UserId::new(id),
+                name: name.into(),
+                avatar: None,
+            })));
+        }
+        keys(&mut app, "i@ad");
+        assert_eq!(suggested(&app), ["Ada", "Brad Adams"]);
+        let positions: Vec<&[usize]> = app
+            .suggestions
+            .as_ref()
+            .unwrap()
+            .items
+            .iter()
+            .map(|s| s.positions.as_slice())
+            .collect();
+        assert_eq!(positions, [&[0, 1][..], &[5, 6][..]]);
+    }
+
+    #[test]
+    fn people_are_searched_for_one_name_at_a_time_and_once() {
+        let mut app = reading_random();
+        assert_eq!(
+            keys(&mut app, "i@a"),
+            [ask(Request::FindPeople { query: "a".into() })]
+        );
+        assert!(keys(&mut app, "l").is_empty(), "one search at a time");
+        let commands = app.update(slack(Update::FoundPeople {
+            query: "a".into(),
+            result: Ok(Vec::new()),
+        }));
+        assert_eq!(commands, [ask(Request::FindPeople { query: "al".into() })]);
+        let failed = app.update(slack(Update::FoundPeople {
+            query: "al".into(),
+            result: Err(Error::SignedOut),
+        }));
+        assert!(failed.is_empty(), "a failed search isn't retried");
+
+        assert!(app.update(key(KeyCode::Backspace)).is_empty());
+        assert!(keys(&mut app, "l").is_empty());
+        assert_eq!(
+            keys(&mut app, "E"),
+            [ask(Request::FindPeople {
+                query: "ale".into()
+            })]
+        );
+    }
+
+    #[test]
+    fn only_channels_offer_their_broadcasts() {
+        let (app, _) = ready_app();
+        let workspace = workspace(&app, W0);
+        let offered = |conversation: &str| -> Vec<String> {
+            let place = place(conversation, None);
+            let suggestions = workspace.suggest(&place, "");
+            suggestions.into_iter().map(|s| s.name).collect()
+        };
+        assert_eq!(offered("C2"), ["here", "channel"]);
+        assert!(offered("D1").is_empty());
     }
 
     #[test]

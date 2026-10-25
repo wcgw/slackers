@@ -11,7 +11,7 @@ use slackers_model::{
 };
 
 use crate::mrkdwn;
-use crate::session::{FollowedThread, HistoryPage, LiveEvent, Snapshot, User};
+use crate::session::{FollowedThread, HistoryPage, LiveEvent, Person, Snapshot, User};
 
 /// Slack's timestamp text as a [`Ts`]; anything unparsable, such as an absent `latest`, reads as zero.
 fn ts(text: &str) -> Ts {
@@ -817,7 +817,34 @@ struct WireUser {
     #[serde(default)]
     real_name: String,
     #[serde(default)]
+    deleted: bool,
+    #[serde(default)]
     profile: Profile,
+}
+
+impl WireUser {
+    /// What to call them: their display name, else their full name, else their handle, else their id.
+    fn display_name(&self) -> String {
+        [
+            &self.profile.display_name,
+            &self.profile.real_name,
+            &self.real_name,
+            &self.name,
+        ]
+        .into_iter()
+        .find(|name| !name.is_empty())
+        .unwrap_or(&self.id)
+        .clone()
+    }
+
+    /// Their full name, as their profile gives it; empty when it gives none.
+    fn full_name(&self) -> String {
+        [&self.profile.real_name, &self.real_name]
+            .into_iter()
+            .find(|name| !name.is_empty())
+            .cloned()
+            .unwrap_or_default()
+    }
 }
 
 #[derive(Default, Deserialize)]
@@ -833,20 +860,33 @@ struct Profile {
 impl UserInfo {
     pub(crate) fn into_user(self) -> User {
         let user = self.user;
-        let name = [
-            user.profile.display_name,
-            user.profile.real_name,
-            user.real_name,
-            user.name,
-        ]
-        .into_iter()
-        .find(|name| !name.is_empty())
-        .unwrap_or_else(|| user.id.clone());
         User {
+            name: user.display_name(),
             id: UserId::new(user.id),
-            name,
             avatar: user.profile.image_48.filter(|url| !url.is_empty()),
         }
+    }
+}
+
+/// The edge API's `users/search` reply: the people found, best first.
+#[derive(Deserialize)]
+pub(crate) struct PeopleSearch {
+    #[serde(default)]
+    results: Vec<WireUser>,
+}
+
+impl PeopleSearch {
+    /// The people found, best first, less any deactivated account.
+    pub(crate) fn into_people(self) -> Vec<Person> {
+        self.results
+            .into_iter()
+            .filter(|user| !user.deleted)
+            .map(|user| Person {
+                name: user.display_name(),
+                full_name: user.full_name(),
+                id: UserId::new(user.id),
+            })
+            .collect()
     }
 }
 
@@ -1498,6 +1538,34 @@ mod tests {
                 name: "Profile Real".into(),
                 avatar: Some("https://a/u1.png".into()),
             }
+        );
+    }
+
+    #[test]
+    fn people_found_keep_their_order_and_leave_deactivated_accounts_out() {
+        let found: PeopleSearch = serde_json::from_value(json!({
+            "ok": true,
+            "results": [
+                {"id": "U1", "name": "ada", "real_name": "Ada Lovelace", "profile": {"display_name": "Ada", "real_name": "Ada Lovelace"}},
+                {"id": "U2", "name": "gone", "deleted": true, "profile": {"display_name": "Gone"}},
+                {"id": "U3", "name": "alan", "profile": {"display_name": "", "real_name": ""}}
+            ]
+        }))
+        .unwrap();
+        assert_eq!(
+            found.into_people(),
+            [
+                Person {
+                    id: UserId::new("U1"),
+                    name: "Ada".into(),
+                    full_name: "Ada Lovelace".into(),
+                },
+                Person {
+                    id: UserId::new("U3"),
+                    name: "alan".into(),
+                    full_name: String::new(),
+                },
+            ]
         );
     }
 

@@ -12,6 +12,7 @@
 mod app;
 mod config;
 mod credentials;
+mod draft;
 mod emoji;
 mod icons;
 mod layout;

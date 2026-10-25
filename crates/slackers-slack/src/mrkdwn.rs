@@ -4,6 +4,8 @@
 
 use slackers_model::{Block, Broadcast, ConversationId, Emoji, Inline, RichText, Style, UserId};
 
+use crate::session::Part;
+
 /// Parses `mrkdwn` text into [`RichText`]: code blocks, `>` quotes, `*bold*`-style markers, `:emoji:`, and
 /// `<…>` mentions and links. Anything malformed stays as plain text.
 pub(crate) fn parse(text: &str) -> RichText {
@@ -186,8 +188,25 @@ fn closing_marker(text: &str, marker: char) -> Option<usize> {
     })
 }
 
+/// `parts` as `mrkdwn`: text with its `&`, `<` and `>` escaped, and mentions as Slack writes them.
+pub(crate) fn write(parts: &[Part]) -> String {
+    let mut written = String::new();
+    for part in parts {
+        match part {
+            Part::Text(text) => written.push_str(&escape(text)),
+            Part::User(id) => written.push_str(&format!("<@{id}>")),
+            Part::Broadcast(broadcast) => written.push_str(match broadcast {
+                Broadcast::Here => "<!here>",
+                Broadcast::Channel => "<!channel>",
+                Broadcast::Everyone => "<!everyone>",
+            }),
+        }
+    }
+    written
+}
+
 /// Escapes `&`, `<` and `>`, which `mrkdwn` reserves for its markup, so that text means what it says.
-pub(crate) fn escape(text: &str) -> String {
+fn escape(text: &str) -> String {
     text.replace('&', "&amp;")
         .replace('<', "&lt;")
         .replace('>', "&gt;")
@@ -283,6 +302,26 @@ mod tests {
                 Block::Preformatted("let x = 1 < 2;".into()),
                 Block::Quote(vec![text("quoted\nmore")]),
                 Block::Paragraph(vec![text("after")]),
+            ]
+        );
+    }
+
+    #[test]
+    fn written_mentions_read_back_as_mentions() {
+        let parts = [
+            Part::Text("<b> & ".into()),
+            Part::User(UserId::new("U1")),
+            Part::Text(", ".into()),
+            Part::Broadcast(Broadcast::Here),
+        ];
+        assert_eq!(write(&parts), "&lt;b&gt; &amp; <@U1>, <!here>");
+        assert_eq!(
+            paragraph(&write(&parts)),
+            [
+                text("<b> & "),
+                Inline::User(UserId::new("U1")),
+                text(", "),
+                Inline::Broadcast(Broadcast::Here),
             ]
         );
     }

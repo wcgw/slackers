@@ -40,6 +40,11 @@ The Replies to one Message, which is the Thread's parent.
 **Reply**:
 A Message posted in a Thread rather than directly in the Conversation.
 
+**Draft**:
+What the user is writing in a Conversation or a Thread, not posted yet. Each Conversation and each Thread has its
+own.
+_Avoid_: composer (that's the box a Draft is written in)
+
 **Custom Emoji**:
 An image, possibly animated, that a Workspace defines under a `:name:`.
 _Avoid_: reaction (a reaction uses an emoji; it isn't one)
@@ -96,4 +101,6 @@ _Avoid_: ping, highlight
 - "DMs remain workspace centric" was read as: **DMs** never join a **Virtual Workspace**, and people are never linked
   across **Workspaces**.
 - Open: whether `@here`/`@channel`, and every **Message** in a **DM**, count as **Mentions**.
+- An @-mention the user writes in a **Draft**, of a person or of `@here`/`@channel`, notifies others. It isn't a
+  **Mention**: only a **Message** that @-mentions the user is.
 - Open: a Slack Connect **Channel** shared between two of the user's **Workspaces**. Is it one **Channel** or two?

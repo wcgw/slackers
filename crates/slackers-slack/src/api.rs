@@ -3,21 +3,29 @@
 
 use std::time::Duration;
 
-use reqwest::StatusCode;
 use reqwest::header::{CONTENT_TYPE, COOKIE, RETRY_AFTER};
+use reqwest::{RequestBuilder, StatusCode};
 use serde::de::DeserializeOwned;
-use serde_json::Value;
-use slackers_model::{Activity, Conversation, ConversationId, CustomEmojiSet, Message, Ts, UserId};
+use serde_json::{Value, json};
+use slackers_model::{
+    Activity, Conversation, ConversationId, CustomEmojiSet, Message, Ts, UserId, WorkspaceId,
+};
 use tokio::sync::Semaphore;
 
-use crate::session::{HistoryPage, Snapshot, User};
+use crate::session::{HistoryPage, Part, Person, Snapshot, User};
 use crate::wire::{
-    AuthTest, ConversationInfo, Counts, EmojiList, History, Posted, Replies, ThreadView, UserBoot,
-    UserInfo,
+    AuthTest, ConversationInfo, Counts, EmojiList, History, PeopleSearch, Posted, Replies,
+    ThreadView, UserBoot, UserInfo,
 };
 use crate::{Credentials, Error};
 
 const BASE: &str = "https://slack.com/api";
+
+/// Where the web client's searches go: Slack's edge API, addressed by Workspace.
+const EDGE: &str = "https://edgeapi.slack.com/cache";
+
+/// The most people one search finds.
+const PEOPLE_FOUND: u32 = 25;
 
 /// How many calls may be in flight at once, so that a burst of lookups doesn't trip Slack's rate limits.
 const IN_FLIGHT: usize = 6;
@@ -56,21 +64,49 @@ impl Api {
         method: &'static str,
         params: &[(&str, &str)],
     ) -> Result<T, Error> {
+        let mut form = vec![("token", self.credentials.token())];
+        form.extend_from_slice(params);
+        self.answer(method, || {
+            self.http
+                .post(format!("{BASE}/{method}"))
+                .header(COOKIE, self.credentials.cookies())
+                .form(&form)
+        })
+        .await
+    }
+
+    /// Calls the edge API's `method` for `workspace` with `body`, waiting out rate limits, and decodes its reply as
+    /// `T`.
+    async fn call_edge<T: DeserializeOwned>(
+        &self,
+        workspace: &WorkspaceId,
+        method: &'static str,
+        body: &Value,
+    ) -> Result<T, Error> {
+        self.answer(method, || {
+            self.http
+                .post(format!("{EDGE}/{workspace}/{method}"))
+                .bearer_auth(self.credentials.token())
+                .header(COOKIE, self.credentials.cookies())
+                .json(body)
+        })
+        .await
+    }
+
+    /// Sends what `request` builds for `method`, again after waiting as long as Slack asks while it's rate limited,
+    /// and decodes Slack's reply as `T`.
+    async fn answer<T: DeserializeOwned>(
+        &self,
+        method: &'static str,
+        request: impl Fn() -> RequestBuilder,
+    ) -> Result<T, Error> {
         let _permit = self
             .in_flight
             .acquire()
             .await
             .expect("the semaphore is never closed");
-        let mut form = vec![("token", self.credentials.token())];
-        form.extend_from_slice(params);
         for _ in 0..=RATE_LIMIT_RETRIES {
-            let response = self
-                .http
-                .post(format!("{BASE}/{method}"))
-                .header(COOKIE, self.credentials.cookies())
-                .form(&form)
-                .send()
-                .await?;
+            let response = request().send().await?;
             if response.status() == StatusCode::TOO_MANY_REQUESTS {
                 let wait = response
                     .headers()
@@ -148,16 +184,15 @@ impl Api {
         Ok(info.into_user())
     }
 
-    /// Posts `text` (see [`Request::Post`](crate::Request::Post)) to `conversation`, and returns the Message as
-    /// Slack stored it.
+    /// Posts `text` to `conversation`, and returns the Message as Slack stored it.
     pub(crate) async fn post(
         &self,
         conversation: &ConversationId,
         thread: Option<Ts>,
-        text: &str,
+        text: &[Part],
         me: &UserId,
     ) -> Result<Message, Error> {
-        let text = crate::mrkdwn::escape(text);
+        let text = crate::mrkdwn::write(text);
         let parent = thread.map(|ts| ts.to_string());
         let mut params = vec![("channel", conversation.as_str()), ("text", text.as_str())];
         if let Some(parent) = &parent {
@@ -229,6 +264,25 @@ impl Api {
         ];
         let _: serde::de::IgnoredAny = self.call("subscriptions.thread.mark", &params).await?;
         Ok(())
+    }
+
+    /// Up to [`PEOPLE_FOUND`] people in `workspace` whose names match `query`, best first. Deactivated accounts
+    /// aren't among them.
+    pub(crate) async fn find_people(
+        &self,
+        workspace: &WorkspaceId,
+        query: &str,
+    ) -> Result<Vec<Person>, Error> {
+        // As the web client asks, less what it would show beyond names.
+        let body = json!({
+            "query": query,
+            "count": PEOPLE_FOUND,
+            "fuzz": 1,
+            "uax29_tokenizer": false,
+            "filter": "NOT deactivated",
+        });
+        let found: PeopleSearch = self.call_edge(workspace, "users/search", &body).await?;
+        Ok(found.into_people())
     }
 
     pub(crate) async fn custom_emoji(&self) -> Result<CustomEmojiSet, Error> {

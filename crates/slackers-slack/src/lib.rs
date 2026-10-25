@@ -15,5 +15,6 @@ mod wire;
 pub use credentials::Credentials;
 pub use error::Error;
 pub use session::{
-    Connection, FollowedThread, HistoryPage, LiveEvent, Request, Session, Snapshot, Update, User,
+    Connection, FollowedThread, HistoryPage, LiveEvent, Part, Person, Request, Session, Snapshot,
+    Update, User,
 };

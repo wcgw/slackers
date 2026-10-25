@@ -31,8 +31,10 @@ pub(crate) const FOLDED: &str = "\u{f44a} ";
 pub(crate) const UNFOLDED: &str = "\u{f44b} ";
 /// `oct-chevron_right`: between the parts of a pane's title, as in a breadcrumb.
 pub(crate) const CRUMB: &str = "\u{f460} ";
-/// `md-account_circle`: a person, until their avatar loads.
+/// `md-account_circle`: a person, until their avatar loads, or wherever it doesn't show.
 pub(crate) const AVATAR: &str = "\u{f0009} ";
+/// `oct-megaphone`: an `@here` or `@channel`.
+pub(crate) const BROADCAST: &str = "\u{f45f} ";
 /// `md-robot`: a bot, until its avatar loads.
 pub(crate) const BOT: &str = "\u{f06a9} ";
 /// `md-keyboard`: Insert mode.

@@ -2,8 +2,8 @@ use std::collections::HashSet;
 use std::sync::Arc;
 
 use slackers_model::{
-    Activity, Conversation, ConversationId, CustomEmojiSet, Emoji, Message, ReactionChange, Ts,
-    UserId, WorkspaceId,
+    Activity, Broadcast, Conversation, ConversationId, CustomEmojiSet, Emoji, Message,
+    ReactionChange, Ts, UserId, WorkspaceId,
 };
 use tokio::sync::mpsc;
 use tokio::task::JoinSet;
@@ -38,17 +38,22 @@ pub enum Request {
         /// requests elsewhere carry none.
         url: String,
     },
-    /// Posts a top-level Message as the user; answered by [`Update::Posted`].
+    /// Posts a Message as the user; answered by [`Update::Posted`].
     Post {
         /// Where.
         conversation: ConversationId,
         /// The Thread to reply in, by its parent; `None` to post at the top level.
         thread: Option<Ts>,
-        /// What, as typed: `mrkdwn` markup such as `*bold*` and `:emoji:` applies, but `&`, `<` and `>` are
-        /// taken literally.
-        text: String,
+        /// What, in order.
+        text: Vec<Part>,
         /// Any number the caller picks, to match the answer to the request.
         id: u64,
+    },
+    /// The people in the Workspace whose names match `query`, best first, as Slack's own people search finds
+    /// them; answered by [`Update::FoundPeople`].
+    FindPeople {
+        /// What they're called, or the start of it.
+        query: String,
     },
     /// A Thread, parent and Replies; answered by [`Update::Replies`].
     Replies {
@@ -112,6 +117,13 @@ pub enum Update {
         /// The Message as Slack stored it, or why it wasn't posted.
         result: Result<Message, Error>,
     },
+    /// The answer to [`Request::FindPeople`].
+    FoundPeople {
+        /// What was asked for.
+        query: String,
+        /// Who, best first, or why no one.
+        result: Result<Vec<Person>, Error>,
+    },
     /// The answer to [`Request::Download`].
     Downloaded {
         /// What was asked for.
@@ -172,6 +184,29 @@ pub struct User {
     pub name: String,
     /// Where their avatar image is, about 48 pixels square; `None` when they have none.
     pub avatar: Option<String>,
+}
+
+/// Someone [`Request::FindPeople`] found.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Person {
+    /// Who.
+    pub id: UserId,
+    /// What to call them, as [`User::name`] does.
+    pub name: String,
+    /// Their full name; empty when they gave none.
+    pub full_name: String,
+}
+
+/// A part of a Message to post.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum Part {
+    /// Text as typed: `mrkdwn` markup such as `*bold*` and `:emoji:` applies, but `&`, `<` and `>` are taken
+    /// literally.
+    Text(String),
+    /// An @-mention of a person.
+    User(UserId),
+    /// An `@here`, `@channel` or `@everyone`.
+    Broadcast(Broadcast),
 }
 
 /// Something that just happened in a Workspace.
@@ -317,7 +352,7 @@ async fn run(
         Err(error) => return notify(Update::SignInFailed(error)),
     };
     let me = snapshot.me.clone();
-    let gateway = snapshot.workspace.clone();
+    let workspace = snapshot.workspace.clone();
     let known = snapshot
         .conversations
         .iter()
@@ -338,7 +373,7 @@ async fn run(
     let (heard, hearing) = mpsc::unbounded_channel();
     tasks.spawn(socket::follow(
         credentials,
-        gateway,
+        workspace.clone(),
         me.clone(),
         heard,
         Arc::clone(&notify),
@@ -353,8 +388,9 @@ async fn run(
     tasks.spawn(relay(known, look_up, hearing, Arc::clone(&notify)));
 
     while let Some(request) = requests.recv().await {
-        let (api, notify, me) = (Arc::clone(&api), Arc::clone(&notify), me.clone());
-        tasks.spawn(async move { serve(&api, request, &me, &notify).await });
+        let (api, notify) = (Arc::clone(&api), Arc::clone(&notify));
+        let (me, workspace) = (me.clone(), workspace.clone());
+        tasks.spawn(async move { serve(&api, request, &me, &workspace, &notify).await });
         while let Some(finished) = tasks.try_join_next() {
             if let Err(error) = finished
                 && error.is_panic()
@@ -413,7 +449,8 @@ async fn relay<F, Found>(
     }
 }
 
-async fn serve(api: &Api, request: Request, me: &UserId, notify: &Notify) {
+/// Answers `request`, made of the Workspace `workspace`, signed in to as `me`.
+async fn serve(api: &Api, request: Request, me: &UserId, workspace: &WorkspaceId, notify: &Notify) {
     match request {
         Request::History {
             conversation,
@@ -445,6 +482,10 @@ async fn serve(api: &Api, request: Request, me: &UserId, notify: &Notify) {
                 conversation,
                 result,
             });
+        }
+        Request::FindPeople { query } => {
+            let result = api.find_people(workspace, &query).await;
+            notify(Update::FoundPeople { query, result });
         }
         Request::Replies {
             conversation,
