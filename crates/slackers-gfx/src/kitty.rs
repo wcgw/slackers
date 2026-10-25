@@ -114,6 +114,11 @@ pub(crate) fn place(out: &mut Vec<u8>, id: ImageId, cols: u16, rows: u16) {
     );
 }
 
+/// Appends a command deleting image `id` and its placements, freeing its memory in the terminal.
+pub(crate) fn delete(out: &mut Vec<u8>, id: ImageId) {
+    out.extend_from_slice(format!("\x1b_Ga=d,d=I,i={},q=2\x1b\\", id.0).as_bytes());
+}
+
 /// The command that deletes every image and placement, freeing their memory in the terminal.
 pub(crate) const DELETE_ALL: &[u8] = b"\x1b_Ga=d,d=A,q=2\x1b\\";
 
@@ -237,6 +242,7 @@ mod tests {
         let mut out = Vec::new();
         send_chunked(&mut out, "a=t,f=32,s=64,v=40,i=7,q=2", &data);
         place(&mut out, ImageId(7), 4, 2);
+        delete(&mut out, ImageId(7));
         let commands = commands(&out);
 
         let controls: Vec<&str> = commands.iter().map(|(c, _)| c.as_str()).collect();
@@ -247,7 +253,8 @@ mod tests {
                 "m=1",
                 "m=1",
                 "m=0",
-                "a=p,U=1,i=7,c=4,r=2,q=2"
+                "a=p,U=1,i=7,c=4,r=2,q=2",
+                "a=d,d=I,i=7,q=2"
             ]
         );
         assert!(commands.iter().all(|(_, payload)| payload.len() <= 4096));

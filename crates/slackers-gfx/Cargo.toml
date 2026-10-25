@@ -12,5 +12,9 @@ ratatui.workspace = true
 thiserror.workspace = true
 tracing.workspace = true
 
+[features]
+# `Picture::for_tests`, for testing code that keeps pictures without a terminal.
+test-util = []
+
 [lints]
 workspace = true

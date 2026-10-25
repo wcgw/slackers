@@ -131,6 +131,7 @@ pub fn prepare(bytes: &[u8], fit: Fit, cell: CellSize, ids: &Ids) -> Result<Prep
     };
     shrink(&mut frames, cells, cell);
 
+    let stored = frames.iter().map(|frame| frame.pixels.as_raw().len()).sum();
     let mut commands = Vec::new();
     let mut staged = Vec::new();
     let mut ends = Duration::ZERO;
@@ -148,6 +149,7 @@ pub fn prepare(bytes: &[u8], fit: Fit, cell: CellSize, ids: &Ids) -> Result<Prep
         picture: Picture {
             cells,
             frames: timed,
+            stored,
         },
     })
 }
@@ -168,6 +170,7 @@ impl Prepared {
             Picture {
                 cells: CellBox::EMOJI,
                 frames: Vec::new(),
+                stored: 0,
             },
         ))
     }
@@ -240,18 +243,55 @@ fn shrink(frames: &mut [Frame], cells: CellBox, cell: CellSize) {
 }
 
 /// A picture in the terminal, drawn as rows of placeholder cells.
-#[derive(Clone, Debug, PartialEq, Eq)]
+///
+/// It isn't `Clone`: once [forgotten](Picture::forget), nothing should draw it.
+#[derive(Debug, PartialEq, Eq)]
 pub struct Picture {
     cells: CellBox,
     /// One entry per frame, in order: its image, and when it stops showing as an offset into the animation's cycle.
     /// The last offset is the cycle's length; zero for a still image.
     frames: Vec<(ImageId, Duration)>,
+    /// The bytes of its frames' pixels.
+    stored: usize,
 }
 
 impl Picture {
+    /// A picture of `frames` emoji-sized frames, under fresh `ids`, said to take `stored_bytes` of the terminal's
+    /// memory, but which no terminal has: for testing code that keeps pictures.
+    #[cfg(any(test, feature = "test-util"))]
+    pub fn for_tests(ids: &Ids, frames: usize, stored_bytes: usize) -> Self {
+        let frame = Duration::from_millis(100);
+        Self {
+            cells: CellBox::EMOJI,
+            frames: (1..=frames)
+                .map(|n| (ids.next(), frame * u32::try_from(n).unwrap_or(u32::MAX)))
+                .collect(),
+            stored: stored_bytes,
+        }
+    }
+
     /// The box it's drawn in.
     pub fn cells(&self) -> CellBox {
         self.cells
+    }
+
+    /// How much of the terminal's memory it takes, in bytes: its frames' pixels, which the terminal keeps.
+    pub fn stored_bytes(&self) -> usize {
+        self.stored
+    }
+
+    /// Deletes it from the terminal, freeing its memory. Anything still drawing it shows blank: forget it only once
+    /// it's off screen. Write it between draws, so that it doesn't interleave with ratatui's output.
+    ///
+    /// # Errors
+    ///
+    /// If writing to `out` fails.
+    pub fn forget(self, out: &mut impl Write) -> io::Result<()> {
+        let mut commands = Vec::new();
+        for (id, _) in self.frames {
+            kitty::delete(&mut commands, id);
+        }
+        out.write_all(&commands)
     }
 
     /// Row `row` (0-based) of the frame showing `elapsed` after the animation epoch. Every picture should be drawn
@@ -361,6 +401,20 @@ mod tests {
         assert_eq!(
             picture.next_change(Duration::from_millis(120)),
             Some(Duration::from_millis(150))
+        );
+    }
+
+    #[test]
+    fn a_picture_takes_its_frames_pixels_and_forgetting_it_deletes_every_frame() {
+        let ids = Ids::default();
+        // 48×48 frames, shrunk to the 20×20 pixels of an emoji's two cells.
+        let picture = sent(prepare(&gif(&[100, 50, 70]), Fit::Emoji, CELL, &ids).unwrap());
+        assert_eq!(picture.stored_bytes(), 3 * 20 * 20 * 4);
+        let mut out = Vec::new();
+        picture.forget(&mut out).unwrap();
+        assert_eq!(
+            String::from_utf8(out).unwrap(),
+            "\x1b_Ga=d,d=I,i=1,q=2\x1b\\\x1b_Ga=d,d=I,i=2,q=2\x1b\\\x1b_Ga=d,d=I,i=3,q=2\x1b\\"
         );
     }
 

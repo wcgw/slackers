@@ -63,11 +63,11 @@ struct Rank {
 pub(crate) enum Drawable<'a> {
     /// As these characters.
     Text(&'a str),
-    /// As this picture.
-    Picture(&'a Picture),
-    /// As its `:name:`, for now: the picture at `url` isn't loaded yet, and hasn't been asked for unless
-    /// `requested`.
-    Awaiting { url: &'a str, requested: bool },
+    /// As the picture at `url`: as `loaded`, once it is; until then, as its `:name:`.
+    Picture {
+        url: &'a str,
+        loaded: Option<&'a Picture>,
+    },
     /// As its `:name:`: there's nothing better.
     Name,
 }
@@ -189,8 +189,11 @@ impl Emojis {
         // A Workspace's Custom Emoji shadow standard ones of the same name, as in Slack.
         match self.custom.resolve(&emoji.name) {
             Some(CustomEmoji::Image { url }) => match pictures.state(url) {
-                PictureState::Ready(picture) => Drawable::Picture(picture),
-                PictureState::Awaiting { requested } => Drawable::Awaiting { url, requested },
+                PictureState::Ready(picture) => Drawable::Picture {
+                    url,
+                    loaded: Some(picture),
+                },
+                PictureState::Awaiting => Drawable::Picture { url, loaded: None },
                 PictureState::Failed => Drawable::Name,
             },
             Some(CustomEmoji::Standard { name }) => {
@@ -320,14 +323,19 @@ mod tests {
             Drawable::Text("✅")
         );
         let parrot = Emoji::named("parrot");
-        let awaiting = |requested| Drawable::Awaiting {
-            url: "https://e/parrot.gif",
-            requested,
-        };
-        assert_eq!(emojis.drawable(&parrot, &pictures), awaiting(false));
-        pictures.request("https://e/parrot.gif", slackers_gfx::Fit::Emoji);
-        assert_eq!(emojis.drawable(&parrot, &pictures), awaiting(true));
-        pictures.failed("https://e/parrot.gif".into());
+        let url = "https://e/parrot.gif";
+        let awaiting = Drawable::Picture { url, loaded: None };
+        assert_eq!(emojis.drawable(&parrot, &pictures), awaiting);
+        pictures.want(url, slackers_gfx::Fit::Emoji);
+        assert_eq!(emojis.drawable(&parrot, &pictures), awaiting);
+        let picture = slackers_gfx::Picture::for_tests(&slackers_gfx::Ids::default(), 1, 1);
+        pictures.loaded(url.into(), picture);
+        assert!(matches!(
+            emojis.drawable(&parrot, &pictures),
+            Drawable::Picture { url: at, loaded: Some(_) } if at == url
+        ));
+        pictures.forget_all();
+        pictures.failed(url.into());
         assert_eq!(emojis.drawable(&parrot, &pictures), Drawable::Name);
     }
 

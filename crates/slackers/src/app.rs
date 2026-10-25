@@ -80,7 +80,8 @@ pub(crate) enum Event {
 /// What a draw found out that only drawing can tell.
 #[derive(Debug, Default, PartialEq, Eq)]
 pub(crate) struct Drawn {
-    /// Pictures it would have shown, had they been loaded.
+    /// The pictures it showed, and those it would have shown had they been loaded: all of them should be in the
+    /// terminal.
     pub(crate) wanted_pictures: Vec<WantedPicture>,
     /// When something drawn next changes frame, as animation time; `None` when nothing animates.
     pub(crate) next_change: Option<Duration>,
@@ -90,8 +91,8 @@ pub(crate) struct Drawn {
     pub(crate) thread: Option<Settled>,
 }
 
-/// A picture to fetch, the Workspace to fetch it through (Slack serves a Workspace's files to its members only), and
-/// how big to draw it.
+/// A picture to have in the terminal, the Workspace to fetch it through (Slack serves a Workspace's files to its
+/// members only), and how big to draw it.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) struct WantedPicture {
     pub(crate) workspace: WorkspaceKey,
@@ -111,6 +112,8 @@ pub(crate) enum Command {
         bytes: Vec<u8>,
         fit: Fit,
     },
+    /// Delete these pictures from the terminal, freeing its memory. Nothing draws them any more.
+    Forget(Vec<Picture>),
     /// Hand the terminal to `$EDITOR` to edit `text`, the draft for `place`, then report back with
     /// [`Event::Edited`] and [`Event::PicturesLost`].
     Edit {
@@ -599,7 +602,11 @@ impl App {
             Event::CantSignIn { workspace, reason } => {
                 self.workspaces.set_phase(workspace, Phase::Failed(reason));
             }
-            Event::PictureReady { url, picture } => self.pictures.loaded(url, picture),
+            Event::PictureReady { url, picture } => {
+                if let Some(again) = self.pictures.loaded(url, picture) {
+                    commands.push(Command::Forget(vec![again]));
+                }
+            }
             Event::PictureFailed { url } => self.pictures.failed(url),
             Event::PicturesLost => self.pictures.forget_all(),
             Event::Edited { place, outcome } => match outcome {
@@ -614,10 +621,14 @@ impl App {
             }
             Event::Drawn(drawn) => {
                 for wanted in drawn.wanted_pictures {
-                    if self.pictures.request(&wanted.url, wanted.fit) {
+                    if self.pictures.want(&wanted.url, wanted.fit) {
                         let request = Request::Download { url: wanted.url };
                         commands.push(Command::Slack(wanted.workspace, request));
                     }
+                }
+                let evicted = self.pictures.evict();
+                if !evicted.is_empty() {
+                    commands.push(Command::Forget(evicted));
                 }
                 self.next_change = drawn.next_change;
                 self.conversation_shown = drawn.conversation.is_some();
@@ -2120,6 +2131,7 @@ mod tests {
     use slackers_slack::{HistoryPage, Part};
 
     use super::*;
+    use crate::pictures::PictureState;
     use crate::sidebar::Row;
 
     const W0: WorkspaceKey = WorkspaceKey(0);
@@ -3650,6 +3662,59 @@ mod tests {
                 bytes: vec![1, 2],
                 fit
             }]
+        );
+    }
+
+    #[test]
+    fn pictures_off_screen_are_forgotten_once_too_many_are_kept() {
+        let (mut app, _) = ready_app();
+        app.pictures = Pictures::with_budget(10);
+        let ids = slackers_gfx::Ids::default();
+        let drawing = |urls: &[&str]| {
+            let wanted = urls.iter().map(|url| WantedPicture {
+                workspace: W0,
+                url: (*url).into(),
+                fit: Fit::Emoji,
+            });
+            Event::Drawn(Drawn {
+                wanted_pictures: wanted.collect(),
+                ..Drawn::default()
+            })
+        };
+        app.update(drawing(&["a", "b"]));
+        for url in ["a", "b"] {
+            let picture = Picture::for_tests(&ids, 1, 8);
+            let ready = Event::PictureReady {
+                url: url.into(),
+                picture,
+            };
+            assert!(app.update(ready).is_empty());
+        }
+        assert!(
+            app.update(drawing(&["b"])).is_empty(),
+            "a, loaded since the last draw, may not have been drawn yet"
+        );
+        let commands = app.update(drawing(&["b"]));
+        assert!(
+            matches!(commands.as_slice(), [Command::Forget(forgotten)] if forgotten.len() == 1),
+            "{commands:?}"
+        );
+        assert_eq!(app.pictures.state("a"), PictureState::Awaiting);
+        assert!(matches!(app.pictures.state("b"), PictureState::Ready(_)));
+        assert_eq!(
+            app.update(drawing(&["a"])),
+            [ask(Request::Download { url: "a".into() })],
+            "fetched again once back on screen"
+        );
+
+        let again = Event::PictureReady {
+            url: "b".into(),
+            picture: Picture::for_tests(&ids, 1, 8),
+        };
+        let commands = app.update(again);
+        assert!(
+            matches!(commands.as_slice(), [Command::Forget(forgotten)] if forgotten.len() == 1),
+            "a second copy is forgotten: {commands:?}"
         );
     }
 

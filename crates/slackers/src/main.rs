@@ -276,6 +276,13 @@ impl Effects {
                         }
                     }));
                 }
+                Command::Forget(pictures) => {
+                    let mut stdout = io::stdout().lock();
+                    for picture in pictures {
+                        picture.forget(&mut stdout)?;
+                    }
+                    stdout.flush()?;
+                }
                 Command::Copy(text) => {
                     // OSC 52: the terminal puts the text on the clipboard, even over ssh.
                     let mut stdout = io::stdout().lock();

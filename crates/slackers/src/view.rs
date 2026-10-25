@@ -465,23 +465,18 @@ fn workspace_marker(
     let Some(url) = &workspace.icon else {
         return fallback;
     };
+    drawn.wanted_pictures.push(WantedPicture {
+        workspace: key,
+        url: url.clone(),
+        fit: Fit::Emoji,
+    });
     match app.pictures.state(url) {
         PictureState::Ready(picture) => {
             let now = app.animation_time();
             drawn.next_change = earliest(drawn.next_change, picture.next_change(now));
             picture.row(0, now)
         }
-        PictureState::Awaiting { requested } => {
-            if !requested {
-                drawn.wanted_pictures.push(WantedPicture {
-                    workspace: key,
-                    url: url.clone(),
-                    fit: Fit::Emoji,
-                });
-            }
-            fallback
-        }
-        PictureState::Failed => fallback,
+        PictureState::Awaiting | PictureState::Failed => fallback,
     }
 }
 
@@ -1231,18 +1226,13 @@ impl<'a> Renderer<'a> {
         let Some(url) = self.workspace.avatar(author) else {
             return fallback;
         };
+        self.want(url, Fit::Emoji);
         match self.app.pictures.state(url) {
             PictureState::Ready(picture) => {
                 self.next_change = earliest(self.next_change, picture.next_change(self.now));
                 picture.row(0, self.now)
             }
-            PictureState::Awaiting { requested } => {
-                if !requested {
-                    self.want(url, Fit::Emoji);
-                }
-                fallback
-            }
-            PictureState::Failed => fallback,
+            PictureState::Awaiting | PictureState::Failed => fallback,
         }
     }
 
@@ -1258,6 +1248,7 @@ impl<'a> Renderer<'a> {
     /// An image's lines: its picture, once loaded; until then, a line saying what's coming, by `label`, followed by
     /// as many blank ones as the picture will take. `None` when it can't be shown.
     fn image(&mut self, image: &Image, label: &str) -> Option<Vec<Line<'static>>> {
+        self.want(&image.url, Fit::Within(IMAGE));
         match self.app.pictures.state(&image.url) {
             PictureState::Ready(picture) => {
                 self.next_change = earliest(self.next_change, picture.next_change(self.now));
@@ -1265,10 +1256,7 @@ impl<'a> Renderer<'a> {
                     (0..picture.cells().rows).map(|row| Line::from(picture.row(row, self.now)));
                 Some(rows.collect())
             }
-            PictureState::Awaiting { requested } => {
-                if !requested {
-                    self.want(&image.url, Fit::Within(IMAGE));
-                }
+            PictureState::Awaiting => {
                 let rows = CellBox::fitting(image.width, image.height, IMAGE, self.app.cell).rows;
                 let mut lines = vec![labelled(icons::IMAGE, label)];
                 lines.resize(usize::from(rows).max(1), Line::default());
@@ -1278,7 +1266,8 @@ impl<'a> Renderer<'a> {
         }
     }
 
-    /// Notes that the picture at `url` should be fetched, to be drawn to `fit`.
+    /// Notes that the picture at `url` should be in the terminal, to be drawn to `fit`: it's drawn, or would be
+    /// once loaded.
     fn want(&mut self, url: &str, fit: Fit) {
         self.wanted.push(WantedPicture {
             workspace: self.key,
@@ -1427,15 +1416,16 @@ impl<'a> Renderer<'a> {
                 Span::raw(text.to_owned()),
                 u16::try_from(text.width().max(1)).unwrap_or(2),
             ),
-            Drawable::Picture(picture) => {
-                self.next_change = earliest(self.next_change, picture.next_change(self.now));
-                Piece::Atom(picture.row(0, self.now), picture.cells().cols)
-            }
-            Drawable::Awaiting { url, requested } => {
-                if !requested {
-                    self.want(url, Fit::Emoji);
+            Drawable::Picture { url, loaded } => {
+                self.want(url, Fit::Emoji);
+                match loaded {
+                    Some(picture) => {
+                        self.next_change =
+                            earliest(self.next_change, picture.next_change(self.now));
+                        Piece::Atom(picture.row(0, self.now), picture.cells().cols)
+                    }
+                    None => Piece::Text(format!(":{}:", emoji.name), DIM),
                 }
-                Piece::Text(format!(":{}:", emoji.name), DIM)
             }
             Drawable::Name => Piece::Text(format!(":{}:", emoji.name), Style::new()),
         }
@@ -2209,6 +2199,116 @@ mod tests {
             fit: Fit::Emoji,
         };
         assert!(drawn.wanted_pictures.contains(&icon));
+    }
+
+    #[test]
+    fn a_picture_on_screen_is_wanted_loaded_or_not_so_that_it_stays() {
+        let mut app = App::new(vec!["test".into()], Vec::new(), CELL);
+        let snapshot = ready(
+            "Test",
+            Some("https://i/test.png"),
+            vec![channel("C1", "general")],
+        );
+        app.update(Event::Slack(w(0), snapshot));
+        let icon = WantedPicture {
+            workspace: w(0),
+            url: "https://i/test.png".into(),
+            fit: Fit::Emoji,
+        };
+        let (_, drawn) = render(&app);
+        assert!(drawn.wanted_pictures.contains(&icon), "to fetch");
+
+        let picture = slackers_gfx::Picture::for_tests(&slackers_gfx::Ids::default(), 1, 4);
+        app.update(Event::PictureReady {
+            url: icon.url.clone(),
+            picture,
+        });
+        let (rows, drawn) = render(&app);
+        assert!(
+            rows.iter().any(|row| row.contains('\u{10EEEE}')),
+            "{rows:#?}"
+        );
+        assert!(drawn.wanted_pictures.contains(&icon), "to keep");
+    }
+
+    #[test]
+    fn a_messages_pictures_stay_wanted_once_loaded() {
+        let mut app = reading_general();
+        let ana = slackers_slack::User {
+            id: UserId::new("U2"),
+            name: "Ana".into(),
+            full_name: String::new(),
+            title: String::new(),
+            time_zone: None,
+            avatar: Some("https://a/ana.png".into()),
+        };
+        app.update(Event::Slack(w(0), Update::User(ana)));
+        let mut custom = slackers_model::CustomEmojiSet::default();
+        custom.insert_image("parrot", "https://e/parrot.gif");
+        let list = slackers_slack::EmojiList {
+            custom,
+            standard: Vec::new(),
+        };
+        app.update(Event::Slack(w(0), Update::Emoji(list)));
+        let shot = File {
+            name: "shot.png".into(),
+            mimetype: "image/png".into(),
+            link: None,
+            image: Some(Image {
+                url: "https://f/shot.png".into(),
+                width: 30,
+                height: 20,
+            }),
+        };
+        let posted = slackers_slack::LiveEvent::Posted {
+            conversation: ConversationId::new("C1"),
+            message: Message {
+                ts: Ts::from_micros(reading_general_message().ts.as_micros() + 60_000_000),
+                content: RichText {
+                    blocks: vec![slackers_model::Block::Paragraph(vec![Inline::Emoji(
+                        Emoji::named("parrot"),
+                    )])],
+                },
+                files: vec![shot],
+                ..reading_general_message()
+            },
+        };
+        app.update(Event::Slack(w(0), Update::Live(posted)));
+        let urls = [
+            "https://a/ana.png",
+            "https://e/parrot.gif",
+            "https://f/shot.png",
+        ];
+        let wanted = |drawn: &Drawn| -> Vec<bool> {
+            urls.iter()
+                .map(|url| {
+                    drawn
+                        .wanted_pictures
+                        .iter()
+                        .any(|wanted| wanted.url == *url)
+                })
+                .collect()
+        };
+        assert_eq!(wanted(&render(&app).1), [true; 3], "to fetch");
+
+        let ids = slackers_gfx::Ids::default();
+        for url in urls {
+            let picture = slackers_gfx::Picture::for_tests(&ids, 1, 4);
+            app.update(Event::PictureReady {
+                url: url.into(),
+                picture,
+            });
+        }
+        let (rows, drawn) = render(&app);
+        let placeholders: usize = rows
+            .iter()
+            .map(|row| row.matches('\u{10EEEE}').count())
+            .sum();
+        assert!(
+            placeholders >= 2 * 3,
+            "all three drawn, two cells each: {rows:#?}"
+        );
+        assert_eq!(wanted(&drawn), [true; 3], "to keep");
     }
 
     #[test]
