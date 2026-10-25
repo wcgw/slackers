@@ -7,6 +7,10 @@
 //! searches the sidebar, and `:` enters Command mode: `:q` quits, `:vw add NAME` puts the open Channel in the
 //! Virtual Workspace called NAME, and `:vw rm NAME` takes it out. In Insert mode, a word starting with `@` brings
 //! up people and broadcasts to @-mention: `↑`/`↓` choose one, `Tab` or `Enter` picks it.
+//!
+//! On a Message, `K` shows its details: who wrote it, who reacted, and where it leads (its links, its files and the
+//! Message itself on Slack's web client), for `j`/`k` to choose, `Enter` or `1`-`9` to open and `y` to copy. `o`
+//! opens a Message's link or file when it has just one, and shows its details to choose from otherwise.
 
 use std::cmp::Reverse;
 use std::collections::{HashMap, HashSet};
@@ -18,7 +22,9 @@ use slackers_model::{
     Activity, Author, Broadcast, Conversation, ConversationId, ConversationKind, Inline, Message,
     Timeline, Ts, UserId,
 };
-use slackers_slack::{Connection, Error, LiveEvent, Person, Request, Snapshot, Update, User};
+use slackers_slack::{
+    Connection, Error, LiveEvent, Permalinks, Person, Request, Snapshot, Update, User,
+};
 
 use crate::config::{ChannelRef, VirtualWorkspace};
 use crate::draft::{Draft, Mentioned, Written};
@@ -30,6 +36,10 @@ use crate::sidebar::{Fold, Item, Section, Sidebar};
 
 /// The most people and broadcasts offered to @-mention at once.
 const SUGGESTIONS: usize = 8;
+
+/// The most people named per reaction in a Message's details, whose names are looked up: more wouldn't fit on the
+/// reaction's line.
+const NAMED_REACTORS: usize = 12;
 
 /// Something that happened, for [`App::update`] to react to.
 #[derive(Debug)]
@@ -60,6 +70,8 @@ pub(crate) enum Event {
     },
     /// Saving the Virtual Workspaces, as [`Command::SaveVirtualWorkspaces`] asked, failed for this reason.
     SaveFailed(String),
+    /// Opening a link, as [`Command::Open`] asked, failed for this reason.
+    OpenFailed(String),
     /// What the last draw found; see [`Drawn`].
     Drawn(Drawn),
 }
@@ -107,6 +119,10 @@ pub(crate) enum Command {
     /// Write these Virtual Workspaces to the config file in place of those there, keeping the rest of it, and report
     /// a failure with [`Event::SaveFailed`].
     SaveVirtualWorkspaces(Vec<VirtualWorkspace>),
+    /// Open this web link in the user's browser, and report a failure with [`Event::OpenFailed`].
+    Open(String),
+    /// Put this text on the clipboard, through the terminal.
+    Copy(String),
     Quit,
 }
 
@@ -144,6 +160,39 @@ pub(crate) enum Mode {
     Command(String),
     /// Keys narrow the sidebar down to the Conversations matching a query, shown after `/` on the status line.
     Search(Search),
+    /// Keys choose where a Message leads, from its details shown over its pane.
+    Details(Details),
+}
+
+/// A Message whose details show: who wrote it and when, who reacted, and where it leads.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) struct Details {
+    /// Where the Message is held: its Conversation, or the Thread whose pane it was chosen in.
+    pub(crate) place: Place,
+    pub(crate) ts: Ts,
+    /// The link `Enter` opens, by its place among the Message's [`Workspace::links`].
+    pub(crate) selected: usize,
+}
+
+/// Somewhere a Message leads, to open in a browser.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) struct Link {
+    pub(crate) kind: LinkKind,
+    /// What to call it.
+    pub(crate) label: String,
+    /// Where it goes: always an `http` or `https` URL.
+    pub(crate) url: String,
+}
+
+/// What a [`Link`] leads to.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum LinkKind {
+    /// A web page linked in the Message's text.
+    Web,
+    /// A file shared with the Message, on Slack's web client.
+    File,
+    /// The Message itself, on Slack's web client.
+    Message,
 }
 
 /// A search of the sidebar under way.
@@ -361,6 +410,7 @@ pub(crate) struct Workspace {
     pub(crate) users: HashMap<UserId, User>,
     requested_users: HashSet<UserId>,
     pub(crate) emojis: Emojis,
+    permalinks: Permalinks,
     /// Channels by name, then DMs, most recently active first.
     pub(crate) conversations: Vec<Conversation>,
     pub(crate) activity: HashMap<ConversationId, Activity>,
@@ -537,6 +587,9 @@ impl App {
             Event::SaveFailed(reason) => {
                 self.notice = Some(format!("couldn't save the virtual workspaces: {reason}"));
             }
+            Event::OpenFailed(reason) => {
+                self.notice = Some(format!("couldn't open the link: {reason}"));
+            }
             Event::Drawn(drawn) => {
                 for wanted in drawn.wanted_pictures {
                     if self.pictures.request(&wanted.url, wanted.fit) {
@@ -566,6 +619,7 @@ impl App {
         // People's names keep arriving: keep a search's hits current.
         self.refresh_search();
         self.refresh_suggestions(&mut commands);
+        self.refresh_details(&mut commands);
         commands
     }
 
@@ -576,6 +630,7 @@ impl App {
             Mode::Insert => self.insert_key(key, pending, commands),
             Mode::Command(_) => self.command_key(key, commands),
             Mode::Search(_) => self.search_key(key, commands),
+            Mode::Details(_) => self.details_key(key, commands),
         }
     }
 
@@ -677,6 +732,8 @@ impl App {
             },
             Focus::Timeline => match key.code {
                 KeyCode::Enter => self.open_selected_thread(commands),
+                KeyCode::Char('K') => self.show_details(commands),
+                KeyCode::Char('o') => self.open_selected_link(commands),
                 KeyCode::Char('h') | KeyCode::Left | KeyCode::Esc => self.focus_sidebar(),
                 _ => {
                     let Some(open) = &self.open else { return };
@@ -690,6 +747,8 @@ impl App {
                 }
             },
             Focus::Thread => match key.code {
+                KeyCode::Char('K') => self.show_details(commands),
+                KeyCode::Char('o') => self.open_selected_link(commands),
                 KeyCode::Char('h') | KeyCode::Left | KeyCode::Esc => {
                     self.open_thread = None;
                     self.focus = Focus::Timeline;
@@ -981,14 +1040,152 @@ impl App {
     /// Opens the Thread of the open Conversation's selected Message. Any Message can start a Thread: one without
     /// Replies yet opens empty, ready for one.
     fn open_selected_thread(&mut self, commands: &mut Vec<Command>) {
-        let Some(open) = &self.open else { return };
-        let selected = self
-            .workspaces
-            .get(open.workspace)
-            .and_then(|workspace| workspace.timelines.get(&open.id))
-            .and_then(|timeline| self.conversation_pane.selected(timeline));
-        if let Some(parent) = selected {
+        if let Some((Place { thread: None, .. }, parent)) = self.selected_message() {
             self.open_thread(parent, commands);
+        }
+    }
+
+    /// The focused pane's selected Message: where it's held, and when it was posted. `None` while the sidebar has
+    /// focus, or the pane holds no Message.
+    fn selected_message(&self) -> Option<(Place, Ts)> {
+        let open = self.open.as_ref()?;
+        let workspace = self.workspaces.get(open.workspace)?;
+        let (thread, timeline, pane) = match self.focus {
+            Focus::Sidebar => return None,
+            Focus::Timeline => (
+                None,
+                workspace.timelines.get(&open.id)?,
+                &self.conversation_pane,
+            ),
+            Focus::Thread => {
+                let parent = self.open_thread?;
+                let thread = workspace.threads.get(&(open.id.clone(), parent))?;
+                (Some(parent), thread, &self.thread_pane)
+            }
+        };
+        let place = Place {
+            conversation: open.clone(),
+            thread,
+        };
+        Some((place, pane.selected(timeline)?))
+    }
+
+    /// The Message posted at `ts`, as `place` holds it, and its Workspace.
+    pub(crate) fn message(&self, place: &Place, ts: Ts) -> Option<(&Workspace, &Message)> {
+        let workspace = self.workspaces.get(place.conversation.workspace)?;
+        let id = &place.conversation.id;
+        let timeline = match place.thread {
+            Some(parent) => workspace.threads.get(&(id.clone(), parent)),
+            None => workspace.timelines.get(id),
+        }?;
+        Some((workspace, timeline.get(ts)?))
+    }
+
+    /// Shows the details of the focused pane's selected Message, asking Slack for everyone who reacted to it when
+    /// its history named only some.
+    fn show_details(&mut self, commands: &mut Vec<Command>) {
+        let Some((place, ts)) = self.selected_message() else {
+            return;
+        };
+        let Some((_, message)) = self.message(&place, ts) else {
+            return;
+        };
+        if message
+            .reactions
+            .iter()
+            .any(|reaction| reaction.unnamed() > 0)
+        {
+            let request = Request::Reactions {
+                conversation: place.conversation.id.clone(),
+                ts,
+            };
+            commands.push(Command::Slack(place.conversation.workspace, request));
+        }
+        self.mode = Mode::Details(Details {
+            place,
+            ts,
+            selected: 0,
+        });
+    }
+
+    /// Opens the link or file of the focused pane's selected Message when it has just one, and shows its details,
+    /// to choose from, otherwise.
+    fn open_selected_link(&mut self, commands: &mut Vec<Command>) {
+        let Some((place, ts)) = self.selected_message() else {
+            return;
+        };
+        let Some((workspace, message)) = self.message(&place, ts) else {
+            return;
+        };
+        let links = workspace.links(&place.conversation.id, message);
+        let mut own = links.iter().filter(|link| link.kind != LinkKind::Message);
+        match (own.next(), own.next()) {
+            (Some(only), None) => commands.push(Command::Open(only.url.clone())),
+            _ => self.show_details(commands),
+        }
+    }
+
+    fn details_key(&mut self, key: KeyEvent, commands: &mut Vec<Command>) {
+        let Mode::Details(details) = &self.mode else {
+            return;
+        };
+        let selected = details.selected;
+        let links = self
+            .message(&details.place, details.ts)
+            .map(|(workspace, message)| workspace.links(&details.place.conversation.id, message))
+            .unwrap_or_default();
+        let url = |index: usize| links.get(index).map(|link| link.url.clone());
+        let control = key.modifiers.contains(KeyModifiers::CONTROL);
+        let command = match (key.code, control) {
+            // `refresh_details` keeps the selection on the last link.
+            (KeyCode::Down | KeyCode::Char('j'), false) | (KeyCode::Char('n'), true) => {
+                return self.select_link(selected + 1);
+            }
+            (KeyCode::Up | KeyCode::Char('k'), false) | (KeyCode::Char('p'), true) => {
+                return self.select_link(selected.saturating_sub(1));
+            }
+            (KeyCode::Enter | KeyCode::Char('o'), false) => url(selected).map(Command::Open),
+            (KeyCode::Char('y'), false) => url(selected).map(Command::Copy),
+            (KeyCode::Char(digit @ '1'..='9'), false) => {
+                let index = digit.to_digit(10).map_or(0, |digit| digit as usize - 1);
+                let Some(url) = url(index) else { return };
+                Some(Command::Open(url))
+            }
+            (KeyCode::Esc | KeyCode::Char('q' | 'K'), false) | (KeyCode::Char('c'), true) => None,
+            _ => return,
+        };
+        commands.extend(command);
+        self.mode = Mode::Normal;
+    }
+
+    fn select_link(&mut self, index: usize) {
+        if let Mode::Details(details) = &mut self.mode {
+            details.selected = index;
+        }
+    }
+
+    /// Keeps the details shown current: closes them once their Message is gone, keeps the selection on one of its
+    /// links, and asks for the names of the first people who reacted with each emoji.
+    fn refresh_details(&mut self, commands: &mut Vec<Command>) {
+        let Mode::Details(details) = &self.mode else {
+            return;
+        };
+        let Some((workspace, message)) = self.message(&details.place, details.ts) else {
+            self.mode = Mode::Normal;
+            return;
+        };
+        let links = workspace.links(&details.place.conversation.id, message);
+        let reactors: Vec<UserId> = message
+            .reactions
+            .iter()
+            .flat_map(|reaction| reaction.users.iter().take(NAMED_REACTORS))
+            .cloned()
+            .collect();
+        let key = details.place.conversation.workspace;
+        let selected = details.selected.min(links.len().saturating_sub(1));
+        self.select_link(selected);
+        if let Some(workspace) = self.workspaces.get_mut(key) {
+            workspace.want_users(key, reactors, commands);
         }
     }
 
@@ -1299,6 +1496,25 @@ impl App {
                     workspace.users.insert(user.id.clone(), user);
                 }
             }
+            Update::Reactions {
+                conversation,
+                ts,
+                result,
+            } => match result {
+                Ok(reactions) => {
+                    if let Some(workspace) = self.workspaces.get_mut(key) {
+                        for timeline in workspace.timelines_of(&conversation) {
+                            timeline.set_reactions(ts, reactions.clone());
+                        }
+                    }
+                }
+                Err(error) => {
+                    self.notice = Some(format!(
+                        "couldn't list everyone who reacted: {}",
+                        describe(&error)
+                    ));
+                }
+            },
             Update::FoundPeople { query, result } => {
                 let Some(workspace) = self.workspaces.get_mut(key) else {
                     return;
@@ -1434,11 +1650,11 @@ impl App {
                 conversation,
                 ts,
                 emoji,
-                mine,
+                user,
                 change,
             } => {
                 for timeline in workspace.timelines_of(&conversation) {
-                    timeline.react(ts, &emoji, mine, change);
+                    timeline.react(ts, &emoji, &user, change);
                 }
             }
             LiveEvent::Marked {
@@ -1514,6 +1730,7 @@ impl Workspace {
             users: HashMap::new(),
             requested_users: HashSet::new(),
             emojis: Emojis::default(),
+            permalinks: snapshot.permalinks,
             conversations: conversations.into_iter().map(|(c, _)| c).collect(),
             activity,
             timelines: HashMap::new(),
@@ -1599,6 +1816,40 @@ impl Workspace {
         self.users
             .get(user)
             .map_or(user.as_str(), |user| user.name.as_str())
+    }
+
+    /// Where `message`, posted in `conversation`, leads: the web pages its text links to, each once, then its files,
+    /// then the Message itself. Only `http` and `https` links are among them, so that none starts a program the user
+    /// didn't mean to.
+    pub(crate) fn links(&self, conversation: &ConversationId, message: &Message) -> Vec<Link> {
+        let mut links: Vec<Link> = Vec::new();
+        for inline in message.content.inlines() {
+            if let Inline::Link { url, label } = inline
+                && !links.iter().any(|link| link.url == *url)
+            {
+                links.push(Link {
+                    kind: LinkKind::Web,
+                    label: label.clone().unwrap_or_else(|| url.clone()),
+                    url: url.clone(),
+                });
+            }
+        }
+        links.extend(message.files.iter().filter_map(|file| {
+            Some(Link {
+                kind: LinkKind::File,
+                label: file.name.clone(),
+                url: file.link.clone()?,
+            })
+        }));
+        // The link to a Thread's parent or Reply opens the Thread.
+        let thread = message.reply_to.or(message.thread.map(|_| message.ts));
+        links.push(Link {
+            kind: LinkKind::Message,
+            label: "this message in Slack".to_owned(),
+            url: self.permalinks.message(conversation, message.ts, thread),
+        });
+        links.retain(|link| is_web(&link.url));
+        links
     }
 
     /// Where `author`'s avatar image is, as far as known.
@@ -1764,6 +2015,12 @@ fn move_in(pane: &mut Pane, timeline: &Timeline, key: KeyEvent) {
         (KeyCode::Char('G') | KeyCode::End, false) => pane.newest(),
         _ => {}
     }
+}
+
+/// Whether `url` is an `http` or `https` link.
+fn is_web(url: &str) -> bool {
+    let scheme = url.split_once("://").map_or("", |(scheme, _)| scheme);
+    scheme.eq_ignore_ascii_case("https") || scheme.eq_ignore_ascii_case("http")
 }
 
 /// Whether `conversation` is a DM or a group DM, which the sidebar lists after the Channels.
@@ -1942,6 +2199,7 @@ mod tests {
             name: name.into(),
             icon: None,
             me: UserId::new("UME"),
+            permalinks: Permalinks::new("https://test.slack.com/"),
             conversations,
             followed_threads: Vec::new(),
         }
@@ -2616,7 +2874,7 @@ mod tests {
             conversation: id("C2"),
             ts: seconds(5),
             emoji: wave,
-            mine: false,
+            user: UserId::new("U3"),
             change: slackers_model::ReactionChange::Added,
         }));
         let thread = |app: &App| workspace(app, W0).threads[&(id("C2"), seconds(5))].clone();
@@ -2949,6 +3207,9 @@ mod tests {
             app.update(slack(Update::User(User {
                 id: UserId::new(id),
                 name: name.into(),
+                full_name: String::new(),
+                title: String::new(),
+                time_zone: None,
                 avatar: None,
             })));
         }
@@ -3032,6 +3293,9 @@ mod tests {
             app.update(slack(Update::User(User {
                 id: UserId::new(id),
                 name: name.into(),
+                full_name: String::new(),
+                title: String::new(),
+                time_zone: None,
                 avatar: None,
             })));
         }
@@ -3184,6 +3448,9 @@ mod tests {
         app.update(slack(Update::User(User {
             id: UserId::new("U9"),
             name: "Rand Al'Thor".into(),
+            full_name: String::new(),
+            title: String::new(),
+            time_zone: None,
             avatar: None,
         })));
         keys(&mut app, "ran");
@@ -3278,5 +3545,238 @@ mod tests {
                 fit
             }]
         );
+    }
+
+    /// `reading_random`, its Message at 5 seconds now showing `content`, `files` and `reactions`, with the
+    /// Conversation's pane focused.
+    fn reading_random_with(
+        content: RichText,
+        files: Vec<slackers_model::File>,
+        reactions: Vec<slackers_model::Reaction>,
+    ) -> App {
+        let mut app = reading_random();
+        let message = Message {
+            files,
+            reactions,
+            ..message(5, "U2", content)
+        };
+        app.update(slack(Update::Live(LiveEvent::Edited {
+            conversation: id("C2"),
+            message,
+        })));
+        app.focus = Focus::Timeline;
+        app
+    }
+
+    fn reacted(users: &[&str], count: u32) -> slackers_model::Reaction {
+        slackers_model::Reaction {
+            emoji: slackers_model::Emoji::named("wave"),
+            users: users.iter().map(|user| UserId::new(*user)).collect(),
+            count,
+        }
+    }
+
+    fn link(url: &str, label: Option<&str>) -> Inline {
+        Inline::Link {
+            url: url.into(),
+            label: label.map(str::to_owned),
+        }
+    }
+
+    fn file(name: &str, link: Option<&str>) -> slackers_model::File {
+        slackers_model::File {
+            name: name.into(),
+            mimetype: "application/pdf".into(),
+            link: link.map(str::to_owned),
+            image: None,
+        }
+    }
+
+    fn details(app: &App) -> Option<&Details> {
+        if let Mode::Details(details) = &app.mode {
+            Some(details)
+        } else {
+            None
+        }
+    }
+
+    #[test]
+    fn k_shows_a_messages_details_and_asks_for_everyone_who_reacted_when_some_went_unnamed() {
+        let mut app =
+            reading_random_with(RichText::plain("hi"), Vec::new(), vec![reacted(&["U4"], 3)]);
+
+        let commands = app.update(key(KeyCode::Char('K')));
+        assert_eq!(
+            details(&app).map(|details| (&details.place, details.ts)),
+            Some((&place("C2", None), seconds(5)))
+        );
+        let reactions = ask(Request::Reactions {
+            conversation: id("C2"),
+            ts: seconds(5),
+        });
+        assert!(commands.contains(&reactions), "{commands:?}");
+        assert!(commands.contains(&ask(Request::User(UserId::new("U4")))));
+
+        let commands = app.update(slack(Update::Reactions {
+            conversation: id("C2"),
+            ts: seconds(5),
+            result: Ok(vec![reacted(&["U4", "U5", "U6"], 3)]),
+        }));
+        let held = workspace(&app, W0).timelines[&id("C2")]
+            .get(seconds(5))
+            .unwrap();
+        assert_eq!(held.reactions, [reacted(&["U4", "U5", "U6"], 3)]);
+        assert_eq!(
+            commands,
+            [
+                ask(Request::User(UserId::new("U5"))),
+                ask(Request::User(UserId::new("U6")))
+            ],
+            "the names of those now listed"
+        );
+
+        app.update(key(KeyCode::Esc));
+        assert_eq!(app.mode, Mode::Normal);
+        let commands = app.update(key(KeyCode::Char('K')));
+        assert!(!commands.contains(&reactions), "everyone is named now");
+
+        app.update(slack(Update::Reactions {
+            conversation: id("C2"),
+            ts: seconds(5),
+            result: Err(Error::SignedOut),
+        }));
+        assert!(app.notice.is_some(), "a failure is told");
+    }
+
+    #[test]
+    fn the_details_list_where_a_message_leads_for_one_to_be_opened_or_copied() {
+        let content = RichText {
+            blocks: vec![slackers_model::Block::Paragraph(vec![
+                link("https://docs.rs/ratatui", Some("docs")),
+                link("https://docs.rs/ratatui", None),
+                link("file:///etc/passwd", None),
+                link("HTTP://example.com", None),
+            ])],
+        };
+        let files = vec![
+            file("a.pdf", Some("https://test.slack.com/files/U2/F1/a.pdf")),
+            file("hidden", None),
+        ];
+        let mut app = reading_random_with(content, files, Vec::new());
+        let held = workspace(&app, W0).timelines[&id("C2")]
+            .get(seconds(5))
+            .unwrap();
+        let links: Vec<(LinkKind, String, String)> = workspace(&app, W0)
+            .links(&id("C2"), held)
+            .into_iter()
+            .map(|link| (link.kind, link.label, link.url))
+            .collect();
+        let message_link = "https://test.slack.com/archives/C2/p5000000?thread_ts=5.000000&cid=C2";
+        assert_eq!(
+            links,
+            [
+                (
+                    LinkKind::Web,
+                    "docs".into(),
+                    "https://docs.rs/ratatui".into()
+                ),
+                (
+                    LinkKind::Web,
+                    "HTTP://example.com".into(),
+                    "HTTP://example.com".into()
+                ),
+                (
+                    LinkKind::File,
+                    "a.pdf".into(),
+                    "https://test.slack.com/files/U2/F1/a.pdf".into()
+                ),
+                (
+                    LinkKind::Message,
+                    "this message in Slack".into(),
+                    message_link.into()
+                ),
+            ],
+            "each web link once, files Slack links to, then the Message, which starts a Thread"
+        );
+
+        app.update(key(KeyCode::Char('K')));
+        app.update(key(KeyCode::Char('j')));
+        assert_eq!(
+            app.update(key(KeyCode::Enter)),
+            [Command::Open("HTTP://example.com".into())]
+        );
+        assert_eq!(app.mode, Mode::Normal, "opening closes the details");
+
+        app.update(key(KeyCode::Char('K')));
+        assert_eq!(
+            app.update(key(KeyCode::Char('y'))),
+            [Command::Copy("https://docs.rs/ratatui".into())]
+        );
+
+        app.update(key(KeyCode::Char('K')));
+        for _ in 0..5 {
+            app.update(key(KeyCode::Char('j')));
+        }
+        assert_eq!(details(&app).unwrap().selected, 3, "stops at the last");
+        assert!(app.update(key(KeyCode::Char('9'))).is_empty());
+        assert_eq!(
+            app.update(key(KeyCode::Char('3'))),
+            [Command::Open(
+                "https://test.slack.com/files/U2/F1/a.pdf".into()
+            )]
+        );
+    }
+
+    #[test]
+    fn o_opens_a_messages_only_link_and_otherwise_shows_its_details_to_choose() {
+        let linking = || RichText {
+            blocks: vec![slackers_model::Block::Paragraph(vec![link(
+                "https://a.example/",
+                None,
+            )])],
+        };
+        let mut app = reading_random_with(linking(), Vec::new(), Vec::new());
+        assert_eq!(
+            app.update(key(KeyCode::Char('o'))),
+            [Command::Open("https://a.example/".into())]
+        );
+        assert_eq!(app.mode, Mode::Normal);
+
+        let pdf = file("a.pdf", Some("https://test.slack.com/files/U2/F1/a.pdf"));
+        let mut app = reading_random_with(linking(), vec![pdf], Vec::new());
+        assert!(app.update(key(KeyCode::Char('o'))).is_empty());
+        assert!(details(&app).is_some());
+    }
+
+    #[test]
+    fn a_replys_details_link_to_its_thread_and_close_once_it_is_deleted() {
+        let mut app = reading_random();
+        app.focus = Focus::Timeline;
+        app.update(key(KeyCode::Enter));
+        app.update(slack(Update::Replies {
+            conversation: id("C2"),
+            parent: seconds(5),
+            result: Ok(vec![message(5, "U2", RichText::plain("hi")), reply(6, 5)]),
+        }));
+        app.update(key(KeyCode::Char('K')));
+        let shown = details(&app).unwrap();
+        assert_eq!(
+            (&shown.place, shown.ts),
+            (&place("C2", Some(5)), seconds(6))
+        );
+        let held = workspace(&app, W0).threads[&(id("C2"), seconds(5))]
+            .get(seconds(6))
+            .unwrap();
+        let links = workspace(&app, W0).links(&id("C2"), held);
+        assert_eq!(
+            links.last().map(|link| link.url.as_str()),
+            Some("https://test.slack.com/archives/C2/p6000000?thread_ts=5.000000&cid=C2")
+        );
+
+        app.update(slack(Update::Live(LiveEvent::Deleted {
+            conversation: id("C2"),
+            ts: seconds(6),
+        })));
+        assert_eq!(app.mode, Mode::Normal);
     }
 }

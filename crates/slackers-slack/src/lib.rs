@@ -10,6 +10,7 @@ mod error;
 mod mrkdwn;
 mod session;
 mod socket;
+mod web;
 mod wire;
 
 pub use credentials::Credentials;
@@ -18,3 +19,4 @@ pub use session::{
     Connection, FollowedThread, HistoryPage, LiveEvent, Part, Person, Request, Session, Snapshot,
     Update, User,
 };
+pub use web::Permalinks;

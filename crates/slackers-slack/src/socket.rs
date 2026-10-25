@@ -4,7 +4,7 @@
 use std::time::Duration;
 
 use futures_util::{SinkExt as _, StreamExt as _};
-use slackers_model::{UserId, WorkspaceId};
+use slackers_model::WorkspaceId;
 use tokio::sync::mpsc;
 use tokio_tungstenite::tungstenite::client::IntoClientRequest as _;
 use tokio_tungstenite::tungstenite::http::HeaderValue;
@@ -25,7 +25,6 @@ const MAX_BACKOFF: Duration = Duration::from_secs(60);
 pub(crate) async fn follow(
     credentials: Credentials,
     gateway: WorkspaceId,
-    me: UserId,
     heard: mpsc::UnboundedSender<Heard>,
     notify: Notify,
 ) {
@@ -47,7 +46,6 @@ pub(crate) async fn follow(
         match connect_and_read(
             &url,
             &cookies,
-            &me,
             &heard,
             &notify,
             &mut reconnect_url,
@@ -71,7 +69,6 @@ pub(crate) async fn follow(
 async fn connect_and_read(
     url: &str,
     cookies: &HeaderValue,
-    me: &UserId,
     heard: &mpsc::UnboundedSender<Heard>,
     notify: &Notify,
     reconnect_url: &mut Option<String>,
@@ -89,7 +86,7 @@ async fn connect_and_read(
             frame = socket.next() => match frame {
                 None | Some(Ok(Message::Close(_))) => return Ok(()),
                 Some(Err(error)) => return Err(error),
-                Some(Ok(Message::Text(text))) => match socket_message(&text, me) {
+                Some(Ok(Message::Text(text))) => match socket_message(&text) {
                     SocketMessage::Hello => {
                         *attempt = 0;
                         notify(Update::Connection(Connection::Live));

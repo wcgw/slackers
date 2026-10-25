@@ -19,6 +19,10 @@ pub(crate) const UNREAD: &str = "\u{f444} ";
 pub(crate) const THREAD: &str = "\u{f442} ";
 /// `oct-image`: an image on its way.
 pub(crate) const IMAGE: &str = "\u{f4e5} ";
+/// `oct-link`: a link to a web page.
+pub(crate) const LINK: &str = "\u{f44c} ";
+/// `md-slack`: something on Slack's web client.
+pub(crate) const SLACK: &str = "\u{f04b1} ";
 /// `oct-paperclip`: a shared file.
 pub(crate) const FILE: &str = "\u{f4fb} ";
 /// `oct-pencil`: an edited Message.

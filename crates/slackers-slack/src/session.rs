@@ -2,13 +2,14 @@ use std::collections::HashSet;
 use std::sync::Arc;
 
 use slackers_model::{
-    Activity, Broadcast, Conversation, ConversationId, CustomEmojiSet, Emoji, Message,
+    Activity, Broadcast, Conversation, ConversationId, CustomEmojiSet, Emoji, Message, Reaction,
     ReactionChange, Ts, UserId, WorkspaceId,
 };
 use tokio::sync::mpsc;
 use tokio::task::JoinSet;
 
 use crate::api::Api;
+use crate::web::Permalinks;
 use crate::{Credentials, Error, socket};
 
 /// A signed-in Workspace, followed by a background task.
@@ -54,6 +55,14 @@ pub enum Request {
     FindPeople {
         /// What they're called, or the start of it.
         query: String,
+    },
+    /// Every reaction to a Message, naming everyone who reacted, where its history names only the first 50
+    /// people of each; answered by [`Update::Reactions`].
+    Reactions {
+        /// Where.
+        conversation: ConversationId,
+        /// Which Message.
+        ts: Ts,
     },
     /// A Thread, parent and Replies; answered by [`Update::Replies`].
     Replies {
@@ -124,6 +133,15 @@ pub enum Update {
         /// Who, best first, or why no one.
         result: Result<Vec<Person>, Error>,
     },
+    /// The answer to [`Request::Reactions`].
+    Reactions {
+        /// Where.
+        conversation: ConversationId,
+        /// Which Message.
+        ts: Ts,
+        /// Its reactions, or why they aren't known.
+        result: Result<Vec<Reaction>, Error>,
+    },
     /// The answer to [`Request::Download`].
     Downloaded {
         /// What was asked for.
@@ -148,6 +166,8 @@ pub struct Snapshot {
     pub icon: Option<String>,
     /// The signed-in user.
     pub me: UserId,
+    /// Builds links to the Workspace's Messages.
+    pub permalinks: Permalinks,
     /// The Conversations in the user's sidebar, with their Activity, in no particular order.
     pub conversations: Vec<(Conversation, Activity)>,
     /// The Followed Threads with the latest Replies; possibly not all of them.
@@ -182,6 +202,12 @@ pub struct User {
     pub id: UserId,
     /// What to call them: their display name, else their full name, else their handle.
     pub name: String,
+    /// Their full name; empty when they gave none.
+    pub full_name: String,
+    /// What they do, as their profile says, such as their job title; empty when it says nothing.
+    pub title: String,
+    /// Their time zone's IANA name, such as `Europe/Paris`; `None` when Slack doesn't say.
+    pub time_zone: Option<String>,
     /// Where their avatar image is, about 48 pixels square; `None` when they have none.
     pub avatar: Option<String>,
 }
@@ -249,8 +275,8 @@ pub enum LiveEvent {
         ts: Ts,
         /// With what.
         emoji: Emoji,
-        /// Whether it was the user.
-        mine: bool,
+        /// Who.
+        user: UserId,
         /// Added or taken back.
         change: ReactionChange,
     },
@@ -351,7 +377,6 @@ async fn run(
         Ok(snapshot) => snapshot,
         Err(error) => return notify(Update::SignInFailed(error)),
     };
-    let me = snapshot.me.clone();
     let workspace = snapshot.workspace.clone();
     let known = snapshot
         .conversations
@@ -374,7 +399,6 @@ async fn run(
     tasks.spawn(socket::follow(
         credentials,
         workspace.clone(),
-        me.clone(),
         heard,
         Arc::clone(&notify),
     ));
@@ -389,8 +413,8 @@ async fn run(
 
     while let Some(request) = requests.recv().await {
         let (api, notify) = (Arc::clone(&api), Arc::clone(&notify));
-        let (me, workspace) = (me.clone(), workspace.clone());
-        tasks.spawn(async move { serve(&api, request, &me, &workspace, &notify).await });
+        let workspace = workspace.clone();
+        tasks.spawn(async move { serve(&api, request, &workspace, &notify).await });
         while let Some(finished) = tasks.try_join_next() {
             if let Err(error) = finished
                 && error.is_panic()
@@ -449,14 +473,14 @@ async fn relay<F, Found>(
     }
 }
 
-/// Answers `request`, made of the Workspace `workspace`, signed in to as `me`.
-async fn serve(api: &Api, request: Request, me: &UserId, workspace: &WorkspaceId, notify: &Notify) {
+/// Answers `request`, made of the Workspace `workspace`.
+async fn serve(api: &Api, request: Request, workspace: &WorkspaceId, notify: &Notify) {
     match request {
         Request::History {
             conversation,
             before,
         } => {
-            let result = api.history(&conversation, before, me).await;
+            let result = api.history(&conversation, before).await;
             notify(Update::History {
                 conversation,
                 result,
@@ -476,7 +500,7 @@ async fn serve(api: &Api, request: Request, me: &UserId, workspace: &WorkspaceId
             text,
             id,
         } => {
-            let result = api.post(&conversation, thread, &text, me).await;
+            let result = api.post(&conversation, thread, &text).await;
             notify(Update::Posted {
                 id,
                 conversation,
@@ -491,10 +515,18 @@ async fn serve(api: &Api, request: Request, me: &UserId, workspace: &WorkspaceId
             conversation,
             parent,
         } => {
-            let result = api.replies(&conversation, parent, me).await;
+            let result = api.replies(&conversation, parent).await;
             notify(Update::Replies {
                 conversation,
                 parent,
+                result,
+            });
+        }
+        Request::Reactions { conversation, ts } => {
+            let result = api.reactions(&conversation, ts).await;
+            notify(Update::Reactions {
+                conversation,
+                ts,
                 result,
             });
         }

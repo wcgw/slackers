@@ -49,10 +49,11 @@ pub struct ThreadSummary {
 pub struct Reaction {
     /// What people reacted with.
     pub emoji: Emoji,
-    /// How many people reacted with it; at least one.
+    /// Who reacted with it, in the order Slack lists them. A Message's history names only the first 50 people, so
+    /// this may leave some out: see [`Reaction::unnamed`].
+    pub users: Vec<UserId>,
+    /// How many people reacted with it; at least one, and never fewer than `users` names.
     pub count: u32,
-    /// Whether the user is one of them.
-    pub mine: bool,
 }
 
 /// A file shared in a Message.
@@ -62,6 +63,8 @@ pub struct File {
     pub name: String,
     /// Its media type, such as `image/png`; empty when Slack didn't say.
     pub mimetype: String,
+    /// Where it opens in a browser; `None` when Slack gave no link, as for a file hidden from the user.
+    pub link: Option<String>,
     /// How to show it inline; `None` unless it's an image Slack made a rendition of.
     pub image: Option<Image>,
 }
@@ -75,6 +78,14 @@ pub struct Image {
     pub width: u32,
     /// Its height, in pixels.
     pub height: u32,
+}
+
+impl Reaction {
+    /// How many of the people who reacted [`Reaction::users`] leaves out.
+    pub fn unnamed(&self) -> u32 {
+        let named = u32::try_from(self.users.len()).unwrap_or(u32::MAX);
+        self.count.saturating_sub(named)
+    }
 }
 
 impl Message {

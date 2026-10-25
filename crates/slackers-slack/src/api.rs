@@ -8,14 +8,15 @@ use reqwest::{RequestBuilder, StatusCode};
 use serde::de::DeserializeOwned;
 use serde_json::{Value, json};
 use slackers_model::{
-    Activity, Conversation, ConversationId, CustomEmojiSet, Message, Ts, UserId, WorkspaceId,
+    Activity, Conversation, ConversationId, CustomEmojiSet, Message, Reaction, Ts, UserId,
+    WorkspaceId,
 };
 use tokio::sync::Semaphore;
 
 use crate::session::{HistoryPage, Part, Person, Snapshot, User};
 use crate::wire::{
-    AuthTest, ConversationInfo, Counts, EmojiList, History, PeopleSearch, Posted, Replies,
-    ThreadView, UserBoot, UserInfo,
+    AuthTest, ConversationInfo, Counts, EmojiList, History, PeopleSearch, Posted, ReactedTo,
+    Replies, ThreadView, UserBoot, UserInfo,
 };
 use crate::{Credentials, Error};
 
@@ -142,7 +143,7 @@ impl Api {
         );
         // Signing in can do without Followed Threads.
         let followed = match threads {
-            Ok(view) => view.into_followed(&auth.me()),
+            Ok(view) => view.into_followed(),
             Err(error) => {
                 tracing::warn!(%error, "couldn't list followed threads");
                 Vec::new()
@@ -156,7 +157,6 @@ impl Api {
         &self,
         conversation: &ConversationId,
         before: Option<Ts>,
-        me: &UserId,
     ) -> Result<HistoryPage, Error> {
         let latest = before.map(|ts| ts.to_string()).unwrap_or_default();
         let mut params = vec![("channel", conversation.as_str()), ("limit", "100")];
@@ -164,7 +164,7 @@ impl Api {
             params.extend([("latest", latest.as_str()), ("inclusive", "false")]);
         }
         let history: History = self.call("conversations.history", &params).await?;
-        Ok(history.into_page(me))
+        Ok(history.into_page())
     }
 
     /// The Conversation `id` as the sidebar lists it, with its Activity up to its Read Marker; `None` when the
@@ -190,7 +190,6 @@ impl Api {
         conversation: &ConversationId,
         thread: Option<Ts>,
         text: &[Part],
-        me: &UserId,
     ) -> Result<Message, Error> {
         let text = crate::mrkdwn::write(text);
         let parent = thread.map(|ts| ts.to_string());
@@ -200,8 +199,26 @@ impl Api {
         }
         let posted: Posted = self.call("chat.postMessage", &params).await?;
         posted
-            .into_message(me)
+            .into_message()
             .ok_or_else(|| Error::refused("chat.postMessage", "unreadable_message"))
+    }
+
+    /// Every reaction to the Message at `ts`, naming everyone who reacted.
+    pub(crate) async fn reactions(
+        &self,
+        conversation: &ConversationId,
+        ts: Ts,
+    ) -> Result<Vec<Reaction>, Error> {
+        let ts = ts.to_string();
+        let params = [
+            ("channel", conversation.as_str()),
+            ("timestamp", ts.as_str()),
+            ("full", "true"),
+        ];
+        let reacted: ReactedTo = self.call("reactions.get", &params).await?;
+        reacted
+            .into_reactions()
+            .ok_or_else(|| Error::refused("reactions.get", "unreadable_message"))
     }
 
     /// The Thread started by the Message at `parent`: the parent first, then its Replies, oldest first. Stops after
@@ -210,7 +227,6 @@ impl Api {
         &self,
         conversation: &ConversationId,
         parent: Ts,
-        me: &UserId,
     ) -> Result<Vec<Message>, Error> {
         let parent = parent.to_string();
         let mut messages = Vec::new();
@@ -228,7 +244,7 @@ impl Api {
                 )
                 .await?;
             let next = page.next_cursor().to_owned();
-            messages.extend(page.into_messages(me));
+            messages.extend(page.into_messages());
             if next.is_empty() || messages.len() > MAX_REPLIES {
                 return Ok(messages);
             }

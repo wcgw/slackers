@@ -12,6 +12,7 @@ use slackers_model::{
 
 use crate::mrkdwn;
 use crate::session::{FollowedThread, HistoryPage, LiveEvent, Person, Snapshot, User};
+use crate::web::Permalinks;
 
 /// Slack's timestamp text as a [`Ts`]; anything unparsable, such as an absent `latest`, reads as zero.
 fn ts(text: &str) -> Ts {
@@ -23,13 +24,8 @@ pub(crate) struct AuthTest {
     /// The team id, or the enterprise id for an org-level session.
     team_id: String,
     user_id: String,
-}
-
-impl AuthTest {
-    /// The signed-in user.
-    pub(crate) fn me(&self) -> UserId {
-        UserId::new(&self.user_id)
-    }
+    /// Where the Workspace is on the web, such as `https://example.slack.com/`.
+    url: String,
 }
 
 /// `subscriptions.thread.getView`'s reply: the Followed Threads with the latest Replies, newest first.
@@ -58,8 +54,8 @@ struct ThreadState {
 }
 
 impl ThreadView {
-    /// The Threads the user follows; `me` decides which reactions are theirs.
-    pub(crate) fn into_followed(self, me: &UserId) -> Vec<FollowedThread> {
+    /// The Threads the user follows.
+    pub(crate) fn into_followed(self) -> Vec<FollowedThread> {
         self.threads
             .into_iter()
             .filter_map(|thread| {
@@ -70,7 +66,7 @@ impl ThreadView {
                 let (read, latest) = (ts(&state.last_read), ts(&state.latest_reply));
                 Some(FollowedThread {
                     conversation: ConversationId::new(state.channel),
-                    parent: message(thread.root_msg, me)?,
+                    parent: message(thread.root_msg)?,
                     activity: Activity::counted(read, latest, latest > read, 0),
                 })
             })
@@ -224,6 +220,7 @@ pub(crate) fn snapshot(
         name: boot.team.name,
         icon,
         me: UserId::new(auth.user_id),
+        permalinks: Permalinks::new(auth.url),
         conversations,
         followed_threads,
     }
@@ -323,11 +320,8 @@ impl Replies {
             .map_or("", |metadata| metadata.next_cursor.as_str())
     }
 
-    pub(crate) fn into_messages(self, me: &UserId) -> impl Iterator<Item = Message> {
-        let me = me.clone();
-        self.messages
-            .into_iter()
-            .filter_map(move |m| message(m, &me))
+    pub(crate) fn into_messages(self) -> impl Iterator<Item = Message> {
+        self.messages.into_iter().filter_map(message)
     }
 }
 
@@ -340,13 +334,9 @@ pub(crate) struct History {
 }
 
 impl History {
-    pub(crate) fn into_page(self, me: &UserId) -> HistoryPage {
+    pub(crate) fn into_page(self) -> HistoryPage {
         HistoryPage {
-            messages: self
-                .messages
-                .into_iter()
-                .filter_map(|m| message(m, me))
-                .collect(),
+            messages: self.messages.into_iter().filter_map(message).collect(),
             has_more: self.has_more,
         }
     }
@@ -448,6 +438,9 @@ struct WireFile {
     /// A GIF's animated rendition, as big as `thumb_360`.
     #[serde(default)]
     thumb_360_gif: Option<String>,
+    /// Its page in the web client.
+    #[serde(default)]
+    permalink: Option<String>,
 }
 
 impl WireFile {
@@ -484,7 +477,7 @@ struct WireReaction {
 }
 
 /// One Message, as `conversations.history` lists it or the socket sends it; `None` when it's malformed.
-fn message(value: Value, me: &UserId) -> Option<Message> {
+fn message(value: Value) -> Option<Message> {
     let wire: WireMessage = serde_json::from_value(value)
         .inspect_err(
             |error| tracing::warn!(%error, "skipping a message slack sent in an unknown shape"),
@@ -516,10 +509,13 @@ fn message(value: Value, me: &UserId) -> Option<Message> {
     let reactions = wire
         .reactions
         .into_iter()
-        .map(|reaction| Reaction {
-            mine: reaction.users.iter().any(|user| user == me.as_str()),
-            emoji: reaction_emoji(&reaction.name),
-            count: reaction.count.max(1),
+        .map(|reaction| {
+            let named = u32::try_from(reaction.users.len()).unwrap_or(u32::MAX);
+            Reaction {
+                emoji: reaction_emoji(&reaction.name),
+                count: reaction.count.max(named).max(1),
+                users: reaction.users.into_iter().map(UserId::new).collect(),
+            }
         })
         .collect();
     let files = wire
@@ -529,6 +525,7 @@ fn message(value: Value, me: &UserId) -> Option<Message> {
             image: file.image(),
             name: file.name,
             mimetype: file.mimetype,
+            link: file.permalink.filter(|link| !link.is_empty()),
         })
         .collect();
     Some(Message {
@@ -799,8 +796,21 @@ pub(crate) struct Posted {
 
 impl Posted {
     /// The Message as Slack stored it; `None` if it came back in an unknown shape.
-    pub(crate) fn into_message(self, me: &UserId) -> Option<Message> {
-        message(self.message, me)
+    pub(crate) fn into_message(self) -> Option<Message> {
+        message(self.message)
+    }
+}
+
+/// `reactions.get`'s reply: the Message reacted to.
+#[derive(Deserialize)]
+pub(crate) struct ReactedTo {
+    message: Value,
+}
+
+impl ReactedTo {
+    /// The Message's reactions; `None` if it came back in an unknown shape.
+    pub(crate) fn into_reactions(self) -> Option<Vec<Reaction>> {
+        Some(message(self.message)?.reactions)
     }
 }
 
@@ -818,6 +828,9 @@ struct WireUser {
     real_name: String,
     #[serde(default)]
     deleted: bool,
+    /// Their time zone's IANA name, such as `Europe/Paris`.
+    #[serde(default)]
+    tz: Option<String>,
     #[serde(default)]
     profile: Profile,
 }
@@ -853,6 +866,9 @@ struct Profile {
     display_name: String,
     #[serde(default)]
     real_name: String,
+    /// What they do, such as their job title.
+    #[serde(default)]
+    title: String,
     #[serde(default)]
     image_48: Option<String>,
 }
@@ -862,8 +878,11 @@ impl UserInfo {
         let user = self.user;
         User {
             name: user.display_name(),
+            full_name: user.full_name(),
             id: UserId::new(user.id),
             avatar: user.profile.image_48.filter(|url| !url.is_empty()),
+            title: user.profile.title,
+            time_zone: user.tz.filter(|zone| !zone.is_empty()),
         }
     }
 }
@@ -923,8 +942,8 @@ pub(crate) enum SocketMessage {
     Ignored,
 }
 
-/// Interprets one frame from the live socket; `me` decides which reactions are the user's.
-pub(crate) fn socket_message(frame: &str, me: &UserId) -> SocketMessage {
+/// Interprets one frame from the live socket.
+pub(crate) fn socket_message(frame: &str) -> SocketMessage {
     let Ok(event) = serde_json::from_str::<Value>(frame) else {
         return SocketMessage::Ignored;
     };
@@ -935,7 +954,7 @@ pub(crate) fn socket_message(frame: &str, me: &UserId) -> SocketMessage {
         "reconnect_url" => return SocketMessage::ReconnectUrl(text("url").to_owned()),
         "message" => match text("subtype") {
             "message_changed" => {
-                let Some(edited) = message(event["message"].clone(), me) else {
+                let Some(edited) = message(event["message"].clone()) else {
                     return SocketMessage::Ignored;
                 };
                 LiveEvent::Edited {
@@ -949,7 +968,7 @@ pub(crate) fn socket_message(frame: &str, me: &UserId) -> SocketMessage {
             },
             "message_replied" => return SocketMessage::Ignored,
             _ => {
-                let Some(posted) = message(event.clone(), me) else {
+                let Some(posted) = message(event.clone()) else {
                     return SocketMessage::Ignored;
                 };
                 LiveEvent::Posted {
@@ -964,7 +983,7 @@ pub(crate) fn socket_message(frame: &str, me: &UserId) -> SocketMessage {
             ),
             ts: ts(event["item"]["ts"].as_str().unwrap_or_default()),
             emoji: reaction_emoji(text("reaction")),
-            mine: text("user") == me.as_str(),
+            user: UserId::new(text("user")),
             change: if kind == "reaction_added" {
                 ReactionChange::Added
             } else {
@@ -1032,8 +1051,10 @@ mod tests {
 
     #[test]
     fn the_sidebar_comes_from_counts_named_from_boot() {
-        let auth: AuthTest =
-            serde_json::from_value(json!({"team_id": "E1", "user_id": "UME"})).unwrap();
+        let auth: AuthTest = serde_json::from_value(
+            json!({"team_id": "E1", "user_id": "UME", "url": "https://org.slack.com/"}),
+        )
+        .unwrap();
         let boot: UserBoot = serde_json::from_value(json!({
             "self": {"id": "UME"},
             "team": {"name": "Org", "icon": {"image_34": "https://i/34.png", "image_44": "https://i/44.png"}},
@@ -1068,6 +1089,10 @@ mod tests {
             ("E1", "Org", "UME")
         );
         assert_eq!(snapshot.icon.as_deref(), Some("https://i/44.png"));
+        assert_eq!(
+            snapshot.permalinks,
+            Permalinks::new("https://org.slack.com/")
+        );
         let listed: Vec<(&str, &ConversationKind, &str)> = snapshot
             .conversations
             .iter()
@@ -1100,28 +1125,28 @@ mod tests {
 
     #[test]
     fn rich_text_blocks_become_the_content() {
-        let message = message(
-            json!({
-                "ts": "100.000001", "user": "U1", "text": "fallback ignored",
-                "blocks": [{"type": "rich_text", "elements": [
-                    {"type": "rich_text_section", "elements": [
-                        {"type": "text", "text": "hi ", "style": {"bold": true}},
-                        {"type": "emoji", "name": "wave", "unicode": "1f44b", "skin_tone": 3},
-                        {"type": "user", "user_id": "UME"},
-                        {"type": "link", "url": "https://x", "text": ""},
-                        {"type": "something_new"}
-                    ]},
-                    {"type": "rich_text_list", "style": "ordered", "elements": [
-                        {"type": "rich_text_section", "elements": [{"type": "text", "text": "one"}]}
-                    ]},
-                    {"type": "rich_text_preformatted", "elements": [{"type": "text", "text": "code"}]}
-                ]}],
-                "reactions": [{"name": "+1::skin-tone-2", "count": 2, "users": ["U1", "UME"]}],
-                "reply_count": 3, "latest_reply": "200.000000", "thread_ts": "100.000001",
-                "edited": {"user": "U1", "ts": "101.000000"}
-            }),
-            &me(),
-        )
+        let message = message(json!({
+            "ts": "100.000001", "user": "U1", "text": "fallback ignored",
+            "blocks": [{"type": "rich_text", "elements": [
+                {"type": "rich_text_section", "elements": [
+                    {"type": "text", "text": "hi ", "style": {"bold": true}},
+                    {"type": "emoji", "name": "wave", "unicode": "1f44b", "skin_tone": 3},
+                    {"type": "user", "user_id": "UME"},
+                    {"type": "link", "url": "https://x", "text": ""},
+                    {"type": "something_new"}
+                ]},
+                {"type": "rich_text_list", "style": "ordered", "elements": [
+                    {"type": "rich_text_section", "elements": [{"type": "text", "text": "one"}]}
+                ]},
+                {"type": "rich_text_preformatted", "elements": [{"type": "text", "text": "code"}]}
+            ]}],
+            "reactions": [
+                {"name": "+1::skin-tone-2", "count": 52, "users": ["U1", "UME"]},
+                {"name": "tada", "count": 1, "users": ["U1", "U2"]}
+            ],
+            "reply_count": 3, "latest_reply": "200.000000", "thread_ts": "100.000001",
+            "edited": {"user": "U1", "ts": "101.000000"}
+        }))
         .unwrap();
 
         assert_eq!(message.author, Author::User(UserId::new("U1")));
@@ -1165,29 +1190,27 @@ mod tests {
                 Block::Preformatted("code".into()),
             ]
         );
-        let thumbs = &message.reactions[0];
+        let reactions: Vec<_> = message
+            .reactions
+            .iter()
+            .map(|r| (r.emoji.name.as_str(), r.emoji.skin_tone, r.count))
+            .collect();
+        assert_eq!(reactions, [("+1", Some(2), 52), ("tada", None, 2)]);
         assert_eq!(
-            (
-                thumbs.emoji.name.as_str(),
-                thumbs.emoji.skin_tone,
-                thumbs.count,
-                thumbs.mine
-            ),
-            ("+1", Some(2), 2, true)
+            message.reactions[0].users,
+            [UserId::new("U1"), me()],
+            "only the first are listed"
         );
     }
 
     #[test]
     fn bots_without_rich_text_use_mrkdwn_and_attachments() {
-        let message = message(
-            json!({
-                "ts": "1.000000", "subtype": "bot_message", "username": "CI", "text": "*build* failed",
-                "icons": {"image_48": "https://a/48.png"},
-                "blocks": [{"type": "section", "text": {"type": "mrkdwn", "text": "ignored"}}],
-                "attachments": [{"fallback": "details"}]
-            }),
-            &me(),
-        )
+        let message = message(json!({
+            "ts": "1.000000", "subtype": "bot_message", "username": "CI", "text": "*build* failed",
+            "icons": {"image_48": "https://a/48.png"},
+            "blocks": [{"type": "section", "text": {"type": "mrkdwn", "text": "ignored"}}],
+            "attachments": [{"fallback": "details"}]
+        }))
         .unwrap();
         assert_eq!(
             message.author,
@@ -1219,15 +1242,10 @@ mod tests {
 
     #[test]
     fn replies_point_at_their_parent_unless_broadcast() {
-        let reply = message(
-            json!({"ts": "2.0", "user": "U1", "thread_ts": "1.0"}),
-            &me(),
-        )
-        .unwrap();
+        let reply = message(json!({"ts": "2.0", "user": "U1", "thread_ts": "1.0"})).unwrap();
         assert_eq!(reply.reply_to, Some(seconds(1)));
         let broadcast = message(
             json!({"ts": "2.0", "user": "U1", "thread_ts": "1.0", "subtype": "thread_broadcast"}),
-            &me(),
         )
         .unwrap();
         assert_eq!(broadcast.reply_to, None);
@@ -1235,19 +1253,13 @@ mod tests {
 
     #[test]
     fn socket_frames_become_live_events() {
+        assert_eq!(socket_message(r#"{"type":"hello"}"#), SocketMessage::Hello);
         assert_eq!(
-            socket_message(r#"{"type":"hello"}"#, &me()),
-            SocketMessage::Hello
-        );
-        assert_eq!(
-            socket_message(r#"{"type":"reconnect_url","url":"wss://again"}"#, &me()),
+            socket_message(r#"{"type":"reconnect_url","url":"wss://again"}"#),
             SocketMessage::ReconnectUrl("wss://again".into())
         );
         assert_eq!(
-            socket_message(
-                r#"{"type":"im_marked","channel":"D1","ts":"5.000000"}"#,
-                &me()
-            ),
+            socket_message(r#"{"type":"im_marked","channel":"D1","ts":"5.000000"}"#),
             SocketMessage::Live(LiveEvent::Marked {
                 conversation: ConversationId::new("D1"),
                 up_to: seconds(5)
@@ -1255,14 +1267,13 @@ mod tests {
         );
         assert_eq!(
             socket_message(
-                r#"{"type":"reaction_added","user":"UME","reaction":"tada","item":{"type":"message","channel":"C1","ts":"7.000000"}}"#,
-                &me()
+                r#"{"type":"reaction_added","user":"UME","reaction":"tada","item":{"type":"message","channel":"C1","ts":"7.000000"}}"#
             ),
             SocketMessage::Live(LiveEvent::Reacted {
                 conversation: ConversationId::new("C1"),
                 ts: seconds(7),
                 emoji: Emoji::named("tada"),
-                mine: true,
+                user: me(),
                 change: ReactionChange::Added,
             })
         );
@@ -1271,7 +1282,6 @@ mod tests {
             message,
         }) = socket_message(
             r#"{"type":"message","channel":"C1","user":"U2","text":"hi","ts":"8.000000"}"#,
-            &me(),
         )
         else {
             panic!("expected a posted message")
@@ -1279,8 +1289,7 @@ mod tests {
         assert_eq!((conversation.as_str(), message.ts), ("C1", seconds(8)));
         assert_eq!(
             socket_message(
-                r#"{"type":"message","subtype":"message_deleted","channel":"C1","deleted_ts":"8.000000"}"#,
-                &me()
+                r#"{"type":"message","subtype":"message_deleted","channel":"C1","deleted_ts":"8.000000"}"#
             ),
             SocketMessage::Live(LiveEvent::Deleted {
                 conversation: ConversationId::new("C1"),
@@ -1288,25 +1297,22 @@ mod tests {
             })
         );
         assert_eq!(
-            socket_message(r#"{"type":"user_typing"}"#, &me()),
+            socket_message(r#"{"type":"user_typing"}"#),
             SocketMessage::Ignored
         );
         assert_eq!(
-            socket_message(
-                r#"{"type":"channel_joined","channel":{"id":"C9","name":"new"}}"#,
-                &me()
-            ),
+            socket_message(r#"{"type":"channel_joined","channel":{"id":"C9","name":"new"}}"#),
             SocketMessage::Appeared(ConversationId::new("C9"))
         );
         assert_eq!(
-            socket_message(r#"{"type":"im_open","user":"U2","channel":"D9"}"#, &me()),
+            socket_message(r#"{"type":"im_open","user":"U2","channel":"D9"}"#),
             SocketMessage::Appeared(ConversationId::new("D9"))
         );
         assert_eq!(
-            socket_message(r#"{"type":"mpim_joined"}"#, &me()),
+            socket_message(r#"{"type":"mpim_joined"}"#),
             SocketMessage::Ignored
         );
-        assert_eq!(socket_message("not json", &me()), SocketMessage::Ignored);
+        assert_eq!(socket_message("not json"), SocketMessage::Ignored);
     }
 
     #[test]
@@ -1365,8 +1371,7 @@ mod tests {
     #[test]
     fn image_files_show_their_best_rendition() {
         let image = |file: Value| {
-            let posted =
-                message(json!({"ts": "1.0", "user": "U1", "files": [file]}), &me()).unwrap();
+            let posted = message(json!({"ts": "1.0", "user": "U1", "files": [file]})).unwrap();
             posted.files[0].image.clone()
         };
         let rendition = |url: &str, width, height| {
@@ -1407,6 +1412,43 @@ mod tests {
     }
 
     #[test]
+    fn reactions_got_in_full_name_everyone() {
+        let reacted: ReactedTo = serde_json::from_value(json!({
+            "ok": true, "type": "message", "channel": "C1",
+            "message": {"ts": "1.000000", "user": "U1", "text": "hi",
+                        "reactions": [{"name": "tada", "count": 3, "users": ["U1", "U2", "UME"]}]}
+        }))
+        .unwrap();
+        let reactions = reacted.into_reactions().unwrap();
+        assert_eq!(
+            reactions
+                .iter()
+                .map(|r| (r.emoji.name.as_str(), r.users.len(), r.count))
+                .collect::<Vec<_>>(),
+            [("tada", 3, 3)]
+        );
+        let unreadable: ReactedTo =
+            serde_json::from_value(json!({"message": {"text": "no ts"}})).unwrap();
+        assert_eq!(unreadable.into_reactions(), None);
+    }
+
+    #[test]
+    fn files_link_to_their_page_when_slack_gives_one() {
+        let link = |file: Value| {
+            let posted = message(json!({"ts": "1.0", "user": "U1", "files": [file]})).unwrap();
+            posted.files[0].link.clone()
+        };
+        assert_eq!(
+            link(json!({"name": "a.pdf", "permalink": "https://x.slack.com/files/U1/F1/a.pdf"})),
+            Some("https://x.slack.com/files/U1/F1/a.pdf".into())
+        );
+        assert_eq!(
+            link(json!({"name": "gone", "mode": "hidden_by_limit"})),
+            None
+        );
+    }
+
+    #[test]
     fn image_blocks_show_inline_when_slack_measured_them() {
         let posted = message(
             json!({"ts": "1.0", "bot_id": "B1", "text": "fallback", "blocks": [
@@ -1416,7 +1458,6 @@ mod tests {
                 {"type": "image", "image_url": "https://unmeasured.example/i.png", "alt_text": "?"},
                 {"type": "context", "elements": []}
             ]}),
-            &me(),
         )
         .unwrap();
         assert_eq!(
@@ -1448,7 +1489,7 @@ mod tests {
             ]
         }))
         .unwrap();
-        let followed = view.into_followed(&me());
+        let followed = view.into_followed();
         let parents: Vec<Ts> = followed.iter().map(|thread| thread.parent.ts).collect();
         assert_eq!(
             parents,
@@ -1470,7 +1511,7 @@ mod tests {
         };
         let (conversation, parent) = (ConversationId::new("C1"), seconds(10));
         assert_eq!(
-            socket_message(&frame("thread_marked", "thread"), &me()),
+            socket_message(&frame("thread_marked", "thread")),
             SocketMessage::Live(LiveEvent::ThreadMarked {
                 conversation: conversation.clone(),
                 parent,
@@ -1478,7 +1519,7 @@ mod tests {
             })
         );
         assert_eq!(
-            socket_message(&frame("thread_subscribed", "thread"), &me()),
+            socket_message(&frame("thread_subscribed", "thread")),
             SocketMessage::Live(LiveEvent::ThreadFollowed {
                 conversation: conversation.clone(),
                 parent,
@@ -1486,14 +1527,14 @@ mod tests {
             })
         );
         assert_eq!(
-            socket_message(&frame("thread_unsubscribed", "thread"), &me()),
+            socket_message(&frame("thread_unsubscribed", "thread")),
             SocketMessage::Live(LiveEvent::ThreadUnfollowed {
                 conversation,
                 parent
             })
         );
         assert_eq!(
-            socket_message(&frame("thread_marked", "channel"), &me()),
+            socket_message(&frame("thread_marked", "channel")),
             SocketMessage::Ignored
         );
     }
@@ -1510,7 +1551,7 @@ mod tests {
         }))
         .unwrap();
         assert_eq!(page.next_cursor(), "abc");
-        let replies: Vec<Option<Ts>> = page.into_messages(&me()).map(|m| m.reply_to).collect();
+        let replies: Vec<Option<Ts>> = page.into_messages().map(|m| m.reply_to).collect();
         assert_eq!(replies, [None, Some(seconds(1))]);
     }
 
@@ -1518,8 +1559,7 @@ mod tests {
     fn an_edited_reply_is_passed_on() {
         let frame = r#"{"type":"message","subtype":"message_changed","channel":"C1",
             "message":{"ts":"2.000000","user":"U2","text":"fixed","thread_ts":"1.000000","edited":{"user":"U2","ts":"3.0"}}}"#;
-        let SocketMessage::Live(LiveEvent::Edited { message, .. }) = socket_message(frame, &me())
-        else {
+        let SocketMessage::Live(LiveEvent::Edited { message, .. }) = socket_message(frame) else {
             panic!("expected an edit")
         };
         assert_eq!((message.reply_to, message.edited), (Some(seconds(1)), true));
@@ -1528,7 +1568,9 @@ mod tests {
     #[test]
     fn users_are_named_by_display_name_first() {
         let info: UserInfo = serde_json::from_value(json!({
-            "user": {"id": "U1", "name": "handle", "real_name": "Real", "profile": {"display_name": "", "real_name": "Profile Real", "image_48": "https://a/u1.png"}}
+            "user": {"id": "U1", "name": "handle", "real_name": "Real", "tz": "Europe/Paris",
+                     "profile": {"display_name": "", "real_name": "Profile Real", "title": "Engineer",
+                                 "image_48": "https://a/u1.png"}}
         }))
         .unwrap();
         assert_eq!(
@@ -1536,8 +1578,18 @@ mod tests {
             User {
                 id: UserId::new("U1"),
                 name: "Profile Real".into(),
+                full_name: "Profile Real".into(),
+                title: "Engineer".into(),
+                time_zone: Some("Europe/Paris".into()),
                 avatar: Some("https://a/u1.png".into()),
             }
+        );
+        let bare: UserInfo =
+            serde_json::from_value(json!({"user": {"id": "U2", "tz": ""}})).unwrap();
+        let bare = bare.into_user();
+        assert_eq!(
+            (bare.name.as_str(), bare.title.as_str(), bare.time_zone),
+            ("U2", "", None)
         );
     }
 

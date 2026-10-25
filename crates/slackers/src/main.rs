@@ -32,6 +32,8 @@ use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use anyhow::{Context as _, Result, ensure};
+use base64::Engine as _;
+use base64::engine::general_purpose::STANDARD as BASE64;
 use crossterm::cursor::{Hide, Show};
 use crossterm::event::{
     DisableFocusChange, EnableFocusChange, EventStream, KeyboardEnhancementFlags,
@@ -265,6 +267,21 @@ impl Effects {
                             .send(Inbox::App(Event::SaveFailed(format!("{error:#}"))));
                     }
                 }
+                Command::Open(url) => {
+                    let inbox = self.inbox.clone();
+                    drop(tokio::spawn(async move {
+                        if let Err(error) = open(&url).await {
+                            tracing::warn!(error = format!("{error:#}"), "couldn't open a link");
+                            let _ = inbox.send(Inbox::App(Event::OpenFailed(format!("{error:#}"))));
+                        }
+                    }));
+                }
+                Command::Copy(text) => {
+                    // OSC 52: the terminal puts the text on the clipboard, even over ssh.
+                    let mut stdout = io::stdout().lock();
+                    write!(stdout, "\x1b]52;c;{}\x07", BASE64.encode(text))?;
+                    stdout.flush()?;
+                }
                 Command::Edit { place, text } => {
                     // The old stream's reader thread would steal the editor's keystrokes: drop it now. The new
                     // one reads nothing until the loop polls it, after the editor exits.
@@ -306,6 +323,26 @@ impl Effects {
             .send(Inbox::App(Event::Edited { place, outcome }));
         Ok(())
     }
+}
+
+/// Opens `url` in the user's browser, as the desktop opens links: with `open` on macOS, `xdg-open` elsewhere. Its
+/// output is discarded, so that it can't draw over the app.
+async fn open(url: &str) -> Result<()> {
+    let program = if cfg!(target_os = "macos") {
+        "open"
+    } else {
+        "xdg-open"
+    };
+    let status = tokio::process::Command::new(program)
+        .arg(url)
+        .stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .status()
+        .await
+        .with_context(|| format!("couldn't run {program}"))?;
+    ensure!(status.success(), "{program} exited with {status}");
+    Ok(())
 }
 
 /// Writes `text` to `path`, readable by the user alone, runs `editor` on it (a program, optionally followed by

@@ -45,6 +45,10 @@ What the user is writing in a Conversation or a Thread, not posted yet. Each Con
 own.
 _Avoid_: composer (that's the box a Draft is written in)
 
+**Reaction**:
+An emoji that people added to a Message, shown once per emoji with how many added it and who.
+_Avoid_: emoji (a Reaction uses one)
+
 **Custom Emoji**:
 An image, possibly animated, that a Workspace defines under a `:name:`.
 _Avoid_: reaction (a reaction uses an emoji; it isn't one)

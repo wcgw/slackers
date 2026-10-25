@@ -13,14 +13,14 @@ use ratatui::widgets::{Block, Borders, Clear, Paragraph, Wrap};
 use slackers_gfx::{CellBox, Fit};
 use slackers_model::{
     Activity, Author, Block as TextBlock, Broadcast, Conversation, ConversationKind, Emoji, File,
-    Image, Inline, Message, RichText, Style as TextStyle, Timeline, Ts,
+    Image, Inline, Message, Reaction, RichText, Style as TextStyle, Timeline, Ts,
 };
 use slackers_slack::Connection;
 use unicode_width::UnicodeWidthStr as _;
 
 use crate::app::{
-    App, ConversationRef, Drawn, Focus, Mode, Phase, Place, Suggestions, WantedPicture, Workspace,
-    WorkspaceKey,
+    App, ConversationRef, Details, Drawn, Focus, LinkKind, Mode, Phase, Place, Suggestions,
+    WantedPicture, Workspace, WorkspaceKey,
 };
 use crate::draft::{Draft, Mentioned};
 use crate::emoji::Drawable;
@@ -50,6 +50,9 @@ const IMAGE: CellBox = CellBox { cols: 60, rows: 15 };
 
 /// The widest the list of whom to @-mention gets, in cells.
 const SUGGESTIONS_WIDTH: u16 = 48;
+
+/// The widest a Message's details get, in cells.
+const DETAILS_WIDTH: u16 = 80;
 
 /// Messages by the same author less than this far apart share one header.
 const GROUP_WITHIN: u64 = 5 * 60 * 1_000_000;
@@ -708,10 +711,183 @@ fn draw_pane(
             },
         );
     }
+    if let Mode::Details(details) = &app.mode
+        && details.place == view.place
+    {
+        // Out of the way of the Message they're about: above it when it's in the bottom half, else below.
+        let middle = usize::from(top) + (selected_rows.start + selected_rows.end) / 2;
+        let at_top = !selected_rows.is_empty()
+            && middle >= usize::from(body.y) + usize::from(body.height) / 2;
+        draw_details(frame, body, at_top, app, details, zone, drawn);
+    }
     if let Some(suggestions) = suggestions {
         draw_suggestions(frame, body, suggestions);
     }
     Some(settled)
+}
+
+/// Draws the details of a Message over the top or bottom of `area`: who wrote it and when, who reacted, and where
+/// it leads, the link `Enter` opens highlighted.
+fn draw_details(
+    frame: &mut Frame<'_>,
+    area: Rect,
+    at_top: bool,
+    app: &App,
+    details: &Details,
+    zone: &TimeZone,
+    drawn: &mut Drawn,
+) {
+    let Some((workspace, message)) = app.message(&details.place, details.ts) else {
+        return;
+    };
+    let width = area.width.min(DETAILS_WIDTH);
+    let room = width.saturating_sub(2);
+    let mut renderer = Renderer::new(
+        app,
+        workspace,
+        details.place.conversation.workspace,
+        room,
+        zone,
+    );
+
+    let mut header = renderer.header(&message.author);
+    if let Author::User(id) = &message.author
+        && let Some(user) = workspace.users.get(id)
+    {
+        for detail in [&user.full_name, &user.title] {
+            if !detail.is_empty() && *detail != user.name {
+                header.push(Span::styled(format!(" · {detail}"), DIM));
+            }
+        }
+        let theirs = user.time_zone.as_deref();
+        if let Some(time) = theirs.and_then(|theirs| their_time(theirs, zone, Timestamp::now())) {
+            header.push(Span::styled(format!(" · {time} for them"), DIM));
+        }
+    }
+    let mut posted = zoned(message.ts, zone)
+        .map(|z| z.strftime("%a %d %b %Y %H:%M").to_string())
+        .unwrap_or_default();
+    if message.edited {
+        posted.push_str(" · edited");
+    }
+    let mut lines = vec![
+        Line::from(header),
+        Line::from(vec![Span::raw("   "), Span::styled(posted, DIM)]),
+    ];
+    let links = workspace.links(&details.place.conversation.id, message);
+    let reactions = &message.reactions;
+    if !reactions.is_empty() {
+        // Cut the reactions short, rather than push who wrote the Message or where it leads out of the box.
+        let around = lines.len() + 2 + links.len();
+        let fit = usize::from(area.height.saturating_sub(2)).saturating_sub(around);
+        let shown = if reactions.len() > fit {
+            fit.saturating_sub(1)
+        } else {
+            reactions.len()
+        };
+        lines.push(Line::default());
+        lines.extend(
+            reactions
+                .iter()
+                .take(shown)
+                .map(|reaction| renderer.reactors(reaction, room)),
+        );
+        if shown < reactions.len() {
+            let more = format!("   … {} more", reactions.len() - shown);
+            lines.push(Line::styled(more, DIM));
+        }
+    }
+    lines.push(Line::default());
+    let first_link = lines.len();
+    for (index, link) in links.iter().enumerate() {
+        let number = if index < 9 {
+            format!("{} ", index + 1)
+        } else {
+            "  ".to_owned()
+        };
+        let icon = match link.kind {
+            LinkKind::Web => icons::LINK,
+            LinkKind::File => icons::FILE,
+            LinkKind::Message => icons::SLACK,
+        };
+        let mut spans = vec![
+            Span::styled(number, DIM),
+            Span::styled(icon, ACCENT),
+            Span::raw(link.label.clone()),
+        ];
+        if link.kind == LinkKind::Web && link.label != link.url {
+            spans.push(Span::styled(format!("  {}", host(&link.url)), DIM));
+        }
+        let line = Line::from(spans);
+        lines.push(if index == details.selected {
+            line.patch_style(SELECTED)
+        } else {
+            line
+        });
+    }
+    drawn.wanted_pictures.extend(renderer.wanted);
+    drawn.next_change = earliest(drawn.next_change, renderer.next_change);
+
+    let rows = u16::try_from(lines.len()).unwrap_or(u16::MAX);
+    let height = rows.saturating_add(2).min(area.height);
+    let popup = Rect {
+        y: if at_top {
+            area.y
+        } else {
+            area.bottom() - height
+        },
+        height,
+        width,
+        ..area
+    };
+    let block = Block::bordered().border_style(DIM);
+    let inner = block.inner(popup);
+    frame.render_widget(Clear, popup);
+    frame.render_widget(block, popup);
+    // Keep the selected link in view.
+    let skip = (first_link + details.selected + 1).saturating_sub(usize::from(inner.height));
+    let shown: Vec<Line<'static>> = lines.into_iter().skip(skip).collect();
+    frame.render_widget(Paragraph::new(shown), inner);
+}
+
+/// Where a web link goes, in short: its host.
+fn host(url: &str) -> &str {
+    let rest = url.split_once("://").map_or(url, |(_, rest)| rest);
+    rest.split(['/', '?', '#']).next().unwrap_or(rest)
+}
+
+/// The time at `now` where someone in the time zone named `theirs` is, unless it's the same as in `ours`.
+fn their_time(theirs: &str, ours: &TimeZone, now: Timestamp) -> Option<String> {
+    let there = now.to_zoned(TimeZone::get(theirs).ok()?);
+    let here = now.to_zoned(ours.clone());
+    (there.offset() != here.offset()).then(|| there.strftime("%H:%M").to_string())
+}
+
+/// Who reacted: as many of `names` as fit in `room` cells, then how many of the `count` people who reacted that
+/// leaves out, as in "Ada, Bob and 3 others".
+fn who(names: &[&str], count: usize, room: usize) -> String {
+    let others = |named: usize| match (count.saturating_sub(named), named) {
+        (0, _) => String::new(),
+        (1, 0) => "1 person".to_owned(),
+        (left, 0) => format!("{left} people"),
+        (1, _) => " and 1 other".to_owned(),
+        (left, _) => format!(" and {left} others"),
+    };
+    let mut listed = String::new();
+    let mut named = 0;
+    for name in names.iter().take(count) {
+        let longer = if named == 0 {
+            (*name).to_owned()
+        } else {
+            format!("{listed}, {name}")
+        };
+        if longer.width() + others(named + 1).width() > room {
+            break;
+        }
+        listed = longer;
+        named += 1;
+    }
+    listed + &others(named)
 }
 
 /// Draws the list of whom to @-mention over the bottom left of `area`, just above the draft, the selected one
@@ -954,7 +1130,11 @@ impl<'a> Renderer<'a> {
             let mut pieces = Vec::new();
             for reaction in &message.reactions {
                 pieces.push(self.emoji(&reaction.emoji));
-                let style = if reaction.mine { MENTION } else { DIM };
+                let style = if reaction.users.contains(&self.workspace.me) {
+                    MENTION
+                } else {
+                    DIM
+                };
                 pieces.push(Piece::Text(format!(" {}  ", reaction.count), style));
             }
             content.extend(wrap(pieces, self.width).into_iter().map(Line::from));
@@ -1172,6 +1352,41 @@ impl<'a> Renderer<'a> {
             .collect()
     }
 
+    /// A reaction's line in a Message's details, `width` cells wide: its emoji, how many reacted, and who, "you"
+    /// for the user.
+    fn reactors(&mut self, reaction: &Reaction, width: u16) -> Line<'static> {
+        let mut spans = Vec::new();
+        let mut used = 0;
+        let count = Piece::Text(format!(" {}  ", reaction.count), DIM);
+        for piece in [self.emoji(&reaction.emoji), count] {
+            let (span, cells) = match piece {
+                Piece::Atom(span, cells) => (span, usize::from(cells)),
+                Piece::Text(text, style) => {
+                    let cells = text.width();
+                    (Span::styled(text, style), cells)
+                }
+            };
+            spans.push(span);
+            used += cells;
+        }
+        let me = &self.workspace.me;
+        let names: Vec<&str> = reaction
+            .users
+            .iter()
+            .map(|user| {
+                if user == me {
+                    "you"
+                } else {
+                    self.workspace.user_name(user)
+                }
+            })
+            .collect();
+        let count = usize::try_from(reaction.count).unwrap_or(usize::MAX);
+        let room = usize::from(width).saturating_sub(used);
+        spans.push(Span::raw(who(&names, count, room)));
+        Line::from(spans)
+    }
+
     fn emoji(&mut self, emoji: &Emoji) -> Piece {
         match self.workspace.emojis.drawable(emoji, &self.app.pictures) {
             Drawable::Text(text) => Piece::Atom(
@@ -1216,7 +1431,7 @@ fn draw_status(frame: &mut Frame<'_>, area: Rect, app: &App) {
             );
             return;
         }
-        Mode::Normal | Mode::Insert => {}
+        Mode::Normal | Mode::Insert | Mode::Details(_) => {}
     }
     let mut left = Vec::new();
     if app.mode == Mode::Insert {
@@ -1235,16 +1450,17 @@ fn draw_status(frame: &mut Frame<'_>, area: Rect, app: &App) {
         ]);
     }
     let hints = match (&app.mode, app.focus) {
+        (Mode::Details(_), _) => "j/k choose · ⏎ open · 1-9 open · y copy · esc close",
         (Mode::Insert, _) if app.suggestions.is_some() => "↑/↓ choose · ⇥/⏎ mention · esc normal",
         (Mode::Insert, _) => "⏎ send · ⇧⏎ new line · ^x^e $EDITOR · esc normal",
         (_, Focus::Sidebar) => {
             "j/k select · ⏎ open · za fold · / search · \\ hide · i write · :q quit"
         }
         (_, Focus::Timeline) => {
-            "j/k message · ⏎ thread · ^e/^y line · ^d/^u page · g/G · i write · \\ sidebar · :q quit"
+            "j/k message · ⏎ thread · K details · o open · ^e/^y line · ^d/^u page · g/G · i write · \\ sidebar · :q quit"
         }
         (_, Focus::Thread) => {
-            "j/k message · ^e/^y line · i reply · esc close · \\ sidebar · :q quit"
+            "j/k message · K details · o open · ^e/^y line · i reply · esc close · \\ sidebar · :q quit"
         }
     };
     let left = Line::from(left);
@@ -1362,7 +1578,7 @@ mod tests {
     use ratatui::Terminal;
     use ratatui::backend::TestBackend;
     use slackers_model::{Activity, ConversationId, Message, RichText, Ts, UserId, WorkspaceId};
-    use slackers_slack::{HistoryPage, Snapshot, Update};
+    use slackers_slack::{HistoryPage, Permalinks, Snapshot, Update};
 
     use super::*;
     use crate::app::Event;
@@ -1458,6 +1674,7 @@ mod tests {
             name: name.into(),
             icon: icon.map(str::to_owned),
             me: UserId::new("UME"),
+            permalinks: Permalinks::new("https://test.slack.com/"),
             conversations,
             followed_threads: Vec::new(),
         }))
@@ -1562,6 +1779,9 @@ mod tests {
         let ana = slackers_slack::User {
             id: UserId::new("U2"),
             name: "Ana".into(),
+            full_name: String::new(),
+            title: String::new(),
+            time_zone: None,
             avatar: Some("https://a/ana.png".into()),
         };
         app.update(Event::Slack(w(0), Update::User(ana)));
@@ -1615,6 +1835,7 @@ mod tests {
         let shot = File {
             name: "shot.png".into(),
             mimetype: "image/png".into(),
+            link: None,
             image: Some(Image {
                 url: "https://f/shot.png".into(),
                 width: 300,
@@ -1989,6 +2210,7 @@ mod tests {
             name: "Test".into(),
             icon: None,
             me: UserId::new("UME"),
+            permalinks: Permalinks::new("https://test.slack.com/"),
             conversations: vec![channel("C1", "general")],
             followed_threads: vec![thread],
         };
@@ -2016,5 +2238,135 @@ mod tests {
         let mut app = reading_general();
         type_text(&mut app, ":q");
         assert!(screen(&app).last().unwrap().starts_with(":q"));
+    }
+
+    #[test]
+    fn who_reacted_names_as_many_as_fit_and_counts_the_rest() {
+        let names = ["Ada", "Bob", "you"];
+        assert_eq!(who(&names, 3, 40), "Ada, Bob, you");
+        assert_eq!(who(&names, 5, 40), "Ada, Bob, you and 2 others");
+        assert_eq!(who(&names, 4, 40), "Ada, Bob, you and 1 other");
+        assert_eq!(
+            who(&names, 5, "Ada, Bob and 3 others".len()),
+            "Ada, Bob and 3 others"
+        );
+        assert_eq!(who(&names, 5, 8), "5 people", "not even one name fits");
+        assert_eq!(who(&[], 1, 8), "1 person");
+    }
+
+    #[test]
+    fn someone_elses_time_shows_only_when_it_differs_from_ours() {
+        let midnight_utc: Timestamp = "2026-01-01T00:00:00Z".parse().unwrap();
+        assert_eq!(
+            their_time("Asia/Tokyo", &TimeZone::UTC, midnight_utc),
+            Some("09:00".into())
+        );
+        assert_eq!(their_time("Etc/UTC", &TimeZone::UTC, midnight_utc), None);
+        assert_eq!(
+            their_time("Nowhere/Land", &TimeZone::UTC, midnight_utc),
+            None
+        );
+    }
+
+    #[test]
+    fn many_reactions_give_way_to_who_wrote_the_message_and_where_it_leads() {
+        let mut app = reading_general();
+        let reactions = [
+            "wave", "tada", "eyes", "rocket", "fire", "heart", "100", "pray",
+        ]
+        .into_iter()
+        .map(|name| Reaction {
+            emoji: Emoji::named(name),
+            users: vec![UserId::new("U4")],
+            count: 1,
+        })
+        .collect();
+        let message = Message {
+            reactions,
+            ..reading_general_message()
+        };
+        let edited = slackers_slack::LiveEvent::Edited {
+            conversation: ConversationId::new("C1"),
+            message,
+        };
+        app.update(Event::Slack(w(0), Update::Live(edited)));
+
+        type_text(&mut app, "K");
+        let (rows, _, _) = render_at(&app, WIDTH, 13);
+        let found = |text: &str| rows.iter().any(|row| row.contains(text));
+        assert!(found("Tue 14 Nov 2023"), "{rows:#?}");
+        assert!(found("… 5 more"), "{rows:#?}");
+        assert!(found("this message in Slack"), "{rows:#?}");
+    }
+
+    #[test]
+    fn a_messages_details_name_who_reacted_and_where_it_leads() {
+        let mut app = reading_general();
+        for (id, name, full_name) in [("U2", "Ana", "Ana Lima"), ("U4", "Bob", "")] {
+            let user = slackers_slack::User {
+                id: UserId::new(id),
+                name: name.into(),
+                full_name: full_name.into(),
+                title: "Engineer".into(),
+                time_zone: None,
+                avatar: None,
+            };
+            app.update(Event::Slack(w(0), Update::User(user)));
+        }
+        let message = Message {
+            content: RichText {
+                blocks: vec![TextBlock::Paragraph(vec![Inline::Link {
+                    url: "https://docs.rs/ratatui/latest".into(),
+                    label: Some("the docs".into()),
+                }])],
+            },
+            reactions: vec![Reaction {
+                emoji: Emoji::named("wave"),
+                users: vec![UserId::new("U4"), UserId::new("UME")],
+                count: 2,
+            }],
+            edited: true,
+            ..reading_general_message()
+        };
+        let edited = slackers_slack::LiveEvent::Edited {
+            conversation: ConversationId::new("C1"),
+            message,
+        };
+        app.update(Event::Slack(w(0), Update::Live(edited)));
+
+        type_text(&mut app, "K");
+        let (rows, _, buffer) = render_sized(&app, WIDTH);
+        let row_of = |text: &str| {
+            rows.iter()
+                .position(|row| row.contains(text))
+                .unwrap_or_else(|| panic!("no {text:?} in {rows:#?}"))
+        };
+        let author = row_of("Ana · Ana Lima · Engineer");
+        assert!(rows[author + 1].contains("· edited"), "{rows:#?}");
+        let reactors = row_of("2  Bob, you");
+        let docs = row_of("1 ");
+        assert!(rows[docs].contains("the docs  docs.rs"), "{rows:#?}");
+        assert!(author < reactors && reactors < docs, "{rows:#?}");
+        assert!(rows[docs + 1].contains("2 "), "{rows:#?}");
+        assert!(
+            rows[docs + 1].contains("this message in Slack"),
+            "{rows:#?}"
+        );
+        let column = rows[docs].find("the docs").unwrap();
+        let x = u16::try_from(rows[docs][..column].chars().count()).unwrap();
+        let y = u16::try_from(docs).unwrap();
+        assert_eq!(
+            buffer[(x, y)].bg,
+            SELECTED.bg.unwrap(),
+            "the first link is selected"
+        );
+        assert!(rows.last().unwrap().contains("esc close"), "{rows:#?}");
+
+        type_text(&mut app, "q");
+        assert!(
+            !screen(&app)
+                .iter()
+                .any(|row| row.contains("this message in Slack"))
+        );
     }
 }

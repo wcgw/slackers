@@ -1,7 +1,7 @@
 use std::collections::BTreeMap;
 use std::collections::btree_map::Entry;
 
-use crate::{Emoji, Message, Reaction, ThreadSummary, Ts};
+use crate::{Emoji, Message, Reaction, ThreadSummary, Ts, UserId};
 
 /// The Messages slackers holds for one Conversation, or for one Thread in it: oldest first, at most one per
 /// [`Ts`].
@@ -116,8 +116,9 @@ impl Timeline {
         self.messages.remove(&ts);
     }
 
-    /// Applies a reaction with `emoji` to the Message at `ts`, if held. `mine` says whether the user reacted.
-    pub fn react(&mut self, ts: Ts, emoji: &Emoji, mine: bool, change: ReactionChange) {
+    /// Applies `user`'s reaction with `emoji`, or their taking it back, to the Message at `ts`, if held. Hearing of
+    /// the same change twice changes nothing more.
+    pub fn react(&mut self, ts: Ts, emoji: &Emoji, user: &UserId, change: ReactionChange) {
         let Some(message) = self.messages.get_mut(&ts) else {
             return;
         };
@@ -128,25 +129,38 @@ impl Timeline {
         match (change, existing) {
             (ReactionChange::Added, Some(at)) => {
                 let reaction = &mut message.reactions[at];
-                reaction.count += 1;
-                reaction.mine |= mine;
+                if !reaction.users.contains(user) {
+                    reaction.users.push(user.clone());
+                    reaction.count += 1;
+                }
             }
             (ReactionChange::Added, None) => {
                 message.reactions.push(Reaction {
                     emoji: emoji.clone(),
+                    users: vec![user.clone()],
                     count: 1,
-                    mine,
                 });
             }
             (ReactionChange::Removed, Some(at)) => {
                 let reaction = &mut message.reactions[at];
-                reaction.count = reaction.count.saturating_sub(1);
-                reaction.mine &= !mine;
+                let listed = reaction.users.len();
+                reaction.users.retain(|listed| listed != user);
+                // Someone not listed may be among those the list leaves out.
+                if reaction.users.len() < listed || reaction.unnamed() > 0 {
+                    reaction.count -= 1;
+                }
                 if reaction.count == 0 {
                     message.reactions.remove(at);
                 }
             }
             (ReactionChange::Removed, None) => {}
+        }
+    }
+
+    /// Replaces the reactions to the Message at `ts`, if held.
+    pub fn set_reactions(&mut self, ts: Ts, reactions: Vec<Reaction>) {
+        if let Some(message) = self.messages.get_mut(&ts) {
+            message.reactions = reactions;
         }
     }
 
@@ -312,18 +326,63 @@ mod tests {
     }
 
     #[test]
-    fn reactions_count_up_and_down() {
+    fn reactions_count_up_and_down_once_per_person() {
         let mut timeline = Timeline::default();
         timeline.insert(message(10, "hi"));
         let wave = Emoji::named("wave");
+        let (ada, bob) = (UserId::new("UADA"), UserId::new("UBOB"));
+        let reaction = |timeline: &Timeline| {
+            let reaction = timeline.get(ts(10)).unwrap().reactions.first().cloned();
+            reaction.map(|r| (r.users, r.count))
+        };
 
-        timeline.react(ts(10), &wave, false, ReactionChange::Added);
-        timeline.react(ts(10), &wave, true, ReactionChange::Added);
+        timeline.react(ts(10), &wave, &ada, ReactionChange::Added);
+        timeline.react(ts(10), &wave, &bob, ReactionChange::Added);
+        timeline.react(ts(10), &wave, &bob, ReactionChange::Added);
+        assert_eq!(
+            reaction(&timeline),
+            Some((vec![ada.clone(), bob.clone()], 2))
+        );
+
+        timeline.react(ts(10), &wave, &ada, ReactionChange::Removed);
+        timeline.react(ts(10), &wave, &ada, ReactionChange::Removed);
+        assert_eq!(reaction(&timeline), Some((vec![bob.clone()], 1)));
+        timeline.react(ts(10), &wave, &bob, ReactionChange::Removed);
+        assert_eq!(reaction(&timeline), None);
+    }
+
+    #[test]
+    fn someone_left_out_of_a_long_list_of_reactions_still_counts() {
+        let mut timeline = Timeline::default();
+        let wave = Emoji::named("wave");
+        let (ada, bob) = (UserId::new("UADA"), UserId::new("UBOB"));
+        timeline.insert(Message {
+            reactions: vec![Reaction {
+                emoji: wave.clone(),
+                users: vec![ada.clone()],
+                count: 3,
+            }],
+            ..message(10, "hi")
+        });
+
+        timeline.react(ts(10), &wave, &bob, ReactionChange::Removed);
         let reaction = &timeline.get(ts(10)).unwrap().reactions[0];
-        assert_eq!((reaction.count, reaction.mine), (2, true));
+        assert_eq!((reaction.count, reaction.unnamed()), (2, 1));
 
-        timeline.react(ts(10), &wave, true, ReactionChange::Removed);
-        timeline.react(ts(10), &wave, false, ReactionChange::Removed);
-        assert!(timeline.get(ts(10)).unwrap().reactions.is_empty());
+        timeline.set_reactions(
+            ts(10),
+            vec![Reaction {
+                emoji: wave.clone(),
+                users: vec![ada.clone(), bob.clone()],
+                count: 2,
+            }],
+        );
+        timeline.react(ts(10), &wave, &UserId::new("UCAT"), ReactionChange::Removed);
+        let reaction = &timeline.get(ts(10)).unwrap().reactions[0];
+        assert_eq!(
+            (reaction.count, reaction.unnamed()),
+            (2, 0),
+            "everyone is listed: someone else can't take a reaction back"
+        );
     }
 }
