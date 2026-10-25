@@ -27,6 +27,9 @@ impl ImageId {
     }
 }
 
+/// The largest [`ImageId`]: ids fit in a truecolor foreground's 24 bits.
+const MAX_ID: u32 = 0x00FF_FFFF;
+
 /// Hands out [`ImageId`]s, from any thread.
 #[derive(Debug, Default)]
 pub struct Ids {
@@ -42,7 +45,7 @@ impl Ids {
     pub(crate) fn next(&self) -> ImageId {
         // Relaxed is enough: the counter only needs to hand out each value once.
         let id = self.last.fetch_add(1, Ordering::Relaxed) + 1;
-        assert!(id <= 0x00FF_FFFF, "fewer than 2^24 images were uploaded");
+        assert!(id <= MAX_ID, "fewer than 2^24 images were uploaded");
         ImageId(id)
     }
 }
@@ -119,8 +122,13 @@ pub(crate) fn delete(out: &mut Vec<u8>, id: ImageId) {
     out.extend_from_slice(format!("\x1b_Ga=d,d=I,i={},q=2\x1b\\", id.0).as_bytes());
 }
 
-/// The command that deletes every image and placement, freeing their memory in the terminal.
-pub(crate) const DELETE_ALL: &[u8] = b"\x1b_Ga=d,d=A,q=2\x1b\\";
+/// The command that deletes every image with an id slackers can give (1 to [`MAX_ID`]) and their placements, freeing
+/// their memory in the terminal.
+///
+/// It names them by id because deleting "all" (`d=A`) leaves virtual placements, which every picture of slackers
+/// has, and so their images too: Ghostty 1.3.1 skips them. Left over, a later run that gives the same ids would
+/// replace those images but keep their placements, drawing its pictures at the old placements' sizes.
+pub(crate) const DELETE_ALL: &[u8] = b"\x1b_Ga=d,d=R,x=1,y=16777215,q=2\x1b\\";
 
 /// Most rows or columns a placeholder can address: one per diacritic.
 pub(crate) const MAX_CELLS: u16 = DIACRITICS.len() as u16;
@@ -211,6 +219,14 @@ mod tests {
                 (control.to_owned(), payload.to_owned())
             })
             .collect()
+    }
+
+    #[test]
+    fn deleting_all_names_every_id_there_is_rather_than_what_shows() {
+        assert_eq!(
+            commands(DELETE_ALL),
+            [(format!("a=d,d=R,x=1,y={MAX_ID},q=2"), String::new())]
+        );
     }
 
     #[test]

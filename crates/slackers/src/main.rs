@@ -78,10 +78,12 @@ fn main() -> Result<()> {
 
     let mut terminal = ratatui::try_init()?;
     terminal_extras(true)?;
+    // An earlier run may have left pictures in this screen, under the ids this one is about to give.
+    slackers_gfx::forget_all(&mut io::stdout())?;
     let cell = CellSize::query();
     let app = App::new(labels, config.virtual_workspaces, cell);
     let outcome = runtime.block_on(run(&mut terminal, app, credentials, config_path, cell));
-    // Best effort on the way out: the terminal drops these with its screen anyway.
+    // Best effort on the way out; the next run clears what's left.
     let _ = terminal_extras(false);
     let _ = slackers_gfx::forget_all(&mut io::stdout());
     ratatui::restore();

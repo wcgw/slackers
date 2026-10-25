@@ -13,7 +13,9 @@ use std::io::{self, Write};
 pub use kitty::Ids;
 pub use picture::{CellBox, CellSize, Error, Fit, Picture, Prepared, prepare};
 
-/// Deletes every picture from the terminal, freeing its memory. Call it before leaving.
+/// Deletes every picture from the terminal, freeing its memory: this run's, and any an earlier run left behind, as one
+/// that crashed does. Call it on entering the terminal's alternate screen, before sending any picture, and before
+/// leaving it.
 ///
 /// # Errors
 ///
