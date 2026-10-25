@@ -14,7 +14,7 @@ use slackers_gfx::{CellBox, Fit};
 use slackers_model::{
     Author, Block as TextBlock, Broadcast, Button, Conversation, ConversationId, ConversationKind,
     Emoji, File, Happened, Image, Inline, MentionOf, Message, Reaction, RichText,
-    Style as TextStyle, Timeline, Ts, Unread,
+    Style as TextStyle, Timeline, Ts, Unread, UserId,
 };
 use slackers_slack::Connection;
 use unicode_width::UnicodeWidthStr as _;
@@ -825,6 +825,15 @@ fn draw_pane(
 ) -> Option<Settled> {
     let [header, body] = Layout::vertical([Constraint::Length(1), Constraint::Fill(1)]).areas(area);
     frame.render_widget(Paragraph::new(view.title.clone()), header);
+    let typists = app.typing.at(&view.place, app.animation_time());
+    drawn.next_change = earliest(drawn.next_change, typists.changes);
+    // Right of the title, when there's room.
+    if let Some(typing) = typing(workspace, &typists.who)
+        && view.title.width() + 2 + typing.width() <= usize::from(header.width)
+    {
+        let typing = Line::styled(typing, DIM.add_modifier(Modifier::ITALIC));
+        frame.render_widget(Paragraph::new(typing).alignment(Alignment::Right), header);
+    }
     let body = body.inner(Margin {
         horizontal: 1,
         vertical: 0,
@@ -1809,6 +1818,17 @@ fn connections(app: &App) -> Vec<Span<'static>> {
         ]
     } else {
         spans
+    }
+}
+
+/// What says that `who` are typing, by name; `None` when nobody is.
+fn typing(workspace: &Workspace, who: &[&UserId]) -> Option<String> {
+    let name = |id: &UserId| workspace.user_name(id).to_owned();
+    match who {
+        [] => None,
+        [one] => Some(format!("{} is typing…", name(one))),
+        [one, other] => Some(format!("{} and {} are typing…", name(one), name(other))),
+        _ => Some("several people are typing…".to_owned()),
     }
 }
 
@@ -3067,6 +3087,53 @@ mod tests {
             after.contains(&format!("{} giphy", icons::BOT)),
             "{after:?}"
         );
+    }
+
+    #[test]
+    fn whoever_is_typing_shows_right_of_the_panes_title_while_there_is_room() {
+        let mut app = reading_general();
+        for (id, name) in [("U2", "Ana"), ("U3", "Bob")] {
+            let user = slackers_slack::User {
+                id: UserId::new(id),
+                name: name.into(),
+                full_name: String::new(),
+                title: String::new(),
+                time_zone: None,
+                avatar: None,
+            };
+            app.update(Event::Slack(w(0), Update::User(user)));
+        }
+        let typing = |user: &str| {
+            let typing = slackers_slack::LiveEvent::Typing {
+                conversation: ConversationId::new("C1"),
+                thread: None,
+                user: UserId::new(user),
+            };
+            Event::Slack(w(0), Update::Live(typing))
+        };
+        let (rows, drawn) = render(&app);
+        assert!(!rows[0].contains("typing"), "{:?}", rows[0]);
+        assert_eq!(drawn.next_change, None);
+
+        app.update(typing("U2"));
+        let (rows, drawn) = render(&app);
+        assert!(
+            rows[0].trim_end().ends_with("Ana is typing…"),
+            "{:?}",
+            rows[0]
+        );
+        assert!(rows[0].contains("general"), "{:?}", rows[0]);
+        let changes = drawn.next_change.expect("drawn again once it's over");
+        assert!(changes > app.animation_time(), "{changes:?}");
+
+        app.update(typing("U3"));
+        assert!(screen(&app)[0].contains("Ana and Bob are typing…"));
+        app.update(typing("U4"));
+        assert!(screen(&app)[0].contains("several people are typing…"));
+
+        let (rows, _, _) = render_sized(&app, 56);
+        assert!(!rows[0].contains("typing"), "no room: {:?}", rows[0]);
+        assert!(rows[0].contains("general"), "{:?}", rows[0]);
     }
 
     #[test]

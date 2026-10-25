@@ -459,6 +459,15 @@ pub enum LiveEvent {
         /// Added or taken back.
         change: ReactionChange,
     },
+    /// Someone is typing, as their client says every few seconds while they do; nothing says when they stop.
+    Typing {
+        /// Where.
+        conversation: ConversationId,
+        /// The Thread, by its parent; `None` for the Conversation itself.
+        thread: Option<Ts>,
+        /// Who.
+        user: UserId,
+    },
     /// The user's Read Marker moved, in this or another client.
     Marked {
         /// Where.

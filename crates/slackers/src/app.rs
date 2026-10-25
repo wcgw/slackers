@@ -15,6 +15,8 @@
 //! While the terminal window doesn't have focus, a DM, a Message that mentions the user, or a Reply in one of their
 //! Followed Threads shows a desktop notification.
 //!
+//! Whoever is typing in a pane's Conversation or Thread shows on its title row.
+//!
 //! A Draft starting with `/` and a word runs that slash command rather than posting: `/` brings up the Workspace's
 //! commands to choose from, as `@` does people. Starting it with a space posts it as text instead. When the command
 //! posts for the user elsewhere, as `/dm @someone hi` does, slackers follows it there.
@@ -53,6 +55,7 @@ use crate::pane::{Pane, Settled};
 use crate::pictures::Pictures;
 use crate::search::{self, Finder};
 use crate::sidebar::{Fold, Item, Row, Section, Sidebar};
+use crate::typing::Typing;
 
 /// The most people and broadcasts offered to @-mention at once, and the most emoji.
 const SUGGESTIONS: usize = 8;
@@ -601,6 +604,8 @@ pub(crate) struct App {
     pub(crate) focus: Focus,
     /// Every Workspace's Activity, and where the user is in it.
     pub(crate) activity: Activity,
+    /// Who's typing where, in every Workspace.
+    pub(crate) typing: Typing,
     /// How many more pages of history to load to reach the open Conversation's selected Message, which an Activity
     /// item opened.
     jump_pages: u32,
@@ -669,6 +674,7 @@ impl App {
             thread_pane: Pane::default(),
             focus: Focus::Sidebar,
             activity: Activity::default(),
+            typing: Typing::default(),
             jump_pages: 0,
             sidebar_shown: true,
             drafts: HashMap::new(),
@@ -2446,8 +2452,16 @@ impl App {
     }
 
     fn live(&mut self, key: WorkspaceKey, event: LiveEvent, commands: &mut Vec<Command>) {
+        let now = self.animation_time();
         let Some(workspace) = self.workspaces.get_mut(key) else {
             return;
+        };
+        let place = |conversation: &ConversationId, thread| Place {
+            conversation: ConversationRef {
+                workspace: key,
+                id: conversation.clone(),
+            },
+            thread,
         };
         let mut joined = false;
         // Where a slash command the user ran posted for them.
@@ -2489,6 +2503,10 @@ impl App {
                     });
                 }
                 workspace.want_names_in(key, [&message], commands);
+                if let Author::User(author) = &message.author {
+                    self.typing
+                        .posted(&place(&conversation, message.reply_to), author);
+                }
                 let kind = workspace.conversation(&conversation).map(|c| &c.kind);
                 let is_dm = matches!(kind, Some(ConversationKind::Dm { .. }));
                 let in_followed = message.reply_to.is_some_and(|parent| {
@@ -2549,6 +2567,17 @@ impl App {
                     && author.as_ref() == Some(&workspace.me);
                 for timeline in workspace.timelines_of(&conversation) {
                     timeline.react(ts, &emoji, &user, change);
+                }
+            }
+            LiveEvent::Typing {
+                conversation,
+                thread,
+                user,
+            } => {
+                // The user's own, from another client, is no news to them.
+                if user != workspace.me {
+                    workspace.want_users(key, [user.clone()], commands);
+                    self.typing.heard(place(&conversation, thread), user, now);
                 }
             }
             LiveEvent::Marked {
@@ -5592,6 +5621,44 @@ mod tests {
             }),
         ));
         assert_eq!(app.open_conversation(), Some(&c("C2")));
+    }
+
+    #[test]
+    fn typing_shows_where_it_is_until_the_typist_posts_there() {
+        let mut app = reading_random();
+        let typing = |user: &str, thread: Option<u64>| {
+            slack(Update::Live(LiveEvent::Typing {
+                conversation: id("C2"),
+                thread: thread.map(seconds),
+                user: UserId::new(user),
+            }))
+        };
+        let commands = app.update(typing("U3", None));
+        assert!(
+            commands.contains(&ask(Request::User(UserId::new("U3")))),
+            "to name them"
+        );
+        app.update(typing("UME", None));
+        app.update(typing("U2", Some(5)));
+        let who = |app: &App, thread| -> Vec<UserId> {
+            let now = app.animation_time();
+            let typists = app.typing.at(&place("C2", thread), now);
+            typists.who.into_iter().cloned().collect()
+        };
+        assert_eq!(who(&app, None), [UserId::new("U3")], "not the user's own");
+        assert_eq!(who(&app, Some(5)), [UserId::new("U2")]);
+
+        app.update(slack(Update::Live(LiveEvent::Posted {
+            conversation: id("C2"),
+            message: Message {
+                reply_to: Some(seconds(5)),
+                ..message(8, "U2", RichText::plain("done"))
+            },
+        })));
+        assert!(who(&app, Some(5)).is_empty());
+        assert_eq!(who(&app, None), [UserId::new("U3")]);
+        app.update(posted_at("C2", seconds(9), "U3"));
+        assert!(who(&app, None).is_empty());
     }
 
     #[test]

@@ -22,6 +22,7 @@ mod pictures;
 mod search;
 mod sidebar;
 mod theme;
+mod typing;
 mod view;
 
 use std::collections::HashMap;

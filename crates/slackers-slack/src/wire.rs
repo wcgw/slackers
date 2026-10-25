@@ -1408,6 +1408,11 @@ pub(crate) fn socket_message(frame: &str) -> SocketMessage {
                 }
             }
         },
+        "user_typing" if !text("user").is_empty() => LiveEvent::Typing {
+            conversation: conversation(),
+            thread: event["thread_ts"].as_str().map(ts),
+            user: UserId::new(text("user")),
+        },
         kind @ ("reaction_added" | "reaction_removed") => LiveEvent::Reacted {
             conversation: ConversationId::new(
                 event["item"]["channel"].as_str().unwrap_or_default(),
@@ -1768,7 +1773,26 @@ mod tests {
         );
         assert_eq!(
             socket_message(r#"{"type":"user_typing"}"#),
-            SocketMessage::Ignored
+            SocketMessage::Ignored,
+            "nobody's typing"
+        );
+        assert_eq!(
+            socket_message(r#"{"type":"user_typing","channel":"C1","id":1,"user":"U2"}"#),
+            SocketMessage::Live(LiveEvent::Typing {
+                conversation: ConversationId::new("C1"),
+                thread: None,
+                user: UserId::new("U2"),
+            })
+        );
+        assert_eq!(
+            socket_message(
+                r#"{"type":"user_typing","channel":"C1","id":1,"user":"U2","thread_ts":"5.000000"}"#
+            ),
+            SocketMessage::Live(LiveEvent::Typing {
+                conversation: ConversationId::new("C1"),
+                thread: Some(seconds(5)),
+                user: UserId::new("U2"),
+            })
         );
         assert_eq!(
             socket_message(r#"{"type":"channel_joined","channel":{"id":"C9","name":"new"}}"#),
