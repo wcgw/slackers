@@ -290,6 +290,11 @@ impl Effects {
                     write!(stdout, "\x1b]52;c;{}\x07", BASE64.encode(text))?;
                     stdout.flush()?;
                 }
+                Command::Notify { title, body } => {
+                    let mut stdout = io::stdout().lock();
+                    stdout.write_all(notification(&title, &body).as_bytes())?;
+                    stdout.flush()?;
+                }
                 Command::Edit { place, text } => {
                     // The old stream's reader thread would steal the editor's keystrokes: drop it now. The new
                     // one reads nothing until the loop polls it, after the editor exits.
@@ -331,6 +336,29 @@ impl Effects {
             .send(Inbox::App(Event::Edited { place, outcome }));
         Ok(())
     }
+}
+
+/// The OSC 777 sequence asking the terminal for a desktop notification titled `title`, saying `body`. They come from
+/// other people, so control characters, which could end the sequence early and start another, are dropped; and so
+/// are semicolons from the title, which would end it. Both are cut short to keep within the 2048 bytes Ghostty takes.
+fn notification(title: &str, body: &str) -> String {
+    let printable = |text: &str| -> String { text.chars().filter(|c| !c.is_control()).collect() };
+    let title = cut(&printable(title).replace(';', ","), 256);
+    let body = cut(&printable(body), 1024);
+    format!("\x1b]777;notify;{title};{body}\x07")
+}
+
+/// `text`, cut at a character boundary to at most `bytes` bytes, ellipsis included, when it's longer.
+fn cut(text: &str, bytes: usize) -> String {
+    if text.len() <= bytes {
+        return text.to_owned();
+    }
+    let room = bytes.saturating_sub('…'.len_utf8());
+    let end = (0..=room)
+        .rev()
+        .find(|&at| text.is_char_boundary(at))
+        .unwrap_or(0);
+    format!("{}…", &text[..end])
 }
 
 /// Opens `url` in the user's browser, as the desktop opens links: with `open` on macOS, `xdg-open` elsewhere. Its
@@ -419,6 +447,20 @@ fn start_logging() -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_notification_cannot_end_its_sequence_early_nor_run_long() {
+        assert_eq!(
+            notification("Ana; in #general", "a;b \x1b]52;c;evil\x07 \u{9b}done"),
+            "\x1b]777;notify;Ana, in #general;a;b ]52;c;evil done\x07"
+        );
+        let long = notification(&"é".repeat(500), &"日本".repeat(1000));
+        assert!(long.len() < 2048, "{}", long.len());
+        let parts: Vec<&str> = long.trim_end_matches('\x07').splitn(4, ';').collect();
+        assert!(parts[2].len() <= 256 && parts[2].ends_with('…'));
+        assert!(parts[3].len() <= 1024 && parts[3].ends_with('…'));
+        assert_eq!(cut("short", 10), "short");
+    }
 
     /// A scratch directory holding a fake editor that runs `script` on its file argument (`$1`).
     fn fake_editor(name: &str, script: &str) -> (PathBuf, String) {

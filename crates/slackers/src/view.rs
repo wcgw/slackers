@@ -233,7 +233,7 @@ fn activity_item(
                     String::new()
                 }
             };
-            Span::raw(by + &gist(workspace, &message.content))
+            Span::raw(by + &workspace.gist(&message.content))
         }
         Fetched::Unasked => {
             drawn
@@ -582,7 +582,7 @@ fn thread_row(
     let parent_message = followed
         .and_then(|followed| followed.parent.as_ref())
         .or_else(|| workspace.timelines.get(&conversation.id)?.get(parent));
-    let text = match parent_message.map(|message| gist(workspace, &message.content)) {
+    let text = match parent_message.map(|message| workspace.gist(&message.content)) {
         Some(gist) if !gist.is_empty() => format!("{name}: {gist}"),
         _ => name.to_owned(),
     };
@@ -594,32 +594,6 @@ fn thread_row(
     let marker = workspace_marker(app, conversation.workspace, workspace, drawn);
     let lead = vec![marker, Span::styled(icons::THREAD, icon_style)];
     entry(lead, &text, name_style, &[], badge.span(), width)
-}
-
-/// `text` as one line of plain words: people, Channels and emoji by name, links by their label.
-fn gist(workspace: &Workspace, text: &RichText) -> String {
-    let mut gist = String::new();
-    for inline in text.inlines() {
-        match inline {
-            Inline::Text { text, .. } => gist.push_str(text),
-            Inline::Emoji(emoji) => gist.push_str(&format!(":{}:", emoji.name)),
-            Inline::User(id) => gist.push_str(&format!("@{}", workspace.user_name(id))),
-            Inline::Channel(id) => {
-                let name = workspace
-                    .conversation(id)
-                    .map_or(id.as_str(), |c| c.name.as_str());
-                gist.push_str(&format!("#{name}"));
-            }
-            Inline::Broadcast(broadcast) => gist.push_str(match broadcast {
-                Broadcast::Here => "@here",
-                Broadcast::Channel => "@channel",
-                Broadcast::Everyone => "@everyone",
-            }),
-            Inline::UserGroup(_) => gist.push_str("@group"),
-            Inline::Link { url, label } => gist.push_str(label.as_deref().unwrap_or(url)),
-        }
-    }
-    gist.split_whitespace().collect::<Vec<_>>().join(" ")
 }
 
 /// One sidebar row, `width` cells wide: `lead`, [`LEAD`] cells wide; `name` in `name_style`, its `matched`

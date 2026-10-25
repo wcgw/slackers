@@ -12,6 +12,9 @@
 //! The sidebar's first row opens Activity, merged from every Workspace, newest first: `j`/`k` choose an item and
 //! `Enter` opens its Message, in its Thread if it has one.
 //!
+//! While the terminal window doesn't have focus, a DM, a Message that mentions the user, or a Reply in one of their
+//! Followed Threads shows a desktop notification.
+//!
 //! On a Message, `+` reacts: it lists the emoji the user uses most, which typing narrows down, for `↑`/`↓` to
 //! choose and `Enter` or `Tab` to react with, or to take back one of the user's reactions. `K` shows its details: who wrote it, who reacted, and where it leads (its links, its files and the
 //! Message itself on Slack's web client), for `j`/`k` to choose, `Enter` or `1`-`9` to open and `y` to copy. `o`
@@ -25,7 +28,7 @@ use crossterm::event::{Event as TerminalEvent, KeyCode, KeyEvent, KeyEventKind, 
 use slackers_gfx::{CellSize, Fit, Picture};
 use slackers_model::{
     Author, Broadcast, Conversation, ConversationId, ConversationKind, Emoji, Happened, Inline,
-    Message, MessageRef, ReactionChange, Timeline, Ts, Unread, UserId,
+    Message, MessageRef, ReactionChange, RichText, Timeline, Ts, Unread, UserId,
 };
 use slackers_slack::{
     Connection, EmojiList, Error, LiveEvent, Permalinks, Person, Request, Snapshot, Update, User,
@@ -46,6 +49,9 @@ const SUGGESTIONS: usize = 8;
 /// The most people named per reaction in a Message's details, whose names are looked up: more wouldn't fit on the
 /// reaction's line.
 const NAMED_REACTORS: usize = 12;
+
+/// The most notifications held back until the names in them are known; past that, the oldest go.
+const HELD_NOTIFICATIONS: usize = 20;
 
 /// The most pages of history loaded to reach a Message an Activity item opens.
 const JUMP_PAGES: u32 = 10;
@@ -137,6 +143,13 @@ pub(crate) enum Command {
     Open(String),
     /// Put this text on the clipboard, through the terminal.
     Copy(String),
+    /// Show a desktop notification, through the terminal.
+    Notify {
+        /// Who and where, in a few words.
+        title: String,
+        /// The gist of what.
+        body: String,
+    },
     Quit,
 }
 
@@ -557,8 +570,12 @@ pub(crate) struct App {
     next_post: u64,
     /// The start of a two-key command, if the last key was one.
     pending: Option<Prefix>,
-    /// Whether the terminal window has focus. Messages count as read only while it does.
+    /// Whether the terminal window has focus. Messages count as read only while it does, and notifications show only
+    /// while it doesn't.
     focused: bool,
+    /// Messages to notify of once the names of everyone in them are known, by Workspace and Conversation, oldest
+    /// first; at most [`HELD_NOTIFICATIONS`].
+    held_notifications: Vec<(WorkspaceKey, ConversationId, Message)>,
     /// Whether the open Conversation's pane was on screen at the last draw; a Thread may cover it.
     conversation_shown: bool,
     /// Whether the open Thread's pane was on screen at the last draw.
@@ -607,6 +624,7 @@ impl App {
             next_post: 0,
             pending: None,
             focused: true,
+            held_notifications: Vec::new(),
             conversation_shown: false,
             thread_shown: false,
             finder: Finder::new(),
@@ -653,7 +671,11 @@ impl App {
             Event::Terminal(TerminalEvent::Key(key)) if key.kind == KeyEventKind::Press => {
                 self.key(key, &mut commands);
             }
-            Event::Terminal(TerminalEvent::FocusGained) => self.focused = true,
+            Event::Terminal(TerminalEvent::FocusGained) => {
+                self.focused = true;
+                // Back in front of the user: notifications still held back are moot.
+                self.held_notifications.clear();
+            }
             Event::Terminal(TerminalEvent::FocusLost) => self.focused = false,
             Event::Terminal(_) => {}
             Event::Slack(workspace, update) => self.slack(workspace, update, &mut commands),
@@ -1602,6 +1624,26 @@ impl App {
     }
 
     /// Moves focus to the sidebar, showing it if it's hidden.
+    /// Notifies of the held Messages in the Workspace at `key` whose people all have names now, and keeps holding the
+    /// others.
+    fn notify_held(&mut self, key: WorkspaceKey, commands: &mut Vec<Command>) {
+        let Some(workspace) = self.workspaces.get(key) else {
+            return;
+        };
+        let several = self.workspaces.iter().count() > 1;
+        self.held_notifications
+            .retain(|(held, conversation, message)| {
+                let named = people_in(message)
+                    .iter()
+                    .all(|person| workspace.users.contains_key(person));
+                if *held != key || !named {
+                    return true;
+                }
+                commands.push(workspace.notification(conversation, message, several));
+                false
+            });
+    }
+
     /// Where focus goes beside the sidebar: to what's open there.
     fn beside_sidebar(&self) -> Focus {
         match self.opened {
@@ -2002,6 +2044,7 @@ impl App {
                 if let Some(workspace) = self.workspaces.get_mut(key) {
                     workspace.users.insert(user.id.clone(), user);
                 }
+                self.notify_held(key, commands);
             }
             Update::Reactions {
                 conversation,
@@ -2106,6 +2149,8 @@ impl App {
         let mut joined = false;
         // Whether it may add to the user's Activity, or change it.
         let mut touches_activity = false;
+        // A Message to notify the user of.
+        let mut notify = None;
         match event {
             LiveEvent::Joined {
                 conversation,
@@ -2138,12 +2183,15 @@ impl App {
                     .content
                     .inlines()
                     .any(|inline| matches!(inline, Inline::Broadcast(_)));
-                touches_activity = !message.is_by(&workspace.me)
-                    && (is_dm
-                        || matches!(kind, Some(ConversationKind::GroupDm))
-                        || in_followed
-                        || to_everyone
-                        || message.mentions(&workspace.me));
+                let by_someone_else = !message.is_by(&workspace.me);
+                let in_dm = is_dm || matches!(kind, Some(ConversationKind::GroupDm));
+                let mentions_me = message.mentions(&workspace.me);
+                touches_activity =
+                    by_someone_else && (in_dm || in_followed || to_everyone || mentions_me);
+                // As Slack notifies by default: of DMs, Mentions and Replies in Followed Threads.
+                if by_someone_else && (in_dm || in_followed || mentions_me) && !self.focused {
+                    notify = Some((conversation.clone(), message.clone()));
+                }
                 if let Some(parent) = message.reply_to {
                     workspace.count_reply(&conversation, parent, &message);
                 } else if !message.is_by(&workspace.me)
@@ -2224,6 +2272,13 @@ impl App {
         }
         if touches_activity {
             self.refresh_activity(key, commands);
+        }
+        if let Some((conversation, message)) = notify {
+            self.held_notifications.push((key, conversation, message));
+            if self.held_notifications.len() > HELD_NOTIFICATIONS {
+                self.held_notifications.remove(0);
+            }
+            self.notify_held(key, commands);
         }
     }
 }
@@ -2394,6 +2449,72 @@ impl Workspace {
             Author::User(id) => self.users.get(id)?.avatar.as_deref(),
             Author::Bot { avatar, .. } => avatar.as_deref(),
         }
+    }
+
+    /// `text` as one line of plain words: people, Channels and emoji by name, links by their label.
+    pub(crate) fn gist(&self, text: &RichText) -> String {
+        let mut gist = String::new();
+        for inline in text.inlines() {
+            match inline {
+                Inline::Text { text, .. } => gist.push_str(text),
+                Inline::Emoji(emoji) => gist.push_str(&format!(":{}:", emoji.name)),
+                Inline::User(id) => gist.push_str(&format!("@{}", self.user_name(id))),
+                Inline::Channel(id) => {
+                    let name = self
+                        .conversation(id)
+                        .map_or(id.as_str(), |c| c.name.as_str());
+                    gist.push_str(&format!("#{name}"));
+                }
+                Inline::Broadcast(broadcast) => gist.push_str(match broadcast {
+                    Broadcast::Here => "@here",
+                    Broadcast::Channel => "@channel",
+                    Broadcast::Everyone => "@everyone",
+                }),
+                Inline::UserGroup(_) => gist.push_str("@group"),
+                Inline::Link { url, label } => gist.push_str(label.as_deref().unwrap_or(url)),
+            }
+        }
+        gist.split_whitespace().collect::<Vec<_>>().join(" ")
+    }
+
+    /// A notification of `message`, in `conversation`: who wrote it and where, and its gist. With `several`
+    /// Workspaces signed in to, it names this one too.
+    fn notification(
+        &self,
+        conversation: &ConversationId,
+        message: &Message,
+        several: bool,
+    ) -> Command {
+        let author = match &message.author {
+            Author::User(id) => self.user_name(id).to_owned(),
+            Author::Bot { name, .. } => name.clone(),
+        };
+        let place = self
+            .conversation(conversation)
+            .and_then(|found| match &found.kind {
+                ConversationKind::Channel { .. } => Some(format!("#{}", found.name)),
+                ConversationKind::GroupDm => Some(self.conversation_name(found).to_owned()),
+                ConversationKind::Dm { .. } => None,
+            });
+        let mut title = match (message.reply_to.is_some(), place) {
+            (false, Some(place)) => format!("{author} in {place}"),
+            (true, Some(place)) => format!("{author} in a thread in {place}"),
+            (false, None) => author,
+            (true, None) => format!("{author} in a thread"),
+        };
+        if several {
+            title.push_str(&format!(" · {}", self.name));
+        }
+        let mut body = self.gist(&message.content);
+        if body.is_empty() {
+            let files: Vec<&str> = message
+                .files
+                .iter()
+                .map(|file| file.name.as_str())
+                .collect();
+            body = files.join(", ");
+        }
+        Command::Notify { title, body }
     }
 
     /// What to call `conversation`: a DM after the other person, anything else by its name.
@@ -4596,6 +4717,132 @@ mod tests {
         })));
         app.focus = Focus::Timeline;
         app
+    }
+
+    fn named(id: &str, name: &str) -> Event {
+        slack(Update::User(User {
+            id: UserId::new(id),
+            name: name.into(),
+            full_name: String::new(),
+            title: String::new(),
+            time_zone: None,
+            avatar: None,
+        }))
+    }
+
+    fn notified(commands: &[Command]) -> Vec<(&str, &str)> {
+        commands
+            .iter()
+            .filter_map(|command| match command {
+                Command::Notify { title, body } => Some((title.as_str(), body.as_str())),
+                _ => None,
+            })
+            .collect()
+    }
+
+    #[test]
+    fn dms_mentions_and_followed_replies_notify_while_the_window_is_elsewhere() {
+        let (mut app, _) = following_threads();
+        for (id, name) in [("U2", "Bob"), ("U9", "Ana"), ("UME", "Me")] {
+            app.update(named(id, name));
+        }
+        let posted = |conversation: &str, message: Message| {
+            slack(Update::Live(LiveEvent::Posted {
+                conversation: id(conversation),
+                message,
+            }))
+        };
+        let dm = |s: u64| posted("D1", message(s, "U9", RichText::plain("lunch?")));
+        assert!(
+            notified(&app.update(dm(30))).is_empty(),
+            "the user is looking"
+        );
+
+        app.update(Event::Terminal(TerminalEvent::FocusLost));
+        assert_eq!(notified(&app.update(dm(31))), [("Ana", "lunch?")]);
+        let mine = posted("D1", message(32, "UME", RichText::plain("sure")));
+        assert!(notified(&app.update(mine)).is_empty(), "the user's own");
+        let chatter = posted("C1", message(33, "U2", RichText::plain("hi all")));
+        assert!(
+            notified(&app.update(chatter)).is_empty(),
+            "nothing for the user"
+        );
+
+        let mut mention = RichText::plain("ping ");
+        if let slackers_model::Block::Paragraph(inlines) = &mut mention.blocks[0] {
+            inlines.push(Inline::User(UserId::new("UME")));
+        }
+        let mentioning = posted("C1", message(34, "U2", mention));
+        assert_eq!(
+            notified(&app.update(mentioning)),
+            [("Bob in #general", "ping @Me")]
+        );
+        let reply = Message {
+            reply_to: Some(seconds(10)),
+            ..message(35, "U2", RichText::plain("an answer"))
+        };
+        assert_eq!(
+            notified(&app.update(posted("C2", reply))),
+            [("Bob in a thread in #random", "an answer")]
+        );
+    }
+
+    #[test]
+    fn a_notification_waits_for_the_names_in_it_unless_the_user_is_back() {
+        let (mut app, _) = ready_app();
+        app.update(Event::Terminal(TerminalEvent::FocusLost));
+        let dm = |s: u64| {
+            slack(Update::Live(LiveEvent::Posted {
+                conversation: id("D1"),
+                message: message(s, "U9", RichText::plain("lunch?")),
+            }))
+        };
+        assert!(
+            notified(&app.update(dm(30))).is_empty(),
+            "U9 has no name yet"
+        );
+        assert_eq!(
+            notified(&app.update(named("U9", "Ana"))),
+            [("Ana", "lunch?")]
+        );
+        assert!(notified(&app.update(named("U9", "Ana"))).is_empty(), "once");
+
+        let (mut app, _) = ready_app();
+        app.update(Event::Terminal(TerminalEvent::FocusLost));
+        app.update(dm(30));
+        app.update(Event::Terminal(TerminalEvent::FocusGained));
+        assert!(
+            notified(&app.update(named("U9", "Ana"))).is_empty(),
+            "moot once the user is back"
+        );
+
+        let (mut app, _) = ready_app();
+        app.update(Event::Terminal(TerminalEvent::FocusLost));
+        for s in 1..=25 {
+            app.update(slack(Update::Live(LiveEvent::Posted {
+                conversation: id("D1"),
+                message: message(s, "U9", RichText::plain(s.to_string())),
+            })));
+        }
+        let commands = app.update(named("U9", "Ana"));
+        let bodies: Vec<&str> = notified(&commands)
+            .into_iter()
+            .map(|(_, body)| body)
+            .collect();
+        assert_eq!(bodies.len(), HELD_NOTIFICATIONS);
+        assert_eq!((bodies[0], bodies[19]), ("6", "25"), "the oldest went");
+    }
+
+    #[test]
+    fn with_several_workspaces_a_notification_names_its_own() {
+        let mut app = two_workspaces();
+        app.update(Event::Terminal(TerminalEvent::FocusLost));
+        app.update(named("U9", "Ana"));
+        let dm = slack(Update::Live(LiveEvent::Posted {
+            conversation: id("D1"),
+            message: message(30, "U9", RichText::plain("hi")),
+        }));
+        assert_eq!(notified(&app.update(dm)), [("Ana · Test", "hi")]);
     }
 
     /// `reading_random_with` its Message holding `reactions`, and the emoji `tada`, `taco` and `+1` on offer, `taco`
