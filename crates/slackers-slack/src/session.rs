@@ -2,7 +2,7 @@ use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 
 use slackers_model::{
-    ActivityItem, Broadcast, Conversation, ConversationId, CustomEmojiSet, Emoji, Message,
+    ActivityItem, Broadcast, Button, Conversation, ConversationId, CustomEmojiSet, Emoji, Message,
     Reaction, ReactionChange, RichText, Ts, Unread, UserId, WorkspaceId,
 };
 use tokio::sync::mpsc;
@@ -66,6 +66,16 @@ pub enum Request {
         emoji: Emoji,
         /// Added or taken back.
         change: ReactionChange,
+    },
+    /// Presses one of the buttons an app put in a Message; answered by [`Update::Pressed`]. What it does, such as
+    /// changing the Message, arrives live.
+    Press {
+        /// Where.
+        conversation: ConversationId,
+        /// In which Message.
+        ts: Ts,
+        /// Which.
+        button: Button,
     },
     /// Every reaction to a Message, naming everyone who reacted, where its history names only the first 50
     /// people of each; answered by [`Update::Reactions`].
@@ -227,6 +237,17 @@ pub enum Update {
         /// Added or taken back.
         change: ReactionChange,
         /// Why it wasn't done, if it wasn't.
+        result: Result<(), Error>,
+    },
+    /// The answer to [`Request::Press`]: done, or why not.
+    Pressed {
+        /// Where.
+        conversation: ConversationId,
+        /// In which Message.
+        ts: Ts,
+        /// Which.
+        button: Button,
+        /// Why it wasn't pressed, if it wasn't.
         result: Result<(), Error>,
     },
     /// The answer to [`Request::Reactions`].
@@ -724,6 +745,19 @@ async fn serve(api: &Api, request: Request, workspace: &WorkspaceId, notify: &No
                 result,
             });
         }
+        Request::Press {
+            conversation,
+            ts,
+            button,
+        } => {
+            let result = api.press(&conversation, ts, &button).await;
+            notify(Update::Pressed {
+                conversation,
+                ts,
+                button,
+                result,
+            });
+        }
         Request::Reactions { conversation, ts } => {
             let result = api.reactions(&conversation, ts).await;
             notify(Update::Reactions {
@@ -776,6 +810,7 @@ mod tests {
                 reactions: Vec::new(),
                 files: Vec::new(),
                 edited: false,
+                ephemeral: false,
             },
         })
     }

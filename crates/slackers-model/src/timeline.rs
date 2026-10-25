@@ -231,6 +231,7 @@ mod tests {
             reactions: Vec::new(),
             files: Vec::new(),
             edited: false,
+            ephemeral: false,
         }
     }
 
@@ -295,6 +296,7 @@ mod tests {
         let mut timeline = Timeline::default();
         let edited = Message {
             edited: true,
+            ephemeral: false,
             ..message(10, "edited")
         };
         timeline.insert(edited.clone());
@@ -309,6 +311,7 @@ mod tests {
         timeline.insert(reply(11, 10));
         timeline.replace(Message {
             edited: true,
+            ephemeral: false,
             ..message(10, "edited")
         });
         timeline.replace(message(12, "never held"));

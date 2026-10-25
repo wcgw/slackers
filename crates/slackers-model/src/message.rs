@@ -19,6 +19,8 @@ pub struct Message {
     pub files: Vec<File>,
     /// Whether it was changed after it was posted.
     pub edited: bool,
+    /// Whether only the user sees it, as an app's answer to them. Slack doesn't keep it: history never has it.
+    pub ephemeral: bool,
 }
 
 /// Who posted a Message.

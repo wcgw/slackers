@@ -25,6 +25,8 @@ pub enum Block {
         /// The list items, in order.
         items: Vec<Vec<Inline>>,
     },
+    /// A row of buttons an app put in the Message, to press.
+    Actions(Vec<Button>),
     /// An image shown inline, such as a GIF posted from Giphy.
     Image {
         /// Where it is, and how big.
@@ -33,6 +35,21 @@ pub enum Block {
         alt_text: String,
     },
 }
+
+/// A button an app put in a Message.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Button {
+    /// What it says.
+    pub label: String,
+    /// Whether it's the one the app suggests, as Giphy's Send is.
+    pub primary: bool,
+    /// What pressing it takes.
+    pub press: Press,
+}
+
+/// What the Slack adapter needs to press a [`Button`]: opaque to anything else.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Press(pub String);
 
 /// A run of [`RichText`] within a block.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -122,7 +139,9 @@ impl RichText {
             .flat_map(|block| -> Box<dyn Iterator<Item = &Inline> + '_> {
                 match block {
                     Block::Paragraph(inlines) | Block::Quote(inlines) => Box::new(inlines.iter()),
-                    Block::Preformatted(_) | Block::Image { .. } => Box::new(std::iter::empty()),
+                    Block::Preformatted(_) | Block::Image { .. } | Block::Actions(_) => {
+                        Box::new(std::iter::empty())
+                    }
                     Block::List { items, .. } => Box::new(items.iter().flatten()),
                 }
             })

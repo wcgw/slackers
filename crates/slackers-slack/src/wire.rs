@@ -2,12 +2,12 @@
 
 use std::collections::HashMap;
 
-use serde::Deserialize;
-use serde_json::Value;
+use serde::{Deserialize, Serialize};
+use serde_json::{Value, json};
 use slackers_model::{
-    ActivityItem, Author, Block, Broadcast, Conversation, ConversationId, ConversationKind,
-    CustomEmojiSet, Emoji, File, Happened, Image, Inline, MentionOf, Message, MessageRef, Reaction,
-    ReactionChange, RichText, Style, ThreadSummary, Ts, Unread, UserId, WorkspaceId,
+    ActivityItem, Author, Block, Broadcast, Button, Conversation, ConversationId, ConversationKind,
+    CustomEmojiSet, Emoji, File, Happened, Image, Inline, MentionOf, Message, MessageRef, Press,
+    Reaction, ReactionChange, RichText, Style, ThreadSummary, Ts, Unread, UserId, WorkspaceId,
 };
 
 use crate::mrkdwn;
@@ -377,6 +377,11 @@ struct WireMessage {
     latest_reply: Option<String>,
     #[serde(default)]
     edited: Option<serde::de::IgnoredAny>,
+    /// The bot that posted it, if one did: its buttons' presses go there.
+    #[serde(default)]
+    bot_id: Option<String>,
+    #[serde(default)]
+    is_ephemeral: bool,
 }
 
 #[derive(Deserialize)]
@@ -406,10 +411,15 @@ impl Icons {
 
 #[derive(Deserialize)]
 struct WireAttachment {
+    /// Which of the Message's attachments it is, which pressing a button in it names.
+    #[serde(default)]
+    id: Option<u64>,
     #[serde(default)]
     text: Option<String>,
     #[serde(default)]
     fallback: Option<String>,
+    #[serde(default)]
+    blocks: Vec<Value>,
 }
 
 #[derive(Deserialize)]
@@ -487,6 +497,11 @@ fn message(value: Value) -> Option<Message> {
         )
         .ok()?;
     let ts = ts(&wire.ts);
+    let presses = wire.bot_id.as_deref().map(|service_id| PressesTo {
+        service_id,
+        is_ephemeral: wire.is_ephemeral,
+    });
+    let content = content(wire.blocks, &wire.text, wire.attachments, presses);
     let author = match (wire.bot_profile, wire.user, wire.username) {
         (Some(bot), _, _) => Author::Bot {
             name: bot.name,
@@ -534,19 +549,58 @@ fn message(value: Value) -> Option<Message> {
     Some(Message {
         ts,
         author,
-        content: content(wire.blocks, &wire.text, wire.attachments),
+        content,
         reply_to,
         thread,
         reactions,
         files,
         edited: wire.edited.is_some(),
+        ephemeral: wire.is_ephemeral,
     })
 }
 
-/// A Message's text: its rich text blocks when it has any, else its `mrkdwn` text; legacy attachments follow as
-/// quotes.
-fn content(blocks: Vec<Value>, text: &str, attachments: Vec<WireAttachment>) -> RichText {
-    let rich: Vec<Block> = blocks
+/// A Message's text: its blocks when any of them is text or an image, else its `mrkdwn` text; legacy attachments
+/// follow, the same way, their text as quotes. Each one's buttons come last, pressed through `presses`; without
+/// it, they're left out.
+fn content(
+    blocks: Vec<Value>,
+    text: &str,
+    attachments: Vec<WireAttachment>,
+    presses: Option<PressesTo<'_>>,
+) -> RichText {
+    let mut content = RichText {
+        blocks: shown(blocks, presses, None, || mrkdwn::parse(text).blocks),
+    };
+    for attachment in attachments {
+        let body = attachment.text.or(attachment.fallback);
+        content
+            .blocks
+            .extend(shown(attachment.blocks, presses, attachment.id, || {
+                let Some(body) = body else {
+                    return Vec::new();
+                };
+                mrkdwn::parse(&body)
+                    .blocks
+                    .into_iter()
+                    .map(|block| match block {
+                        Block::Paragraph(inlines) => Block::Quote(inlines),
+                        other => other,
+                    })
+                    .collect()
+            }));
+    }
+    content
+}
+
+/// What of `blocks` shows, or `text` when none of them is text or an image, followed by their buttons. Those in
+/// a legacy attachment name it, by its `attachment` id.
+fn shown(
+    blocks: Vec<Value>,
+    presses: Option<PressesTo<'_>>,
+    attachment: Option<u64>,
+    text: impl FnOnce() -> Vec<Block>,
+) -> Vec<Block> {
+    let (buttons, mut shown): (Vec<Block>, Vec<Block>) = blocks
         .into_iter()
         .filter_map(|block| serde_json::from_value::<WireBlock>(block).ok())
         .flat_map(|block| match block {
@@ -562,30 +616,148 @@ fn content(blocks: Vec<Value>, text: &str, attachments: Vec<WireAttachment>) -> 
                 image: Image { url, width, height },
                 alt_text,
             }],
+            WireBlock::Actions { block_id, elements } => {
+                let Some(presses) = presses else {
+                    return Vec::new();
+                };
+                let buttons: Vec<Button> = elements
+                    .into_iter()
+                    .filter_map(|element| serde_json::from_value::<WireElement>(element).ok())
+                    .filter_map(|element| element.button(presses, &block_id, attachment))
+                    .collect();
+                if buttons.is_empty() {
+                    Vec::new()
+                } else {
+                    vec![Block::Actions(buttons)]
+                }
+            }
             // An image Slack didn't measure, or one of its own files: neither can take its room before it loads.
             WireBlock::Image { .. } | WireBlock::Other => Vec::new(),
         })
-        .collect();
-    let mut content = if rich.is_empty() {
-        mrkdwn::parse(text)
-    } else {
-        RichText { blocks: rich }
-    };
-    for attachment in attachments {
-        let Some(body) = attachment.text.or(attachment.fallback) else {
-            continue;
-        };
-        content.blocks.extend(
-            mrkdwn::parse(&body)
-                .blocks
-                .into_iter()
-                .map(|block| match block {
-                    Block::Paragraph(inlines) => Block::Quote(inlines),
-                    other => other,
-                }),
-        );
+        .partition(|block| matches!(block, Block::Actions(_)));
+    if shown.is_empty() {
+        shown = text();
     }
-    content
+    shown.extend(buttons);
+    shown
+}
+
+/// Where a Message's buttons send their presses: the bot that posted it.
+#[derive(Clone, Copy)]
+struct PressesTo<'a> {
+    service_id: &'a str,
+    is_ephemeral: bool,
+}
+
+/// An interactive element of an `actions` block.
+#[derive(Deserialize)]
+#[serde(tag = "type", rename_all = "snake_case")]
+enum WireElement {
+    Button {
+        action_id: String,
+        text: PlainText,
+        #[serde(default)]
+        value: Option<String>,
+        #[serde(default)]
+        style: Option<String>,
+        /// A web page it opens, which pressing it through Slack wouldn't.
+        #[serde(default)]
+        url: Option<String>,
+    },
+    #[serde(other)]
+    Other,
+}
+
+#[derive(Deserialize)]
+struct PlainText {
+    text: String,
+}
+
+impl WireElement {
+    /// The button it is, in the block `block_id`, pressed through `presses`; `None` for anything else, and for a
+    /// button that opens a web page.
+    fn button(
+        self,
+        presses: PressesTo<'_>,
+        block_id: &str,
+        attachment: Option<u64>,
+    ) -> Option<Button> {
+        let WireElement::Button {
+            action_id,
+            text,
+            value,
+            style,
+            url: None,
+        } = self
+        else {
+            return None;
+        };
+        let pressing = Pressing {
+            service_id: presses.service_id.to_owned(),
+            action_id,
+            block_id: block_id.to_owned(),
+            value,
+            label: text.text.clone(),
+            attachment_id: attachment,
+            is_ephemeral: presses.is_ephemeral,
+        };
+        Some(Button {
+            label: text.text,
+            primary: style.as_deref() == Some("primary"),
+            press: Press(serde_json::to_string(&pressing).expect("a Pressing always serializes")),
+        })
+    }
+}
+
+/// What a [`Press`] holds: one of an app's buttons, and where its press goes.
+#[derive(Debug, Deserialize, PartialEq, Eq, Serialize)]
+struct Pressing {
+    service_id: String,
+    action_id: String,
+    block_id: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    value: Option<String>,
+    label: String,
+    /// The legacy attachment the button is in, if it's in one.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    attachment_id: Option<u64>,
+    is_ephemeral: bool,
+}
+
+/// The form `blocks.actions` takes to press `press` in the Message at `ts`, as the web client sends it, under
+/// `client_token`, which must be new each time. `None` when `press` wasn't made by this crate.
+pub(crate) fn press_form(
+    conversation: &ConversationId,
+    ts: Ts,
+    press: &Press,
+    client_token: &str,
+) -> Option<[(&'static str, String); 4]> {
+    let pressing: Pressing = serde_json::from_str(&press.0).ok()?;
+    let mut action = json!({
+        "type": "button",
+        "action_id": pressing.action_id,
+        "block_id": pressing.block_id,
+        "text": { "type": "plain_text", "text": pressing.label, "emoji": true },
+    });
+    if let Some(value) = pressing.value {
+        action["value"] = value.into();
+    }
+    let mut container = json!({
+        "type": "message",
+        "message_ts": ts.to_string(),
+        "channel_id": conversation.as_str(),
+        "is_ephemeral": pressing.is_ephemeral,
+    });
+    if let Some(id) = pressing.attachment_id {
+        container["type"] = "message_attachment".into();
+        container["attachment_id"] = id.into();
+    }
+    Some([
+        ("service_id", pressing.service_id),
+        ("client_token", client_token.to_owned()),
+        ("actions", json!([action]).to_string()),
+        ("container", container.to_string()),
+    ])
 }
 
 #[derive(Deserialize)]
@@ -605,6 +777,13 @@ enum WireBlock {
         image_height: Option<u32>,
         #[serde(default)]
         alt_text: String,
+    },
+    /// A row of interactive elements, such as the buttons under Giphy's preview.
+    Actions {
+        #[serde(default)]
+        block_id: String,
+        #[serde(default)]
+        elements: Vec<Value>,
     },
     #[serde(other)]
     Other,
@@ -871,8 +1050,8 @@ impl Updated {
     /// The Message's new content, as Slack stored it.
     pub(crate) fn into_content(self) -> RichText {
         match self.message {
-            Some(message) => content(message.blocks, &message.text, Vec::new()),
-            None => content(Vec::new(), &self.text, Vec::new()),
+            Some(message) => content(message.blocks, &message.text, Vec::new(), None),
+            None => content(Vec::new(), &self.text, Vec::new(), None),
         }
     }
 }
@@ -1694,6 +1873,170 @@ mod tests {
                 },
                 alt_text: "a dancing cat".into(),
             }]
+        );
+    }
+
+    /// The buttons of `message`, as (label, primary) pairs, by `actions` block.
+    fn buttons(message: &Message) -> Vec<Vec<(&str, bool)>> {
+        message
+            .content
+            .blocks
+            .iter()
+            .filter_map(|block| match block {
+                Block::Actions(buttons) => Some(
+                    buttons
+                        .iter()
+                        .map(|button| (button.label.as_str(), button.primary))
+                        .collect(),
+                ),
+                _ => None,
+            })
+            .collect()
+    }
+
+    /// The form pressing `button` of the Message at `ts` in `D1` sends, with its JSON fields decoded.
+    fn pressed(button: &Button, ts: &str) -> HashMap<&'static str, Value> {
+        press_form(
+            &ConversationId::new("D1"),
+            super::ts(ts),
+            &button.press,
+            "token-1",
+        )
+        .expect("made by this crate")
+        .into_iter()
+        .map(|(name, value)| {
+            let value = match name {
+                "actions" | "container" => serde_json::from_str(&value).unwrap(),
+                _ => Value::String(value),
+            };
+            (name, value)
+        })
+        .collect()
+    }
+
+    #[test]
+    fn giphys_preview_is_ephemeral_and_its_buttons_press_through_its_bot() {
+        // As the socket sends it, but for the values.
+        let preview = message(json!({
+            "type": "message", "subtype": "bot_message", "is_ephemeral": true, "bot_id": "B1",
+            "channel": "D1", "ts": "5.000100", "event_ts": "5.000100", "text": "",
+            "attachments": [{"id": 1, "fallback": "giphy: https://giphy.com/gifs/cat", "blocks": [
+                {"type": "image", "block_id": "img", "image_url": "https://media.giphy.com/cat.gif",
+                 "image_width": 480, "image_height": 270, "image_bytes": 100, "is_animated": true,
+                 "alt_text": "cat", "fallback": "480x270px image",
+                 "title": {"type": "plain_text", "text": "cat", "emoji": true}},
+                {"type": "actions", "block_id": "giphy", "elements": [
+                    {"type": "button", "action_id": "post", "style": "primary", "value": "v-post",
+                     "text": {"type": "plain_text", "text": "Send GIF", "emoji": true}},
+                    {"type": "button", "action_id": "shuffle", "value": "v-shuffle",
+                     "text": {"type": "plain_text", "text": "Shuffle", "emoji": true}},
+                    {"type": "button", "action_id": "cancel", "value": "v-cancel",
+                     "text": {"type": "plain_text", "text": "Cancel", "emoji": true}}
+                ]}
+            ]}]
+        }))
+        .unwrap();
+        assert!(preview.ephemeral);
+        assert!(
+            matches!(&preview.content.blocks[0], Block::Image { image, .. } if image.url == "https://media.giphy.com/cat.gif"),
+            "the image shows rather than the fallback: {:?}",
+            preview.content.blocks
+        );
+        assert_eq!(
+            buttons(&preview),
+            [vec![
+                ("Send GIF", true),
+                ("Shuffle", false),
+                ("Cancel", false)
+            ]]
+        );
+        assert_eq!(preview.content.blocks.len(), 2);
+
+        let Block::Actions(shown) = &preview.content.blocks[1] else {
+            unreachable!()
+        };
+        let form = pressed(&shown[0], "5.000100");
+        assert_eq!(form["service_id"], "B1");
+        assert_eq!(form["client_token"], "token-1");
+        assert_eq!(
+            form["actions"],
+            json!([{"type": "button", "action_id": "post", "block_id": "giphy", "value": "v-post",
+                    "text": {"type": "plain_text", "text": "Send GIF", "emoji": true}}])
+        );
+        assert_eq!(
+            form["container"],
+            json!({"type": "message_attachment", "message_ts": "5.000100", "channel_id": "D1",
+                   "attachment_id": 1, "is_ephemeral": true})
+        );
+        assert_eq!(
+            pressed(&shown[1], "5.000100")["actions"][0]["action_id"],
+            "shuffle"
+        );
+    }
+
+    #[test]
+    fn buttons_need_a_bot_to_press_them_and_follow_the_text() {
+        let blocks = json!([
+            {"type": "section", "text": {"type": "mrkdwn", "text": "ignored"}},
+            {"type": "actions", "block_id": "row", "elements": [
+                {"type": "button", "action_id": "approve", "text": {"type": "plain_text", "text": "Approve"}},
+                {"type": "button", "action_id": "docs", "url": "https://docs.example",
+                 "text": {"type": "plain_text", "text": "Docs"}},
+                {"type": "static_select", "action_id": "pick"}
+            ]}
+        ]);
+        let unpressable = message(
+            json!({"ts": "1.000000", "username": "CI", "text": "deploy?", "blocks": blocks}),
+        )
+        .unwrap();
+        assert!(!unpressable.ephemeral);
+        assert_eq!(unpressable.content, mrkdwn::parse("deploy?"));
+
+        let posted = message(json!({"ts": "1.000000", "bot_id": "B2", "text": "deploy?",
+        "blocks": blocks, "attachments": [{"fallback": "details", "blocks": [
+            {"type": "section", "text": {"type": "mrkdwn", "text": "ignored too"}}
+        ]}]}))
+        .unwrap();
+        assert_eq!(
+            posted.content.blocks[0],
+            mrkdwn::parse("deploy?").blocks[0],
+            "the text shows: no block is text"
+        );
+        assert_eq!(
+            posted.content.blocks[2],
+            Block::Quote(vec![Inline::Text {
+                text: "details".into(),
+                style: Style::PLAIN
+            }]),
+            "so does the attachment's fallback, after the Message's own buttons"
+        );
+        assert_eq!(
+            buttons(&posted),
+            [vec![("Approve", false)]],
+            "only buttons Slack presses"
+        );
+        let Block::Actions(shown) = &posted.content.blocks[1] else {
+            unreachable!()
+        };
+        let form = pressed(&shown[0], "1.000000");
+        assert_eq!(form["service_id"], "B2");
+        assert_eq!(
+            form["actions"],
+            json!([{"type": "button", "action_id": "approve", "block_id": "row",
+                    "text": {"type": "plain_text", "text": "Approve", "emoji": true}}])
+        );
+        assert_eq!(
+            form["container"],
+            json!({"type": "message", "message_ts": "1.000000", "channel_id": "D1", "is_ephemeral": false})
+        );
+    }
+
+    #[test]
+    fn only_presses_made_here_can_be_pressed() {
+        let foreign = Press("{}".into());
+        assert_eq!(
+            press_form(&ConversationId::new("D1"), seconds(1), &foreign, "t"),
+            None
         );
     }
 

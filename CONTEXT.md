@@ -34,6 +34,11 @@ _Avoid_: IM, MPIM, chat
 A post in a Conversation, identified by its timestamp within that Conversation.
 _Avoid_: post, event
 
+**Ephemeral Message**:
+A Message an app shows the user alone, such as Giphy's preview of a GIF before it's sent. Slack doesn't keep it,
+so history never has it.
+_Avoid_: hidden message, private message
+
 **Thread**:
 The Replies to one Message, which is the Thread's parent.
 

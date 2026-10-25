@@ -2,15 +2,15 @@
 //! session cookies alongside.
 
 use std::collections::HashMap;
-use std::time::Duration;
+use std::time::{Duration, SystemTime};
 
 use reqwest::header::{CONTENT_TYPE, COOKIE, RETRY_AFTER};
 use reqwest::{RequestBuilder, StatusCode};
 use serde::de::DeserializeOwned;
 use serde_json::{Value, json};
 use slackers_model::{
-    Conversation, ConversationId, Emoji, Message, Reaction, ReactionChange, RichText, Ts, Unread,
-    UserId, WorkspaceId,
+    Button, Conversation, ConversationId, Emoji, Message, Reaction, ReactionChange, RichText, Ts,
+    Unread, UserId, WorkspaceId,
 };
 use tokio::sync::Semaphore;
 
@@ -21,7 +21,7 @@ use crate::session::{
 use crate::wire::{
     ACTIVITY_KINDS, ActivityFeed, AuthTest, CommandList, CommandRun, ConversationInfo, Counts,
     History, ListedEmoji, PeopleSearch, Posted, Prefs, ReactedTo, Replies, ThreadView, Updated,
-    UserBoot, UserInfo, reaction_name,
+    UserBoot, UserInfo, press_form, reaction_name,
 };
 use crate::{Credentials, Error};
 
@@ -320,6 +320,31 @@ impl Api {
             }
             Err(error) => Err(error),
         }
+    }
+
+    /// Presses `button`, one of those an app put in the Message at `ts`.
+    pub(crate) async fn press(
+        &self,
+        conversation: &ConversationId,
+        ts: Ts,
+        button: &Button,
+    ) -> Result<(), Error> {
+        let nanos = SystemTime::UNIX_EPOCH
+            .elapsed()
+            .map_or(0, |since| since.as_nanos());
+        let client_token = format!("slackers-{nanos}");
+        let Some(form) = press_form(conversation, ts, &button.press, &client_token) else {
+            // Only this crate makes a Press, so this one comes from a bug elsewhere: refuse it rather than panic.
+            tracing::error!("asked to press a button this crate didn't make");
+            return Err(Error::refused("blocks.actions", "invalid_press"));
+        };
+        let params: Vec<(&str, &str)> = form
+            .iter()
+            .map(|(name, value)| (*name, value.as_str()))
+            .collect();
+        self.call::<serde::de::IgnoredAny>("blocks.actions", &params)
+            .await
+            .map(drop)
     }
 
     /// Every reaction to the Message at `ts`, naming everyone who reacted.

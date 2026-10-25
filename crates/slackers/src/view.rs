@@ -12,17 +12,17 @@ use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, Borders, Clear, Paragraph, Wrap};
 use slackers_gfx::{CellBox, Fit};
 use slackers_model::{
-    Author, Block as TextBlock, Broadcast, Conversation, ConversationId, ConversationKind, Emoji,
-    File, Happened, Image, Inline, MentionOf, Message, Reaction, RichText, Style as TextStyle,
-    Timeline, Ts, Unread,
+    Author, Block as TextBlock, Broadcast, Button, Conversation, ConversationId, ConversationKind,
+    Emoji, File, Happened, Image, Inline, MentionOf, Message, Reaction, RichText,
+    Style as TextStyle, Timeline, Ts, Unread,
 };
 use slackers_slack::Connection;
 use unicode_width::UnicodeWidthStr as _;
 
 use crate::activity::{Entry, Fetched};
 use crate::app::{
-    App, ConversationRef, Details, Drawn, Focus, LinkKind, Mode, Opened, Phase, Place, Suggested,
-    Suggestions, WantedPicture, Workspace, WorkspaceKey,
+    App, Choice, ConversationRef, Details, Drawn, Focus, LinkKind, Mode, Opened, Phase, Place,
+    Suggested, Suggestions, WantedPicture, Workspace, WorkspaceKey,
 };
 use crate::draft::{Draft, Mentioned};
 use crate::emoji::Drawable;
@@ -999,15 +999,18 @@ fn draw_details(
     if message.edited {
         posted.push_str(" · edited");
     }
+    if message.ephemeral {
+        posted.push_str(" · only visible to you");
+    }
     let mut lines = vec![
         Line::from(header),
         Line::from(vec![Span::raw("   "), Span::styled(posted, DIM)]),
     ];
-    let links = workspace.links(&details.place.conversation.id, message);
+    let choices = workspace.choices(&details.place.conversation.id, message);
     let reactions = &message.reactions;
     if !reactions.is_empty() {
-        // Cut the reactions short, rather than push who wrote the Message or where it leads out of the box.
-        let around = lines.len() + 2 + links.len();
+        // Cut the reactions short, rather than push who wrote the Message or what it offers out of the box.
+        let around = lines.len() + 2 + choices.len();
         let fit = usize::from(area.height.saturating_sub(2)).saturating_sub(around);
         let shown = if reactions.len() > fit {
             fit.saturating_sub(1)
@@ -1027,25 +1030,27 @@ fn draw_details(
         }
     }
     lines.push(Line::default());
-    let first_link = lines.len();
-    for (index, link) in links.iter().enumerate() {
+    let first_choice = lines.len();
+    for (index, choice) in choices.iter().enumerate() {
         let number = if index < 9 {
             format!("{} ", index + 1)
         } else {
             "  ".to_owned()
         };
-        let icon = match link.kind {
-            LinkKind::Web => icons::LINK,
-            LinkKind::File => icons::FILE,
-            LinkKind::Message => icons::SLACK,
-        };
-        let mut spans = vec![
-            Span::styled(number, DIM),
-            Span::styled(icon, ACCENT),
-            Span::raw(link.label.clone()),
-        ];
-        if link.kind == LinkKind::Web && link.label != link.url {
-            spans.push(Span::styled(format!("  {}", host(&link.url)), DIM));
+        let mut spans = vec![Span::styled(number, DIM)];
+        match choice {
+            Choice::Press(button) => spans.push(button_span(button)),
+            Choice::Open(link) => {
+                let icon = match link.kind {
+                    LinkKind::Web => icons::LINK,
+                    LinkKind::File => icons::FILE,
+                    LinkKind::Message => icons::SLACK,
+                };
+                spans.extend([Span::styled(icon, ACCENT), Span::raw(link.label.clone())]);
+                if link.kind == LinkKind::Web && link.label != link.url {
+                    spans.push(Span::styled(format!("  {}", host(&link.url)), DIM));
+                }
+            }
         }
         let line = Line::from(spans);
         lines.push(if index == details.selected {
@@ -1074,7 +1079,7 @@ fn draw_details(
     frame.render_widget(Clear, popup);
     frame.render_widget(block, popup);
     // Keep the selected link in view.
-    let skip = (first_link + details.selected + 1).saturating_sub(usize::from(inner.height));
+    let skip = (first_choice + details.selected + 1).saturating_sub(usize::from(inner.height));
     let shown: Vec<Line<'static>> = lines.into_iter().skip(skip).collect();
     frame.render_widget(Paragraph::new(shown), inner);
 }
@@ -1226,10 +1231,12 @@ fn lay_out(
             );
         }
         let leading = lines.len();
+        // An ephemeral Message keeps the header that says so.
         let grouped = !new_day
             && !first_reply
             && previous.is_some_and(|p| {
                 p.author == message.author
+                    && p.ephemeral == message.ephemeral
                     && message.ts.as_micros().saturating_sub(p.ts.as_micros()) < GROUP_WITHIN
             });
         let mut renderer = Renderer::new(app, workspace, place.conversation.workspace, width, zone);
@@ -1370,6 +1377,12 @@ impl<'a> Renderer<'a> {
             ));
             if message.edited {
                 header.push(Span::styled(format!(" {}", icons::EDITED), DIM));
+            }
+            if message.ephemeral {
+                header.extend([
+                    Span::styled(format!("  {}", icons::EPHEMERAL), DIM),
+                    Span::styled("only visible to you", DIM),
+                ]);
             }
             lines.push(Line::from(header));
         }
@@ -1540,6 +1553,18 @@ impl<'a> Renderer<'a> {
                 TextBlock::Image { image, alt_text } => {
                     let shown = self.image(image, alt_text);
                     lines.extend(shown.unwrap_or_else(|| vec![labelled(icons::IMAGE, alt_text)]));
+                }
+                TextBlock::Actions(buttons) => {
+                    let mut pieces = Vec::new();
+                    for (index, button) in buttons.iter().enumerate() {
+                        if index > 0 {
+                            pieces.push(Piece::Text("  ".to_owned(), Style::new()));
+                        }
+                        let span = button_span(button);
+                        let cells = u16::try_from(span.width()).unwrap_or(u16::MAX);
+                        pieces.push(Piece::Atom(span, cells));
+                    }
+                    lines.extend(wrap(pieces, self.width).into_iter().map(Line::from));
                 }
             }
         }
@@ -1723,7 +1748,7 @@ fn draw_status(frame: &mut Frame<'_>, area: Rect, app: &App) {
         ]);
     }
     let hints = match (&app.mode, app.focus) {
-        (Mode::Details(_), _) => "j/k choose · ⏎ open · 1-9 open · y copy · esc close",
+        (Mode::Details(_), _) => "j/k choose · ⏎/1-9 press or open · y copy · esc close",
         (Mode::Insert, _) if let Some(suggestions) = &app.suggestions => {
             match suggestions.items[suggestions.selected].suggested {
                 Suggested::Mention(_) => "↑/↓ choose · ⇥/⏎ mention · esc normal",
@@ -1795,6 +1820,16 @@ fn connections(app: &App) -> Vec<Span<'static>> {
     } else {
         spans
     }
+}
+
+/// An app's button, as it shows: its label in brackets, the one the app suggests standing out.
+fn button_span(button: &Button) -> Span<'static> {
+    let style = if button.primary {
+        theme::PRIMARY_BUTTON
+    } else {
+        theme::BUTTON
+    };
+    Span::styled(format!("[ {} ]", button.label), style)
 }
 
 /// A dim line: `icon`, then `label`.
@@ -1938,6 +1973,7 @@ mod tests {
             reactions: Vec::new(),
             files: Vec::new(),
             edited: false,
+            ephemeral: false,
         }
     }
 
@@ -2979,6 +3015,71 @@ mod tests {
     }
 
     #[test]
+    fn an_apps_ephemeral_answer_says_so_and_shows_its_buttons_to_press() {
+        let mut app = reading_general();
+        let button = |label: &str, primary| Button {
+            label: label.into(),
+            primary,
+            press: slackers_model::Press(String::new()),
+        };
+        let answer = Message {
+            ts: Ts::from_micros(1_700_000_060_000_000),
+            content: RichText {
+                blocks: vec![TextBlock::Actions(vec![
+                    button("Send GIF", true),
+                    button("Shuffle", false),
+                ])],
+            },
+            ephemeral: true,
+            ..reading_general_message()
+        };
+        let posted = slackers_slack::LiveEvent::Posted {
+            conversation: ConversationId::new("C1"),
+            message: answer,
+        };
+        app.update(Event::Slack(w(0), Update::Live(posted)));
+
+        let (rows, _, buffer) = render_sized(&app, WIDTH);
+        let row_of = |rows: &[String], text: &str| {
+            rows.iter()
+                .position(|row| row.contains(text))
+                .unwrap_or_else(|| panic!("no {text:?} in {rows:#?}"))
+        };
+        let only_mine = row_of(&rows, "only visible to you");
+        assert!(
+            rows[only_mine].contains(icons::EPHEMERAL),
+            "a header of its own, though it follows the same author's Message: {rows:#?}"
+        );
+        let buttons = row_of(&rows, "[ Send GIF ]  [ Shuffle ]");
+        assert_eq!(buttons, only_mine + 1, "{rows:#?}");
+        let x = |text: &str| {
+            let column = rows[buttons].find(text).unwrap();
+            u16::try_from(rows[buttons][..column].chars().count()).unwrap()
+        };
+        let y = u16::try_from(buttons).unwrap();
+        assert_eq!(
+            buffer[(x("Send GIF"), y)].fg,
+            theme::PRIMARY_BUTTON.fg.unwrap()
+        );
+        assert_eq!(buffer[(x("Shuffle"), y)].fg, theme::BUTTON.fg.unwrap());
+
+        type_text(&mut app, "K");
+        let rows = screen(&app);
+        let first = row_of(&rows, "1 [ Send GIF ]");
+        assert!(rows[first + 1].contains("2 [ Shuffle ]"), "{rows:#?}");
+        assert!(
+            !rows.iter().any(|row| row.contains("this message in Slack")),
+            "{rows:#?}"
+        );
+        assert!(
+            rows.iter().any(
+                |row| row.contains(" · only visible to you") && !row.contains(icons::EPHEMERAL)
+            ),
+            "the details say so too: {rows:#?}"
+        );
+    }
+
+    #[test]
     fn a_messages_details_name_who_reacted_and_where_it_leads() {
         let mut app = reading_general();
         for (id, name, full_name) in [("U2", "Ana", "Ana Lima"), ("U4", "Bob", "")] {
@@ -3005,6 +3106,7 @@ mod tests {
                 count: 2,
             }],
             edited: true,
+            ephemeral: false,
             ..reading_general_message()
         };
         let edited = slackers_slack::LiveEvent::Edited {

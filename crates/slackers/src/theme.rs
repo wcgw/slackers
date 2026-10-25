@@ -31,6 +31,11 @@ pub(crate) const DIM: Style = Style::new().fg(palette::COMMENT);
 pub(crate) const READ: Style = Style::new().fg(palette::FG_DARK);
 /// What has focus, or wants attention without alarm.
 pub(crate) const ACCENT: Style = Style::new().fg(palette::BLUE);
+/// A button an app put in a Message.
+pub(crate) const BUTTON: Style = Style::new().fg(palette::BLUE);
+/// The button an app suggests pressing, such as Giphy's Send.
+pub(crate) const PRIMARY_BUTTON: Style =
+    Style::new().fg(palette::GREEN).add_modifier(Modifier::BOLD);
 /// An @-mention of someone else.
 pub(crate) const MENTION: Style = Style::new().fg(palette::BLUE1).add_modifier(Modifier::BOLD);
 /// An @-mention of the user, or a broadcast reaching them.

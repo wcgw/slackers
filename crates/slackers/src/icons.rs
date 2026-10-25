@@ -35,6 +35,8 @@ pub(crate) const SLACK: &str = "\u{f04b1} ";
 pub(crate) const FILE: &str = "\u{f4fb} ";
 /// `oct-pencil`: an edited Message.
 pub(crate) const EDITED: &str = "\u{f448} ";
+/// `oct-eye`: a Message only the user sees.
+pub(crate) const EPHEMERAL: &str = "\u{f441} ";
 /// `oct-stack`: a Virtual Workspace.
 pub(crate) const VIRTUAL_WORKSPACE: &str = "\u{f51e} ";
 /// `oct-triangle_right`: a folded sidebar section.

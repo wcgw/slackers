@@ -22,8 +22,9 @@
 //! there: `Enter` saves the edit and `Esc` gives it up, bringing back what was being written before.
 //!
 //! On a Message, `+` reacts: it lists the emoji the user uses most, which typing narrows down, for `↑`/`↓` to
-//! choose and `Enter` or `Tab` to react with, or to take back one of the user's reactions. `K` shows its details: who wrote it, who reacted, and where it leads (its links, its files and the
-//! Message itself on Slack's web client), for `j`/`k` to choose, `Enter` or `1`-`9` to open and `y` to copy. `o`
+//! choose and `Enter` or `Tab` to react with, or to take back one of the user's reactions. `K` shows its details: who
+//! wrote it, who reacted, the buttons an app put in it, and where it leads (its links, its files and the Message
+//! itself on Slack's web client), for `j`/`k` to choose, `Enter` or `1`-`9` to press or open and `y` to copy. `o`
 //! opens a Message's link or file when it has just one, and shows its details to choose from otherwise.
 
 use std::cmp::Reverse;
@@ -33,8 +34,9 @@ use std::time::{Duration, Instant};
 use crossterm::event::{Event as TerminalEvent, KeyCode, KeyEvent, KeyEventKind, KeyModifiers};
 use slackers_gfx::{CellSize, Fit, Picture};
 use slackers_model::{
-    Author, Block, Broadcast, Conversation, ConversationId, ConversationKind, Emoji, Happened,
-    Inline, Message, MessageRef, ReactionChange, RichText, Style, Timeline, Ts, Unread, UserId,
+    Author, Block, Broadcast, Button, Conversation, ConversationId, ConversationKind, Emoji,
+    Happened, Inline, Message, MessageRef, ReactionChange, RichText, Style, Timeline, Ts, Unread,
+    UserId,
 };
 use slackers_slack::{
     Connection, EmojiList, Error, LiveEvent, Permalinks, Person, Request, SlashCommand, Snapshot,
@@ -194,7 +196,7 @@ pub(crate) enum Mode {
     Command(String),
     /// Keys narrow the sidebar down to the Conversations matching a query, shown after `/` on the status line.
     Search(Search),
-    /// Keys choose where a Message leads, from its details shown over its pane.
+    /// Keys choose a button to press or somewhere to open, from a Message's details shown over its pane.
     Details(Details),
     /// Keys choose an emoji to react to a Message with, shown after `+` on the status line.
     React(Reacting),
@@ -212,14 +214,23 @@ pub(crate) struct Reacting {
     pub(crate) choices: Option<Suggestions>,
 }
 
-/// A Message whose details show: who wrote it and when, who reacted, and where it leads.
+/// A Message whose details show: who wrote it and when, who reacted, its buttons and where it leads.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) struct Details {
     /// Where the Message is held: its Conversation, or the Thread whose pane it was chosen in.
     pub(crate) place: Place,
     pub(crate) ts: Ts,
-    /// The link `Enter` opens, by its place among the Message's [`Workspace::links`].
+    /// The choice `Enter` takes, by its place among the Message's [`Workspace::choices`].
     pub(crate) selected: usize,
+}
+
+/// What a Message's details offer to choose.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) enum Choice {
+    /// One of the buttons an app put in it, to press.
+    Press(Button),
+    /// Somewhere it leads, to open or copy.
+    Open(Link),
 }
 
 /// Somewhere a Message leads, to open in a browser.
@@ -1370,27 +1381,44 @@ impl App {
         let Mode::Details(details) = &self.mode else {
             return;
         };
-        let selected = details.selected;
-        let links = self
-            .message(&details.place, details.ts)
-            .map(|(workspace, message)| workspace.links(&details.place.conversation.id, message))
+        let (place, ts, selected) = (&details.place, details.ts, details.selected);
+        let choices = self
+            .message(place, ts)
+            .map(|(workspace, message)| workspace.choices(&place.conversation.id, message))
             .unwrap_or_default();
-        let url = |index: usize| links.get(index).map(|link| link.url.clone());
+        let take = |index: usize| {
+            Some(match choices.get(index)? {
+                Choice::Press(button) => {
+                    let request = Request::Press {
+                        conversation: place.conversation.id.clone(),
+                        ts,
+                        button: button.clone(),
+                    };
+                    Command::Slack(place.conversation.workspace, request)
+                }
+                Choice::Open(link) => Command::Open(link.url.clone()),
+            })
+        };
         let control = key.modifiers.contains(KeyModifiers::CONTROL);
         let command = match (key.code, control) {
-            // `refresh_details` keeps the selection on the last link.
+            // `refresh_details` keeps the selection on the last choice.
             (KeyCode::Down | KeyCode::Char('j'), false) | (KeyCode::Char('n'), true) => {
-                return self.select_link(selected + 1);
+                return self.select_choice(selected + 1);
             }
             (KeyCode::Up | KeyCode::Char('k'), false) | (KeyCode::Char('p'), true) => {
-                return self.select_link(selected.saturating_sub(1));
+                return self.select_choice(selected.saturating_sub(1));
             }
-            (KeyCode::Enter | KeyCode::Char('o'), false) => url(selected).map(Command::Open),
-            (KeyCode::Char('y'), false) => url(selected).map(Command::Copy),
+            (KeyCode::Enter | KeyCode::Char('o'), false) => take(selected),
+            (KeyCode::Char('y'), false) => match choices.get(selected) {
+                Some(Choice::Open(link)) => Some(Command::Copy(link.url.clone())),
+                // A button has nothing to copy.
+                Some(Choice::Press(_)) => return,
+                None => None,
+            },
             (KeyCode::Char(digit @ '1'..='9'), false) => {
                 let index = digit.to_digit(10).map_or(0, |digit| digit as usize - 1);
-                let Some(url) = url(index) else { return };
-                Some(Command::Open(url))
+                let Some(command) = take(index) else { return };
+                Some(command)
             }
             (KeyCode::Esc | KeyCode::Char('q' | 'K'), false) | (KeyCode::Char('c'), true) => None,
             _ => return,
@@ -1399,14 +1427,14 @@ impl App {
         self.mode = Mode::Normal;
     }
 
-    fn select_link(&mut self, index: usize) {
+    fn select_choice(&mut self, index: usize) {
         if let Mode::Details(details) = &mut self.mode {
             details.selected = index;
         }
     }
 
     /// Keeps the details shown current: closes them once their Message is gone, keeps the selection on one of its
-    /// links, and asks for the names of the first people who reacted with each emoji.
+    /// choices, and asks for the names of the first people who reacted with each emoji.
     fn refresh_details(&mut self, commands: &mut Vec<Command>) {
         let Mode::Details(details) = &self.mode else {
             return;
@@ -1415,7 +1443,7 @@ impl App {
             self.mode = Mode::Normal;
             return;
         };
-        let links = workspace.links(&details.place.conversation.id, message);
+        let choices = workspace.choices(&details.place.conversation.id, message);
         let reactors: Vec<UserId> = message
             .reactions
             .iter()
@@ -1423,8 +1451,8 @@ impl App {
             .cloned()
             .collect();
         let key = details.place.conversation.workspace;
-        let selected = details.selected.min(links.len().saturating_sub(1));
-        self.select_link(selected);
+        let selected = details.selected.min(choices.len().saturating_sub(1));
+        self.select_choice(selected);
         if let Some(workspace) = self.workspaces.get_mut(key) {
             workspace.want_users(key, reactors, commands);
         }
@@ -2138,6 +2166,19 @@ impl App {
                 ));
             }
             Update::Reacted { result: Ok(()), .. } => {}
+            Update::Pressed {
+                button,
+                result: Err(error),
+                ..
+            } => {
+                self.notice = Some(format!(
+                    "couldn't press {}: {}",
+                    button.label,
+                    describe(&error)
+                ));
+            }
+            // What pressing it did arrives live.
+            Update::Pressed { result: Ok(()), .. } => {}
             Update::Activity { cursor, result } => {
                 let next = match result {
                     Ok(page) => {
@@ -2659,15 +2700,39 @@ impl Workspace {
                 url: file.link.clone()?,
             })
         }));
-        // The link to a Thread's parent or Reply opens the Thread.
-        let thread = message.reply_to.or(message.thread.map(|_| message.ts));
-        links.push(Link {
-            kind: LinkKind::Message,
-            label: "this message in Slack".to_owned(),
-            url: self.permalinks.message(conversation, message.ts, thread),
-        });
+        // Slack doesn't keep an ephemeral Message, so there's no page for it.
+        if !message.ephemeral {
+            // The link to a Thread's parent or Reply opens the Thread.
+            let thread = message.reply_to.or(message.thread.map(|_| message.ts));
+            links.push(Link {
+                kind: LinkKind::Message,
+                label: "this message in Slack".to_owned(),
+                url: self.permalinks.message(conversation, message.ts, thread),
+            });
+        }
         links.retain(|link| is_web(&link.url));
         links
+    }
+
+    /// What `message`'s details offer, in order: the buttons an app put in it, then its [`Workspace::links`].
+    pub(crate) fn choices(&self, conversation: &ConversationId, message: &Message) -> Vec<Choice> {
+        let buttons = message.content.blocks.iter().flat_map(|block| match block {
+            Block::Actions(buttons) => buttons.as_slice(),
+            Block::Paragraph(_)
+            | Block::Quote(_)
+            | Block::Preformatted(_)
+            | Block::List { .. }
+            | Block::Image { .. } => &[],
+        });
+        buttons
+            .cloned()
+            .map(Choice::Press)
+            .chain(
+                self.links(conversation, message)
+                    .into_iter()
+                    .map(Choice::Open),
+            )
+            .collect()
     }
 
     /// Where `author`'s avatar image is, as far as known.
@@ -2679,8 +2744,8 @@ impl Workspace {
     }
 
     /// A Draft at `place` holding `content` as one would write it: styles as `mrkdwn` markers, emoji by name, and
-    /// people, broadcasts, user groups, Channels and labelled links as labels standing for them. Images go: they
-    /// aren't text.
+    /// people, broadcasts, user groups, Channels and labelled links as labels standing for them. Images and buttons
+    /// go: they aren't text.
     fn draft_of(&self, place: &Place, content: &RichText) -> Draft {
         let mut draft = Draft::new(place);
         for (index, block) in content.blocks.iter().enumerate() {
@@ -2708,7 +2773,7 @@ impl Workspace {
                         self.write_inlines(&mut draft, item, "");
                     }
                 }
-                Block::Image { .. } => {}
+                Block::Image { .. } | Block::Actions(_) => {}
             }
         }
         draft
@@ -3131,6 +3196,7 @@ mod tests {
             reactions: Vec::new(),
             files: Vec::new(),
             edited: false,
+            ephemeral: false,
         }
     }
 
@@ -3909,6 +3975,7 @@ mod tests {
 
         let edited = Message {
             edited: true,
+            ephemeral: false,
             ..reply(6, 5)
         };
         app.update(live(LiveEvent::Edited {
@@ -5855,6 +5922,86 @@ mod tests {
             [Command::Open(
                 "https://test.slack.com/files/U2/F1/a.pdf".into()
             )]
+        );
+    }
+
+    #[test]
+    fn the_details_offer_an_apps_buttons_first_and_enter_presses_one() {
+        let button = |label: &str, primary| slackers_model::Button {
+            label: label.into(),
+            primary,
+            press: slackers_model::Press(label.to_lowercase()),
+        };
+        let (send, shuffle) = (button("Send GIF", true), button("Shuffle", false));
+        let content = RichText {
+            blocks: vec![
+                Block::Paragraph(vec![link("https://giphy.com/cat", None)]),
+                Block::Actions(vec![send.clone(), shuffle.clone()]),
+            ],
+        };
+        let mut app = reading_random();
+        let preview = Message {
+            ephemeral: true,
+            ..message(5, "U2", content)
+        };
+        app.update(slack(Update::Live(LiveEvent::Edited {
+            conversation: id("C2"),
+            message: preview,
+        })));
+        app.focus = Focus::Timeline;
+        let held = workspace(&app, W0).timelines[&id("C2")]
+            .get(seconds(5))
+            .unwrap();
+        assert_eq!(
+            workspace(&app, W0).choices(&id("C2"), held),
+            [
+                Choice::Press(send.clone()),
+                Choice::Press(shuffle.clone()),
+                Choice::Open(Link {
+                    kind: LinkKind::Web,
+                    label: "https://giphy.com/cat".into(),
+                    url: "https://giphy.com/cat".into(),
+                }),
+            ],
+            "buttons, then links; Slack keeps no page for an ephemeral Message"
+        );
+        let press = |button: &slackers_model::Button| {
+            ask(Request::Press {
+                conversation: id("C2"),
+                ts: seconds(5),
+                button: button.clone(),
+            })
+        };
+
+        app.update(key(KeyCode::Char('K')));
+        assert_eq!(app.update(key(KeyCode::Enter)), [press(&send)]);
+        assert_eq!(app.mode, Mode::Normal, "pressing closes the details");
+
+        app.update(key(KeyCode::Char('K')));
+        assert!(app.update(key(KeyCode::Char('y'))).is_empty());
+        assert!(details(&app).is_some(), "a button has nothing to copy");
+        assert_eq!(app.update(key(KeyCode::Char('2'))), [press(&shuffle)]);
+
+        app.update(key(KeyCode::Char('K')));
+        app.update(key(KeyCode::Char('j')));
+        app.update(key(KeyCode::Char('j')));
+        assert_eq!(
+            app.update(key(KeyCode::Char('y'))),
+            [Command::Copy("https://giphy.com/cat".into())]
+        );
+
+        app.update(slack(Update::Pressed {
+            conversation: id("C2"),
+            ts: seconds(5),
+            button: shuffle,
+            result: Err(Error::Refused {
+                method: "blocks.actions",
+                code: "invalid_service_id".into(),
+            }),
+        }));
+        assert_eq!(
+            app.notice.as_deref(),
+            Some("couldn't press Shuffle: slack refused blocks.actions: invalid_service_id")
         );
     }
 

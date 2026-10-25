@@ -241,6 +241,7 @@ mod tests {
                 reactions: Vec::new(),
                 files: Vec::new(),
                 edited: false,
+                ephemeral: false,
             });
         }
         timeline
