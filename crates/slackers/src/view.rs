@@ -14,7 +14,7 @@ use slackers_gfx::{CellBox, Fit};
 use slackers_model::{
     Author, Block as TextBlock, Broadcast, Button, Conversation, ConversationId, ConversationKind,
     Emoji, File, Happened, Image, Inline, MentionOf, Message, Presence, Reaction, RichText,
-    Style as TextStyle, Timeline, Ts, Unread, UserId,
+    Style as TextStyle, Timeline, Ts, Unread,
 };
 use slackers_slack::Connection;
 use unicode_width::UnicodeWidthStr as _;
@@ -840,15 +840,6 @@ fn draw_pane(
 ) -> Option<Settled> {
     let [header, body] = Layout::vertical([Constraint::Length(1), Constraint::Fill(1)]).areas(area);
     frame.render_widget(Paragraph::new(view.title.clone()), header);
-    let typists = app.typing.at(&view.place, app.animation_time());
-    drawn.next_change = earliest(drawn.next_change, typists.changes);
-    // Right of the title, when there's room.
-    if let Some(typing) = typing(workspace, &typists.who)
-        && view.title.width() + 2 + typing.width() <= usize::from(header.width)
-    {
-        let typing = Line::styled(typing, DIM.add_modifier(Modifier::ITALIC));
-        frame.render_widget(Paragraph::new(typing).alignment(Alignment::Right), header);
-    }
     let body = body.inner(Margin {
         horizontal: 1,
         vertical: 0,
@@ -1777,6 +1768,7 @@ fn draw_status(frame: &mut Frame<'_>, area: Rect, app: &App, drawn: &mut Drawn) 
         ]);
     }
     left.extend(connections(app));
+    left.extend(typing(app, drawn));
     if let Some(notice) = app.notice(app.animation_time()) {
         // Drawn again once it's had its time.
         drawn.next_change = earliest(drawn.next_change, Some(notice.until));
@@ -1861,15 +1853,50 @@ fn connections(app: &App) -> Vec<Span<'static>> {
     }
 }
 
-/// What says that `who` are typing, by name; `None` when nobody is.
-fn typing(workspace: &Workspace, who: &[&UserId]) -> Option<String> {
-    let name = |id: &UserId| workspace.user_name(id).to_owned();
-    match who {
-        [] => None,
-        [one] => Some(format!("{} is typing…", name(one))),
-        [one, other] => Some(format!("{} and {} are typing…", name(one), name(other))),
-        _ => Some("several people are typing…".to_owned()),
+/// Who's typing in the open Conversation, then in its open Thread, as the status line says it; noting in `drawn` when
+/// that next runs out.
+fn typing(app: &App, drawn: &mut Drawn) -> Vec<Span<'static>> {
+    let Some(open) = app.open_conversation() else {
+        return Vec::new();
+    };
+    let Some((workspace, _)) = app.workspaces.conversation(open) else {
+        return Vec::new();
+    };
+    let now = app.animation_time();
+    let mut spans = Vec::new();
+    // The Conversation's own (no Thread), then the open Thread's, if one is.
+    for thread in [Some(None), app.open_thread.map(Some)]
+        .into_iter()
+        .flatten()
+    {
+        let place = Place {
+            conversation: open.clone(),
+            thread,
+        };
+        let typists = app.typing.at(&place, now);
+        drawn.next_change = earliest(drawn.next_change, typists.changes);
+        let names: Vec<&str> = typists
+            .who
+            .iter()
+            .map(|id| workspace.user_name(id))
+            .collect();
+        let there = if thread.is_some() {
+            " in the thread"
+        } else {
+            ""
+        };
+        let said = match names.as_slice() {
+            [] => continue,
+            [one] => format!("{one} is typing{there}…"),
+            [one, other] => format!("{one} and {other} are typing{there}…"),
+            _ => format!("several people are typing{there}…"),
+        };
+        spans.extend([
+            Span::raw("  "),
+            Span::styled(said, DIM.add_modifier(Modifier::ITALIC)),
+        ]);
     }
+    spans
 }
 
 /// An app's button, as it shows: its label in brackets, the one the app suggests standing out.
@@ -3258,8 +3285,8 @@ mod tests {
     }
 
     #[test]
-    fn whoever_is_typing_shows_right_of_the_panes_title_while_there_is_room() {
-        let mut app = reading_general();
+    fn whoever_is_typing_shows_on_the_status_line() {
+        let mut app = reading_a_thread();
         for (id, name) in [("U2", "Ana"), ("U3", "Bob")] {
             let user = slackers_slack::User {
                 id: UserId::new(id),
@@ -3271,37 +3298,42 @@ mod tests {
             };
             app.update(Event::Slack(w(0), Update::User(user)));
         }
-        let typing = |user: &str| {
+        let thread = Some(reading_general_message().ts);
+        let typing = |user: &str, thread| {
             let typing = slackers_slack::LiveEvent::Typing {
                 conversation: ConversationId::new("C1"),
-                thread: None,
+                thread,
                 user: UserId::new(user),
             };
             Event::Slack(w(0), Update::Live(typing))
         };
-        let (rows, drawn) = render(&app);
-        assert!(!rows[0].contains("typing"), "{:?}", rows[0]);
-        assert_eq!(drawn.next_change, None);
+        let status = |app: &App| render_sized(app, 200).0.last().unwrap().clone();
+        assert!(!status(&app).contains("typing"));
+        assert_eq!(render(&app).1.next_change, None);
 
-        app.update(typing("U2"));
-        let (rows, drawn) = render(&app);
+        app.update(typing("U2", None));
+        let (rows, drawn, _) = render_sized(&app, 200);
         assert!(
-            rows[0].trim_end().ends_with("Ana is typing…"),
+            rows.last().unwrap().contains("Ana is typing…"),
             "{:?}",
-            rows[0]
+            rows.last()
         );
-        assert!(rows[0].contains("general"), "{:?}", rows[0]);
+        assert!(!rows[0].contains("typing"), "not on top: {:?}", rows[0]);
         let changes = drawn.next_change.expect("drawn again once it's over");
         assert!(changes > app.animation_time(), "{changes:?}");
 
-        app.update(typing("U3"));
-        assert!(screen(&app)[0].contains("Ana and Bob are typing…"));
-        app.update(typing("U4"));
-        assert!(screen(&app)[0].contains("several people are typing…"));
+        app.update(typing("U3", None));
+        assert!(status(&app).contains("Ana and Bob are typing…"));
+        app.update(typing("U4", None));
+        assert!(status(&app).contains("several people are typing…"));
 
-        let (rows, _, _) = render_sized(&app, 56);
-        assert!(!rows[0].contains("typing"), "no room: {:?}", rows[0]);
-        assert!(rows[0].contains("general"), "{:?}", rows[0]);
+        app.update(typing("U2", thread));
+        let said = status(&app);
+        let (conversation, in_thread) = (
+            said.find("several people are typing…").unwrap(),
+            said.find("Ana is typing in the thread…").unwrap(),
+        );
+        assert!(conversation < in_thread, "{said:?}");
     }
 
     #[test]
