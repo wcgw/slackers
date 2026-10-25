@@ -31,6 +31,8 @@ pub(crate) const DIM: Style = Style::new().fg(palette::COMMENT);
 pub(crate) const READ: Style = Style::new().fg(palette::FG_DARK);
 /// What has focus, or wants attention without alarm.
 pub(crate) const ACCENT: Style = Style::new().fg(palette::BLUE);
+/// Where what's new starts, in a pane.
+pub(crate) const NEW: Style = Style::new().fg(palette::RED);
 /// Someone using Slack right now.
 pub(crate) const ACTIVE: Style = Style::new().fg(palette::GREEN);
 /// A button an app put in a Message.

@@ -890,7 +890,16 @@ fn draw_pane(
         return None;
     };
 
-    let rendered = lay_out(app, workspace, timeline, &view.place, body.width, zone);
+    let new_after = view.pane.new_after();
+    let rendered = lay_out(
+        app,
+        workspace,
+        timeline,
+        &view.place,
+        new_after,
+        body.width,
+        zone,
+    );
     let blocks: Vec<pane::Block> = rendered
         .iter()
         .map(|r| pane::Block {
@@ -1221,12 +1230,14 @@ fn draw_suggestions(
 }
 
 /// Lays out `timeline`'s Messages for `place`, `width` cells wide, followed by those still being sent there. A
-/// Thread's parent comes first, then a rule counting its Replies.
+/// Thread's parent comes first, then a rule counting its Replies. What's new, after `new_after`, starts under a rule
+/// of its own.
 fn lay_out(
     app: &App,
     workspace: &Workspace,
     timeline: &Timeline,
     place: &Place,
+    new_after: Option<Ts>,
     width: u16,
     zone: &TimeZone,
 ) -> Vec<Rendered> {
@@ -1238,6 +1249,9 @@ fn lay_out(
         let day = day(message.ts, zone);
         let new_day = previous.is_none_or(|p| day != self::day(p.ts, zone));
         let first_reply = in_thread && index == 1;
+        let first_new = new_after.is_some_and(|after| {
+            message.ts > after && previous.is_none_or(|previous| previous.ts <= after)
+        });
         let mut lines = Vec::new();
         if new_day && let Some(day) = day {
             lines.push(
@@ -1251,10 +1265,14 @@ fn lay_out(
                 Line::styled(format!("─── {replies} {noun} ───"), DIM).alignment(Alignment::Center),
             );
         }
+        if first_new {
+            lines.push(Line::styled("─── new ───", theme::NEW).alignment(Alignment::Center));
+        }
         let leading = lines.len();
         // An ephemeral Message keeps the header that says so.
         let grouped = !new_day
             && !first_reply
+            && !first_new
             && previous.is_some_and(|p| {
                 p.author == message.author
                     && p.ephemeral == message.ephemeral
@@ -2050,6 +2068,70 @@ mod tests {
             },
         ));
         app
+    }
+
+    #[test]
+    fn whats_new_starts_under_a_rule_of_its_own() {
+        let read = reading_general_message();
+        let new = Message {
+            ts: Ts::from_micros(read.ts.as_micros() + 60_000_000),
+            content: RichText::plain("a minute later"),
+            ..read.clone()
+        };
+        let newer = Message {
+            ts: Ts::from_micros(new.ts.as_micros() + 1_000_000),
+            content: RichText::plain("and a second"),
+            ..read.clone()
+        };
+        let mut app = App::new(vec!["test".into()], Vec::new(), CELL);
+        let (general, _) = channel("C1", "general");
+        let unread = Unread::counted(read.ts, newer.ts, true, 0);
+        app.update(Event::Slack(
+            w(0),
+            ready("Test", None, vec![(general, unread)]),
+        ));
+        type_text(&mut app, "/general");
+        press(&mut app, KeyCode::Enter, KeyModifiers::NONE);
+        let page = HistoryPage {
+            messages: vec![newer, new, read],
+            has_more: false,
+        };
+        let history = Update::History {
+            conversation: ConversationId::new("C1"),
+            result: Ok(page),
+        };
+        app.update(Event::Slack(w(0), history));
+
+        let (rows, _, buffer) = render_sized(&app, WIDTH);
+        let row_of = |text: &str| {
+            rows.iter()
+                .position(|row| row.contains(text))
+                .unwrap_or_else(|| panic!("no {text:?} in {rows:#?}"))
+        };
+        let (read, rule, new) = (
+            row_of("the only message"),
+            row_of("─── new ───"),
+            row_of("a minute later"),
+        );
+        assert!(read < rule && rule < new, "{rows:#?}");
+        assert_eq!(new, rule + 2, "under a header of its own: {rows:#?}");
+        assert_eq!(
+            rows.iter()
+                .filter(|row| row.contains("─── new ───"))
+                .count(),
+            1,
+            "{rows:#?}"
+        );
+        let x = u16::try_from(
+            rows[rule]
+                .find('─')
+                .map_or(0, |at| rows[rule][..at].chars().count()),
+        )
+        .unwrap();
+        assert_eq!(
+            buffer[(x, u16::try_from(rule).unwrap())].fg,
+            theme::NEW.fg.unwrap()
+        );
     }
 
     #[test]

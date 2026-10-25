@@ -1,4 +1,5 @@
-//! Where the user is in a pane of Messages: which one is selected, and how far the pane is scrolled.
+//! Where the user is in a pane of Messages: which one is selected, how far the pane is scrolled, and what was new
+//! when it opened.
 //!
 //! As in vim, moving the selection scrolls the pane to show it, and scrolling the pane drags the selection along
 //! to stay in view. Only drawing knows how many lines each Message takes, so drawing settles which ([`Pane::settle`])
@@ -17,6 +18,9 @@ pub(crate) struct Pane {
     anchor: Anchor,
     /// What the last draw settled.
     settled: Settled,
+    /// The Read Marker as it stood when the pane opened, when something was unread past it: what's new starts
+    /// after it, until the pane opens anew.
+    new_after: Option<Ts>,
 }
 
 /// What the last key moved.
@@ -55,6 +59,35 @@ pub(crate) struct Block {
 }
 
 impl Pane {
+    /// A pane opening on what's unread past `read_up_to`: the first Message after it is selected once
+    /// [`Pane::snap`] finds it held, and what's new starts there.
+    pub(crate) fn unread_after(read_up_to: Ts) -> Self {
+        Self {
+            // Just past the Read Marker, until a Message there is held.
+            cursor: Some(Ts::from_micros(read_up_to.as_micros().saturating_add(1))),
+            new_after: Some(read_up_to),
+            ..Self::default()
+        }
+    }
+
+    /// Where what was new when the pane opened starts: after this; `None` when nothing was.
+    pub(crate) fn new_after(&self) -> Option<Ts> {
+        self.new_after
+    }
+
+    /// Moves a selection that isn't on a Message `timeline` holds onto the next one it holds, else the newest; leaves
+    /// it while `timeline` holds none.
+    pub(crate) fn snap(&mut self, timeline: &Timeline) {
+        if let Some(cursor) = self.cursor
+            && timeline.newest().is_some()
+            && timeline.get(cursor).is_none()
+        {
+            self.cursor = timeline
+                .after(cursor)
+                .filter(|&next| Some(next) != timeline.newest());
+        }
+    }
+
     /// The selected Message; `None` for the newest.
     pub(crate) fn cursor(&self) -> Option<Ts> {
         self.cursor
@@ -263,6 +296,29 @@ mod tests {
         let settled = pane.settle(blocks, height);
         pane.adopt(settled);
         settled
+    }
+
+    #[test]
+    fn opening_on_whats_unread_snaps_to_its_first_message_once_held() {
+        let mut pane = Pane::unread_after(ts(2));
+        assert_eq!(pane.new_after(), Some(ts(2)));
+        assert!(!pane.at_newest(), "not read while it's sought");
+        pane.snap(&Timeline::default());
+        assert_eq!(
+            pane.cursor(),
+            Some(Ts::from_micros(ts(2).as_micros() + 1)),
+            "nothing held yet"
+        );
+        pane.snap(&timeline(5));
+        assert_eq!(pane.cursor(), Some(ts(3)));
+        pane.snap(&timeline(5));
+        assert_eq!(pane.cursor(), Some(ts(3)), "on a Message, it stays");
+
+        let mut pane = Pane::unread_after(ts(4));
+        pane.snap(&timeline(5));
+        assert_eq!(pane.cursor(), None, "only the newest is new");
+        assert!(pane.at_newest());
+        assert_eq!(Pane::default().new_after(), None);
     }
 
     #[test]

@@ -9,6 +9,9 @@
 //! up people and broadcasts to @-mention, and one starting with `:` and two more characters brings up emoji: `↑`/`↓`
 //! choose one, `Tab` or `Enter` picks it.
 //!
+//! A Conversation, or a Followed Thread, with something unread opens on its first unread Message, under a rule
+//! saying what's new, loading older history to reach it; it's read once its newest Message is reached.
+//!
 //! The sidebar's first row opens Activity, merged from every Workspace, newest first: `j`/`k` choose an item and
 //! `Enter` opens its Message, in its Thread if it has one.
 //!
@@ -71,7 +74,8 @@ const NAMED_REACTORS: usize = 12;
 /// The most notifications held back until the names in them are known; past that, the oldest go.
 const HELD_NOTIFICATIONS: usize = 20;
 
-/// The most pages of history loaded to reach a Message an Activity item opens.
+/// The most pages of history loaded to reach the Message a Conversation opens on: its first unread, or the one an
+/// Activity item is about.
 const JUMP_PAGES: u32 = 10;
 
 /// How long a notice shows on the status line: long enough to read one that came while the user was busy.
@@ -617,9 +621,9 @@ pub(crate) struct App {
     pub(crate) activity: Activity,
     /// Who's typing where, in every Workspace.
     pub(crate) typing: Typing,
-    /// How many more pages of history to load to reach the open Conversation's selected Message, which an Activity
-    /// item opened.
-    jump_pages: u32,
+    /// While the open Conversation's selected Message is older than its history loaded, which it opened on, how
+    /// many more pages may load to reach it; `None` once it's reached, or given up on.
+    reaching: Option<u32>,
     /// Whether the sidebar shows. `\` hides it from within it, and brings it back. Whenever focus is on it, it shows.
     pub(crate) sidebar_shown: bool,
     /// Unsent text, per Place.
@@ -688,7 +692,7 @@ impl App {
             focus: Focus::Sidebar,
             activity: Activity::default(),
             typing: Typing::default(),
-            jump_pages: 0,
+            reaching: None,
             sidebar_shown: true,
             drafts: HashMap::new(),
             suggestions: None,
@@ -833,6 +837,7 @@ impl App {
         self.refresh_details(&mut commands);
         self.refresh_reacting();
         self.reach_selected(&mut commands);
+        self.snap_thread();
         commands
     }
 
@@ -1746,19 +1751,26 @@ impl App {
     }
 
     /// Opens the Thread under `parent` in the open Conversation, in its own pane with focus, and asks for its
-    /// Replies unless they're held or on their way.
+    /// Replies unless they're held or on their way. A Followed Thread opens on its first unread Reply, if any.
     fn open_thread(&mut self, parent: Ts, commands: &mut Vec<Command>) {
         let Some(open) = self.opened.as_ref().and_then(Opened::conversation) else {
             return;
         };
         self.open_thread = Some(parent);
-        self.thread_pane = Pane::default();
         self.thread_shown = false;
         self.focus = Focus::Thread;
         let Some(workspace) = self.workspaces.get_mut(open.workspace) else {
             return;
         };
         let thread = (open.id.clone(), parent);
+        // A Followed Thread opens on its first unread Reply, once loaded.
+        let unread = workspace
+            .followed
+            .get(&thread)
+            .map(|followed| &followed.unread)
+            .filter(|unread| unread.has_unread())
+            .map(Unread::read_up_to);
+        self.thread_pane = unread.map_or_else(Pane::default, Pane::unread_after);
         if !workspace.threads.contains_key(&thread) && workspace.loading_threads.insert(thread) {
             let request = Request::Replies {
                 conversation: open.id.clone(),
@@ -1989,7 +2001,7 @@ impl App {
             None => {
                 self.focus = Focus::Timeline;
                 self.conversation_pane.select(at.ts);
-                self.jump_pages = JUMP_PAGES;
+                self.reaching = Some(JUMP_PAGES);
             }
         }
     }
@@ -2007,14 +2019,15 @@ impl App {
         loaded.map_or_else(|| self.activity.message(key, at), Fetched::Got)
     }
 
-    /// Loads the open Conversation's older history while the Message an Activity item opened it on is older than
-    /// what's loaded, as far as [`JUMP_PAGES`] pages.
+    /// Loads the open Conversation's older history while the Message it opened on is older than what's loaded, as
+    /// far as [`JUMP_PAGES`] pages, then settles the selection on a Message loaded: the one it opened on, else the
+    /// next one loaded.
     fn reach_selected(&mut self, commands: &mut Vec<Command>) {
-        if self.jump_pages == 0 {
+        let Some(pages) = self.reaching else {
             return;
-        }
+        };
         let Some(open) = self.opened.as_ref().and_then(Opened::conversation) else {
-            self.jump_pages = 0;
+            self.reaching = None;
             return;
         };
         let Some(workspace) = self.workspaces.get(open.workspace) else {
@@ -2024,16 +2037,38 @@ impl App {
             // The first page is on its way.
             return;
         };
+        if workspace.loading.contains(&open.id) {
+            return;
+        }
         let beyond = self
             .conversation_pane
             .cursor()
             .zip(timeline.oldest())
             .is_some_and(|(selected, oldest)| selected < oldest);
-        if !beyond || !timeline.has_older() {
-            self.jump_pages = 0;
-        } else if !workspace.loading.contains(&open.id) {
-            self.jump_pages -= 1;
+        if beyond && timeline.has_older() && pages > 0 {
+            self.reaching = Some(pages - 1);
             self.load_older(commands);
+        } else {
+            self.reaching = None;
+            self.conversation_pane.snap(timeline);
+        }
+    }
+
+    /// Settles the open Thread's selection on a Reply it holds, once it's loaded: its first unread one, when it opened
+    /// on that.
+    fn snap_thread(&mut self) {
+        let (Some(open), Some(parent)) = (
+            self.opened.as_ref().and_then(Opened::conversation),
+            self.open_thread,
+        ) else {
+            return;
+        };
+        let thread = self
+            .workspaces
+            .get(open.workspace)
+            .and_then(|workspace| workspace.threads.get(&(open.id.clone(), parent)));
+        if let Some(thread) = thread {
+            self.thread_pane.snap(thread);
         }
     }
 
@@ -2042,9 +2077,17 @@ impl App {
         self.focus = Focus::Sidebar;
     }
 
+    /// Opens `conversation`: on its first unread Message when it has any, loading older history to reach it, else
+    /// on its newest.
     fn open(&mut self, conversation: ConversationRef, commands: &mut Vec<Command>) {
         self.kept_unread = None;
-        self.conversation_pane = Pane::default();
+        let unread = self
+            .workspaces
+            .unread(&conversation)
+            .filter(|unread| unread.has_unread())
+            .map(Unread::read_up_to);
+        self.conversation_pane = unread.map_or_else(Pane::default, Pane::unread_after);
+        self.reaching = unread.map(|_| JUMP_PAGES);
         self.conversation_shown = false;
         self.open_thread = None;
         self.thread_shown = false;
@@ -2059,7 +2102,6 @@ impl App {
             commands.push(Command::Slack(conversation.workspace, request));
         }
         self.opened = Some(Opened::Conversation(conversation));
-        self.jump_pages = 0;
     }
 
     /// Asks for the page before the oldest Message of the open Timeline, if there is one and it isn't on its way.
@@ -3670,6 +3712,8 @@ mod tests {
             conversation: id("C2"),
             result: Ok(page),
         }));
+        // It opened on its first unread Message: on to the newest, which reads it.
+        app.update(key(KeyCode::Char('G')));
         drawn(&mut app, 10);
         app
     }
@@ -3994,10 +4038,12 @@ mod tests {
     fn reaching_the_top_loads_older_history_once() {
         let (mut app, _) = ready_app();
         app.update(key(KeyCode::Enter));
+        // Back to the Read Marker, at 1: nothing older is needed to open on the first unread.
         let page = HistoryPage {
             messages: vec![
                 message(5, "U2", RichText::plain("hi")),
                 message(2, "U2", RichText::plain("ho")),
+                message(1, "U2", RichText::plain("hey")),
             ],
             has_more: true,
         };
@@ -4030,7 +4076,7 @@ mod tests {
             commands,
             [ask(Request::History {
                 conversation: id("C2"),
-                before: Some(seconds(2))
+                before: Some(seconds(1))
             })]
         );
         let again = app.update(Event::Drawn(Drawn {
@@ -5822,13 +5868,19 @@ mod tests {
 
         app.open(c("C1"), &mut Vec::new());
         app.open(c("C2"), &mut Vec::new());
+        assert!(drawn(&mut app, 10).is_empty());
         assert_eq!(
-            drawn(&mut app, 10),
+            app.conversation_pane.cursor(),
+            Some(seconds(2)),
+            "opened again, on the first unread"
+        );
+        assert_eq!(
+            app.update(key(KeyCode::Char('G'))),
             [ask(Request::Mark {
                 conversation: id("C2"),
                 up_to: seconds(5)
             })],
-            "opened again, it's read"
+            "read once the newest is reached"
         );
     }
 
@@ -5891,6 +5943,132 @@ mod tests {
             Some("K lists test#nowhere, which isn't among your channels"),
             "the last of them: there's room for one"
         );
+    }
+
+    #[test]
+    fn a_conversation_opens_on_its_first_unread_loading_back_to_it_and_reads_at_the_newest() {
+        let (mut app, _) = ready_app();
+        app.update(key(KeyCode::Enter));
+        let page = |seconds: &[u64]| {
+            slack(Update::History {
+                conversation: id("C2"),
+                result: Ok(HistoryPage {
+                    messages: seconds
+                        .iter()
+                        .map(|&s| message(s, "U2", RichText::plain("hi")))
+                        .collect(),
+                    has_more: true,
+                }),
+            })
+        };
+        let older = |before| {
+            ask(Request::History {
+                conversation: id("C2"),
+                before: Some(seconds(before)),
+            })
+        };
+        let histories = |commands: Vec<Command>| -> Vec<Command> {
+            commands
+                .into_iter()
+                .filter(|command| matches!(command, Command::Slack(_, Request::History { .. })))
+                .collect()
+        };
+        // The Read Marker is at 1.
+        assert_eq!(histories(app.update(page(&[5, 4]))), [older(4)]);
+        for _ in 0..=JUMP_PAGES {
+            drawn(&mut app, 10);
+        }
+        assert_eq!(
+            histories(app.update(page(&[3, 2]))),
+            [older(2)],
+            "waiting for a page uses none up"
+        );
+        assert!(histories(app.update(page(&[1]))).is_empty(), "reached");
+        assert_eq!(app.conversation_pane.cursor(), Some(seconds(2)));
+        assert_eq!(app.conversation_pane.new_after(), Some(seconds(1)));
+        assert!(
+            !drawn(&mut app, 10)
+                .iter()
+                .any(|command| matches!(command, Command::Slack(_, Request::Mark { .. }))),
+            "not read yet"
+        );
+        assert_eq!(
+            app.update(key(KeyCode::Char('G'))),
+            [ask(Request::Mark {
+                conversation: id("C2"),
+                up_to: seconds(5)
+            })]
+        );
+        assert_eq!(
+            app.conversation_pane.new_after(),
+            Some(seconds(1)),
+            "what was new stays marked while it's open"
+        );
+    }
+
+    #[test]
+    fn reaching_back_for_the_first_unread_gives_up_on_the_oldest_loaded() {
+        let (mut app, _) = ready_app();
+        app.update(key(KeyCode::Enter));
+        // Never back to the Read Marker at 1: a Message every 10 ms, 4 seconds on. The first page, then each asked
+        // for.
+        let mut requests = 0;
+        for page in 0..=JUMP_PAGES {
+            let at = Ts::from_micros(4_000_000 - u64::from(page) * 10_000);
+            let commands = app.update(slack(Update::History {
+                conversation: id("C2"),
+                result: Ok(HistoryPage {
+                    messages: vec![Message {
+                        ts: at,
+                        ..message(1, "U2", RichText::plain("hi"))
+                    }],
+                    has_more: true,
+                }),
+            }));
+            requests += commands
+                .iter()
+                .filter(|command| matches!(command, Command::Slack(_, Request::History { .. })))
+                .count();
+        }
+        assert_eq!(requests, usize::try_from(JUMP_PAGES).unwrap());
+        let oldest = workspace(&app, W0).timelines[&id("C2")].oldest();
+        assert_eq!(
+            app.conversation_pane.cursor(),
+            oldest,
+            "as far back as it got"
+        );
+    }
+
+    #[test]
+    fn a_followed_thread_opens_on_its_first_unread_reply() {
+        let mut snapshot = test_snapshot();
+        snapshot
+            .followed_threads
+            .push(slackers_slack::FollowedThread {
+                conversation: id("C1"),
+                parent: message(5, "U2", RichText::plain("hi")),
+                unread: Unread::counted(seconds(6), seconds(8), true, 0),
+            });
+        let mut app = App::new(vec!["test".into()], Vec::new(), CELL);
+        app.update(slack(Update::Ready(Box::new(snapshot))));
+        app.open(c("C1"), &mut Vec::new());
+        app.open_thread(seconds(5), &mut Vec::new());
+        assert_eq!(app.thread_pane.new_after(), Some(seconds(6)));
+        let replies = vec![
+            message(5, "U2", RichText::plain("hi")),
+            reply(6, 5),
+            reply(7, 5),
+            reply(8, 5),
+        ];
+        app.update(slack(Update::Replies {
+            conversation: id("C1"),
+            parent: seconds(5),
+            result: Ok(replies),
+        }));
+        assert_eq!(app.thread_pane.cursor(), Some(seconds(7)));
+
+        app.open_thread(seconds(9), &mut Vec::new());
+        assert_eq!(app.thread_pane.new_after(), None, "a Thread not followed");
     }
 
     #[test]
