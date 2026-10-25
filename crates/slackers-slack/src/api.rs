@@ -9,19 +9,19 @@ use reqwest::{RequestBuilder, StatusCode};
 use serde::de::DeserializeOwned;
 use serde_json::{Value, json};
 use slackers_model::{
-    Button, Conversation, ConversationId, Emoji, Message, Reaction, ReactionChange, RichText, Ts,
-    Unread, UserId, WorkspaceId,
+    BotId, Button, Conversation, ConversationId, Emoji, Message, Reaction, ReactionChange,
+    RichText, Ts, Unread, UserId, WorkspaceId,
 };
 use tokio::sync::Semaphore;
 
 use crate::session::{
-    ActivityCursor, ActivityPage, EmojiList, HistoryPage, Part, Person, SlashCommand, Snapshot,
-    User,
+    ActivityCursor, ActivityPage, Bot, EmojiList, HistoryPage, Part, Person, SlashCommand,
+    Snapshot, User,
 };
 use crate::wire::{
-    ACTIVITY_KINDS, ActivityFeed, AuthTest, CommandList, CommandRun, ConversationInfo, Counts,
-    History, ListedEmoji, PeopleSearch, Posted, Prefs, ReactedTo, Replies, ThreadView, Updated,
-    UserBoot, UserInfo, press_form, reaction_name,
+    ACTIVITY_KINDS, ActivityFeed, AuthTest, BotInfo, CommandList, CommandRun, ConversationInfo,
+    Counts, History, ListedEmoji, PeopleSearch, Posted, Prefs, ReactedTo, Replies, ThreadView,
+    Updated, UserBoot, UserInfo, press_form, reaction_name,
 };
 use crate::{Credentials, Error};
 
@@ -187,6 +187,11 @@ impl Api {
     pub(crate) async fn user(&self, id: &UserId) -> Result<User, Error> {
         let info: UserInfo = self.call("users.info", &[("user", id.as_str())]).await?;
         Ok(info.into_user())
+    }
+
+    pub(crate) async fn bot(&self, id: &BotId) -> Result<Bot, Error> {
+        let info: BotInfo = self.call("bots.info", &[("bot", id.as_str())]).await?;
+        Ok(info.into_bot())
     }
 
     /// The Workspace's slash commands, by name.

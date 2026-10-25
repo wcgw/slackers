@@ -1,4 +1,4 @@
-use crate::{Emoji, Inline, RichText, Ts, UserId};
+use crate::{BotId, Emoji, Inline, RichText, Ts, UserId};
 
 /// A Message as slackers shows it.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -35,6 +35,8 @@ pub enum Author {
         /// Where its avatar image is; `None` when it has none.
         avatar: Option<String>,
     },
+    /// A bot that posted without saying its name, as Giphy's previews do: only its id is known.
+    UnnamedBot(BotId),
 }
 
 /// The Replies to a Message that starts a Thread.

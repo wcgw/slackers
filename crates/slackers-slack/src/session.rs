@@ -2,8 +2,8 @@ use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 
 use slackers_model::{
-    ActivityItem, Broadcast, Button, Conversation, ConversationId, CustomEmojiSet, Emoji, Message,
-    Reaction, ReactionChange, RichText, Ts, Unread, UserId, WorkspaceId,
+    ActivityItem, BotId, Broadcast, Button, Conversation, ConversationId, CustomEmojiSet, Emoji,
+    Message, Reaction, ReactionChange, RichText, Ts, Unread, UserId, WorkspaceId,
 };
 use tokio::sync::mpsc;
 use tokio::task::JoinSet;
@@ -33,6 +33,8 @@ pub enum Request {
     },
     /// A person's name; answered by [`Update::User`], or not at all if Slack doesn't know them.
     User(UserId),
+    /// A bot's name; answered by [`Update::Bot`], or not at all if Slack doesn't know it.
+    Bot(BotId),
     /// A file, image, avatar or Custom Emoji; answered by [`Update::Downloaded`].
     Download {
         /// Where it is. Requests to Slack's own hosts carry the session's credentials, so private files work;
@@ -167,6 +169,8 @@ pub enum Update {
     },
     /// The answer to [`Request::User`].
     User(User),
+    /// The answer to [`Request::Bot`].
+    Bot(Bot),
     /// The answer to [`Request::Replies`].
     Replies {
         /// Where.
@@ -326,6 +330,17 @@ pub struct User {
     /// Their time zone's IANA name, such as `Europe/Paris`; `None` when Slack doesn't say.
     pub time_zone: Option<String>,
     /// Where their avatar image is, about 48 pixels square; `None` when they have none.
+    pub avatar: Option<String>,
+}
+
+/// A bot, which an app or integration posts through.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Bot {
+    /// Which.
+    pub id: BotId,
+    /// What it's called, such as `giphy`.
+    pub name: String,
+    /// Where its avatar image is, about 48 pixels square; `None` when it has none.
     pub avatar: Option<String>,
 }
 
@@ -661,6 +676,10 @@ async fn serve(api: &Api, request: Request, workspace: &WorkspaceId, notify: &No
         Request::User(id) => match api.user(&id).await {
             Ok(user) => notify(Update::User(user)),
             Err(error) => tracing::warn!(%error, user = %id, "couldn't look up a user"),
+        },
+        Request::Bot(id) => match api.bot(&id).await {
+            Ok(bot) => notify(Update::Bot(bot)),
+            Err(error) => tracing::warn!(%error, bot = %id, "couldn't look up a bot"),
         },
         Request::Download { url } => {
             let result = api.download(&url).await;

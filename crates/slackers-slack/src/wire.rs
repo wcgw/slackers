@@ -5,14 +5,15 @@ use std::collections::HashMap;
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 use slackers_model::{
-    ActivityItem, Author, Block, Broadcast, Button, Conversation, ConversationId, ConversationKind,
-    CustomEmojiSet, Emoji, File, Happened, Image, Inline, MentionOf, Message, MessageRef, Press,
-    Reaction, ReactionChange, RichText, Style, ThreadSummary, Ts, Unread, UserId, WorkspaceId,
+    ActivityItem, Author, Block, BotId, Broadcast, Button, Conversation, ConversationId,
+    ConversationKind, CustomEmojiSet, Emoji, File, Happened, Image, Inline, MentionOf, Message,
+    MessageRef, Press, Reaction, ReactionChange, RichText, Style, ThreadSummary, Ts, Unread,
+    UserId, WorkspaceId,
 };
 
 use crate::mrkdwn;
 use crate::session::{
-    ActivityCursor, ActivityPage, EmojiList, FollowedThread, HistoryPage, LiveEvent, Person,
+    ActivityCursor, ActivityPage, Bot, EmojiList, FollowedThread, HistoryPage, LiveEvent, Person,
     SlashCommand, Snapshot, User,
 };
 use crate::web::Permalinks;
@@ -502,14 +503,19 @@ fn message(value: Value) -> Option<Message> {
         is_ephemeral: wire.is_ephemeral,
     });
     let content = content(wire.blocks, &wire.text, wire.attachments, presses);
-    let author = match (wire.bot_profile, wire.user, wire.username) {
-        (Some(bot), _, _) => Author::Bot {
+    let author = match (wire.bot_profile, wire.user, wire.username, wire.bot_id) {
+        (Some(bot), _, _, _) => Author::Bot {
             name: bot.name,
             avatar: bot.icons.avatar(),
         },
-        (None, Some(user), _) => Author::User(UserId::new(user)),
-        (None, None, name) => Author::Bot {
-            name: name.unwrap_or_else(|| "bot".to_owned()),
+        (None, Some(user), _, _) => Author::User(UserId::new(user)),
+        (None, None, Some(name), _) => Author::Bot {
+            name,
+            avatar: wire.icons.avatar(),
+        },
+        (None, None, None, Some(bot)) => Author::UnnamedBot(BotId::new(bot)),
+        (None, None, None, None) => Author::Bot {
+            name: "bot".to_owned(),
             avatar: wire.icons.avatar(),
         },
     };
@@ -1176,6 +1182,30 @@ impl ReactedTo {
     }
 }
 
+/// `bots.info`'s reply.
+#[derive(Deserialize)]
+pub(crate) struct BotInfo {
+    bot: WireBot,
+}
+
+#[derive(Deserialize)]
+struct WireBot {
+    id: String,
+    name: String,
+    #[serde(default)]
+    icons: Icons,
+}
+
+impl BotInfo {
+    pub(crate) fn into_bot(self) -> Bot {
+        Bot {
+            id: BotId::new(self.bot.id),
+            name: self.bot.name,
+            avatar: self.bot.icons.avatar(),
+        }
+    }
+}
+
 #[derive(Deserialize)]
 pub(crate) struct UserInfo {
     user: WireUser,
@@ -1639,6 +1669,43 @@ mod tests {
                     style: Style::PLAIN
                 }]),
             ]
+        );
+    }
+
+    #[test]
+    fn a_bot_that_doesnt_say_its_name_is_known_by_its_id_to_look_up() {
+        let author = |wire: Value| message(wire).unwrap().author;
+        let named = |name: &str| Author::Bot {
+            name: name.into(),
+            avatar: None,
+        };
+        assert_eq!(
+            author(json!({"ts": "1.0", "bot_id": "B1", "subtype": "bot_message"})),
+            Author::UnnamedBot(BotId::new("B1"))
+        );
+        assert_eq!(
+            author(json!({"ts": "1.0", "bot_id": "B1", "username": "CI"})),
+            named("CI")
+        );
+        assert_eq!(
+            author(json!({"ts": "1.0", "bot_id": "B1", "bot_profile": {"name": "giphy"}})),
+            named("giphy")
+        );
+        assert_eq!(author(json!({"ts": "1.0"})), named("bot"));
+
+        let info: BotInfo = serde_json::from_value(json!({"ok": true, "bot": {
+            "id": "B1", "deleted": false, "name": "giphy", "updated": 1, "app_id": "A1",
+            "icons": {"image_36": "https://a/36.png", "image_48": "https://a/48.png",
+                      "image_72": "https://a/72.png"}
+        }}))
+        .unwrap();
+        assert_eq!(
+            info.into_bot(),
+            Bot {
+                id: BotId::new("B1"),
+                name: "giphy".into(),
+                avatar: Some("https://a/48.png".into()),
+            }
         );
     }
 

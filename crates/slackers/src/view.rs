@@ -227,7 +227,7 @@ fn activity_item(
         Fetched::Got(message) => {
             let by = match item.happened {
                 Happened::Replies { .. } | Happened::Dm => {
-                    format!("{}: ", author_name(workspace, &message.author))
+                    format!("{}: ", workspace.author_name(&message.author))
                 }
                 Happened::Mention { .. } | Happened::Reaction { .. } | Happened::Added { .. } => {
                     String::new()
@@ -263,14 +263,6 @@ fn place_name(workspace: &Workspace, conversation: &ConversationId) -> String {
         ) => format!("#{}", found.name),
         Some(found) => workspace.conversation_name(found).to_owned(),
         None => "a conversation you're not in".to_owned(),
-    }
-}
-
-/// What `author` is called.
-fn author_name(workspace: &Workspace, author: &Author) -> String {
-    match author {
-        Author::User(id) => workspace.user_name(id).to_owned(),
-        Author::Bot { name, .. } => name.clone(),
     }
 }
 
@@ -1444,13 +1436,11 @@ impl<'a> Renderer<'a> {
 
     /// The start of a header line: `author`'s avatar in the gutter, then their name.
     fn header(&mut self, author: &Author) -> Vec<Span<'static>> {
-        let (name, color) = match author {
-            Author::User(id) => (
-                self.workspace.user_name(id).to_owned(),
-                stable_color(id.as_str()),
-            ),
-            Author::Bot { name, .. } => (name.clone(), theme::BOT),
+        let color = match author {
+            Author::User(id) => stable_color(id.as_str()),
+            Author::Bot { .. } | Author::UnnamedBot(_) => theme::BOT,
         };
+        let name = self.workspace.author_name(author).to_owned();
         vec![
             self.avatar(author, color),
             Span::raw(" "),
@@ -1462,7 +1452,7 @@ impl<'a> Renderer<'a> {
     fn avatar(&mut self, author: &Author, color: Color) -> Span<'static> {
         let icon = match author {
             Author::User(_) => icons::AVATAR,
-            Author::Bot { .. } => icons::BOT,
+            Author::Bot { .. } | Author::UnnamedBot(_) => icons::BOT,
         };
         let fallback = Span::styled(icon, Style::new().fg(color));
         let Some(url) = self.workspace.avatar(author) else {
@@ -2756,6 +2746,33 @@ mod tests {
             rows.last().unwrap().contains("j/k choose · ⏎ open"),
             "{rows:#?}"
         );
+
+        let giphy = slackers_model::BotId::new("B1");
+        let from_bot = Message {
+            ts: at(19),
+            author: Author::UnnamedBot(giphy.clone()),
+            content: RichText::plain("a gif"),
+            ..reading_general_message()
+        };
+        app.update(Event::Slack(
+            w(0),
+            Update::Message {
+                conversation: ConversationId::new("D1"),
+                ts: at(19),
+                result: Ok(Some(from_bot)),
+            },
+        ));
+        let bot = slackers_slack::Bot {
+            id: giphy,
+            name: "giphy".into(),
+            avatar: None,
+        };
+        app.update(Event::Slack(w(0), Update::Bot(bot)));
+        let rows = render_sized(&app, 100).0;
+        assert!(
+            rows[8].contains("giphy: a gif"),
+            "a DM's gist says who wrote it: {rows:#?}"
+        );
     }
 
     #[test]
@@ -3012,6 +3029,44 @@ mod tests {
         assert!(found("Tue 14 Nov 2023"), "{rows:#?}");
         assert!(found("… 5 more"), "{rows:#?}");
         assert!(found("this message in Slack"), "{rows:#?}");
+    }
+
+    #[test]
+    fn a_bot_that_doesnt_say_its_name_is_named_once_looked_up() {
+        let mut app = reading_general();
+        let giphy = slackers_model::BotId::new("B1");
+        let gif = Message {
+            ts: Ts::from_micros(1_700_000_060_000_000),
+            author: Author::UnnamedBot(giphy.clone()),
+            content: RichText::plain("a gif"),
+            ..reading_general_message()
+        };
+        let posted = slackers_slack::LiveEvent::Posted {
+            conversation: ConversationId::new("C1"),
+            message: gif,
+        };
+        app.update(Event::Slack(w(0), Update::Live(posted)));
+        let header = |rows: &[String]| {
+            let body = rows.iter().position(|row| row.contains("a gif")).unwrap();
+            rows[body - 1].clone()
+        };
+        let before = header(&screen(&app));
+        assert!(
+            before.contains(&format!("{} bot", icons::BOT)),
+            "{before:?}"
+        );
+
+        let bot = slackers_slack::Bot {
+            id: giphy,
+            name: "giphy".into(),
+            avatar: None,
+        };
+        app.update(Event::Slack(w(0), Update::Bot(bot)));
+        let after = header(&screen(&app));
+        assert!(
+            after.contains(&format!("{} giphy", icons::BOT)),
+            "{after:?}"
+        );
     }
 
     #[test]

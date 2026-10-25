@@ -40,6 +40,10 @@ slack_id!(
     /// A person or bot, unique within its Workspace (`U…`, or `W…` on Enterprise Grid).
     UserId
 );
+slack_id!(
+    /// A bot, which an app or integration posts through (`B…`), unique within its Workspace.
+    BotId
+);
 
 /// When a Message was posted, which is also its id within its Conversation: microseconds since the Unix epoch.
 ///

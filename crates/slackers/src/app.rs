@@ -34,13 +34,13 @@ use std::time::{Duration, Instant};
 use crossterm::event::{Event as TerminalEvent, KeyCode, KeyEvent, KeyEventKind, KeyModifiers};
 use slackers_gfx::{CellSize, Fit, Picture};
 use slackers_model::{
-    Author, Block, Broadcast, Button, Conversation, ConversationId, ConversationKind, Emoji,
+    Author, Block, BotId, Broadcast, Button, Conversation, ConversationId, ConversationKind, Emoji,
     Happened, Inline, Message, MessageRef, ReactionChange, RichText, Style, Timeline, Ts, Unread,
     UserId,
 };
 use slackers_slack::{
-    Connection, EmojiList, Error, LiveEvent, Permalinks, Person, Request, SlashCommand, Snapshot,
-    Update, User,
+    Bot, Connection, EmojiList, Error, LiveEvent, Permalinks, Person, Request, SlashCommand,
+    Snapshot, Update, User,
 };
 
 use crate::activity::{Activity, Fetched};
@@ -523,6 +523,9 @@ pub(crate) struct Workspace {
     /// Its people, as far as they've been looked up.
     pub(crate) users: HashMap<UserId, User>,
     requested_users: HashSet<UserId>,
+    /// Its bots that posted without saying their names, as far as they've been looked up.
+    bots: HashMap<BotId, Bot>,
+    requested_bots: HashSet<BotId>,
     pub(crate) emojis: Emojis,
     permalinks: Permalinks,
     /// Channels by name, then DMs, most recently active first.
@@ -1824,10 +1827,7 @@ impl App {
         let several = self.workspaces.iter().count() > 1;
         self.held_notifications
             .retain(|(held, conversation, message)| {
-                let named = people_in(message)
-                    .iter()
-                    .all(|person| workspace.users.contains_key(person));
-                if *held != key || !named {
+                if *held != key || !workspace.knows_names_in(message) {
                     return true;
                 }
                 commands.push(workspace.notification(conversation, message, several));
@@ -2216,7 +2216,7 @@ impl App {
                 if let Some(message) = &message
                     && let Some(workspace) = self.workspaces.get_mut(key)
                 {
-                    workspace.want_users(key, people_in(message), commands);
+                    workspace.want_names_in(key, [message], commands);
                 }
                 self.activity.fetched(key, conversation, ts, message);
             }
@@ -2240,11 +2240,9 @@ impl App {
                 workspace.loading.remove(&conversation);
                 match result {
                     Ok(page) => {
-                        let people: Vec<UserId> =
-                            page.messages.iter().flat_map(people_in).collect();
+                        workspace.want_names_in(key, &page.messages, commands);
                         let timeline = workspace.timelines.entry(conversation).or_default();
                         timeline.add_history(page.messages, page.has_more);
-                        workspace.want_users(key, people, commands);
                     }
                     Err(error) => self.notice = Some(describe(&error)),
                 }
@@ -2261,13 +2259,12 @@ impl App {
                 workspace.loading_threads.remove(&thread);
                 match result {
                     Ok(messages) => {
-                        let people: Vec<UserId> = messages.iter().flat_map(people_in).collect();
+                        workspace.want_names_in(key, &messages, commands);
                         workspace
                             .threads
                             .entry(thread)
                             .or_insert_with(|| Timeline::thread(parent))
                             .add_history(messages, false);
-                        workspace.want_users(key, people, commands);
                     }
                     Err(error) => self.notice = Some(describe(&error)),
                 }
@@ -2296,9 +2293,8 @@ impl App {
                             }
                         }
                         // It may @-mention people found by name, whose names are known only to the search.
-                        let people = people_in(&message);
+                        workspace.want_names_in(key, [&message], commands);
                         workspace.add(&conversation, message);
-                        workspace.want_users(key, people, commands);
                     }
                     Err(error) => {
                         self.notice =
@@ -2310,6 +2306,12 @@ impl App {
             Update::User(user) => {
                 if let Some(workspace) = self.workspaces.get_mut(key) {
                     workspace.users.insert(user.id.clone(), user);
+                }
+                self.notify_held(key, commands);
+            }
+            Update::Bot(bot) => {
+                if let Some(workspace) = self.workspaces.get_mut(key) {
+                    workspace.bots.insert(bot.id.clone(), bot);
                 }
                 self.notify_held(key, commands);
             }
@@ -2438,7 +2440,7 @@ impl App {
                 conversation,
                 message,
             } => {
-                let people = people_in(&message);
+                workspace.want_names_in(key, [&message], commands);
                 let kind = workspace.conversation(&conversation).map(|c| &c.kind);
                 let is_dm = matches!(kind, Some(ConversationKind::Dm { .. }));
                 let in_followed = message.reply_to.is_some_and(|parent| {
@@ -2468,7 +2470,6 @@ impl App {
                     unread.record(message.ts, is_dm || message.mentions(&workspace.me));
                 }
                 workspace.add(&conversation, message);
-                workspace.want_users(key, people, commands);
             }
             LiveEvent::Edited {
                 conversation,
@@ -2587,6 +2588,8 @@ impl Workspace {
             connection: None,
             users: HashMap::new(),
             requested_users: HashSet::new(),
+            bots: HashMap::new(),
+            requested_bots: HashSet::new(),
             emojis: Emojis::default(),
             permalinks: snapshot.permalinks,
             conversations: conversations.into_iter().map(|(c, _)| c).collect(),
@@ -2677,6 +2680,15 @@ impl Workspace {
             .map_or(user.as_str(), |user| user.name.as_str())
     }
 
+    /// What `author` is called, as far as known: a bot not looked up yet is just "bot".
+    pub(crate) fn author_name<'a>(&'a self, author: &'a Author) -> &'a str {
+        match author {
+            Author::User(id) => self.user_name(id),
+            Author::Bot { name, .. } => name,
+            Author::UnnamedBot(id) => self.bots.get(id).map_or("bot", |bot| bot.name.as_str()),
+        }
+    }
+
     /// Where `message`, posted in `conversation`, leads: the web pages its text links to, each once, then its files,
     /// then the Message itself. Only `http` and `https` links are among them, so that none starts a program the user
     /// didn't mean to.
@@ -2740,6 +2752,7 @@ impl Workspace {
         match author {
             Author::User(id) => self.users.get(id)?.avatar.as_deref(),
             Author::Bot { avatar, .. } => avatar.as_deref(),
+            Author::UnnamedBot(id) => self.bots.get(id)?.avatar.as_deref(),
         }
     }
 
@@ -2863,10 +2876,7 @@ impl Workspace {
         message: &Message,
         several: bool,
     ) -> Command {
-        let author = match &message.author {
-            Author::User(id) => self.user_name(id).to_owned(),
-            Author::Bot { name, .. } => name.clone(),
-        };
+        let author = self.author_name(&message.author).to_owned();
         let place = self
             .conversation(conversation)
             .and_then(|found| match &found.kind {
@@ -2957,7 +2967,7 @@ impl Workspace {
             .flat_map(|timeline| timeline.messages().rev())
             .filter_map(|message| match &message.author {
                 Author::User(id) => Some(id),
-                Author::Bot { .. } => None,
+                Author::Bot { .. } | Author::UnnamedBot(_) => None,
             });
         let mut everyone: Vec<&User> = self.users.values().collect();
         everyone.sort_by(|a, b| a.name.cmp(&b.name).then_with(|| a.id.cmp(&b.id)));
@@ -3018,6 +3028,37 @@ impl Workspace {
         }
         suggestions.truncate(SUGGESTIONS);
         suggestions
+    }
+
+    /// Asks this Workspace, at `key`, for the names of the people `messages` name, and of the bots that wrote them
+    /// without saying theirs, not known or asked for yet.
+    fn want_names_in<'a>(
+        &mut self,
+        key: WorkspaceKey,
+        messages: impl IntoIterator<Item = &'a Message>,
+        commands: &mut Vec<Command>,
+    ) {
+        for message in messages {
+            // A bot is known only once asked for.
+            if let Author::UnnamedBot(bot) = &message.author
+                && self.requested_bots.insert(bot.clone())
+            {
+                commands.push(Command::Slack(key, Request::Bot(bot.clone())));
+            }
+            self.want_users(key, people_in(message), commands);
+        }
+    }
+
+    /// Whether everyone `message` names has a name here: its author, and the people it mentions.
+    fn knows_names_in(&self, message: &Message) -> bool {
+        let author = match &message.author {
+            Author::UnnamedBot(bot) => self.bots.contains_key(bot),
+            Author::User(_) | Author::Bot { .. } => true,
+        };
+        author
+            && people_in(message)
+                .iter()
+                .all(|person| self.users.contains_key(person))
     }
 
     /// Asks this Workspace, at `key`, for the names of `people` not known or asked for yet.
@@ -3109,7 +3150,7 @@ fn same_name(a: &str, b: &str) -> bool {
 fn people_in(message: &Message) -> Vec<UserId> {
     let author = match &message.author {
         Author::User(id) => Some(id.clone()),
-        Author::Bot { .. } => None,
+        Author::Bot { .. } | Author::UnnamedBot(_) => None,
     };
     let mentioned = message.content.inlines().filter_map(|inline| match inline {
         Inline::User(id) => Some(id.clone()),
@@ -5583,6 +5624,90 @@ mod tests {
             .collect();
         assert_eq!(bodies.len(), HELD_NOTIFICATIONS);
         assert_eq!((bodies[0], bodies[19]), ("6", "25"), "the oldest went");
+    }
+
+    #[test]
+    fn bots_that_dont_say_their_names_are_looked_up_once_and_named_after() {
+        let giphy = BotId::new("B1");
+        let by_giphy = |s: u64| Message {
+            author: Author::UnnamedBot(giphy.clone()),
+            ..message(s, "U2", RichText::plain("a gif"))
+        };
+        let look_up = ask(Request::Bot(giphy.clone()));
+        let mut app = reading_random();
+        let page = HistoryPage {
+            messages: vec![by_giphy(1), by_giphy(2)],
+            has_more: false,
+        };
+        let commands = app.update(slack(Update::History {
+            conversation: id("C2"),
+            result: Ok(page),
+        }));
+        assert_eq!(
+            commands
+                .iter()
+                .filter(|&command| *command == look_up)
+                .count(),
+            1
+        );
+        let posted = |s| {
+            slack(Update::Live(LiveEvent::Posted {
+                conversation: id("C2"),
+                message: by_giphy(s),
+            }))
+        };
+        assert!(!app.update(posted(3)).contains(&look_up), "asked already");
+        let author = Author::UnnamedBot(giphy.clone());
+        assert_eq!(workspace(&app, W0).author_name(&author), "bot");
+
+        app.update(slack(Update::Bot(Bot {
+            id: giphy.clone(),
+            name: "giphy".into(),
+            avatar: Some("https://a/giphy.png".into()),
+        })));
+        assert_eq!(workspace(&app, W0).author_name(&author), "giphy");
+        assert_eq!(
+            workspace(&app, W0).avatar(&author),
+            Some("https://a/giphy.png")
+        );
+        assert!(!app.update(posted(4)).contains(&look_up), "known now");
+
+        let other = BotId::new("B2");
+        let fetched = app.update(slack(Update::Message {
+            conversation: id("C2"),
+            ts: seconds(5),
+            result: Ok(Some(Message {
+                author: Author::UnnamedBot(other.clone()),
+                ..message(5, "U2", RichText::plain("for Activity"))
+            })),
+        }));
+        assert_eq!(
+            fetched,
+            [ask(Request::Bot(other))],
+            "a Message fetched for Activity too"
+        );
+    }
+
+    #[test]
+    fn a_bots_notification_waits_for_its_name() {
+        let (mut app, _) = ready_app();
+        app.update(Event::Terminal(TerminalEvent::FocusLost));
+        let giphy = BotId::new("B1");
+        let commands = app.update(slack(Update::Live(LiveEvent::Posted {
+            conversation: id("D1"),
+            message: Message {
+                author: Author::UnnamedBot(giphy.clone()),
+                ..message(30, "U9", RichText::plain("a gif"))
+            },
+        })));
+        assert!(notified(&commands).is_empty(), "the bot has no name yet");
+        assert!(commands.contains(&ask(Request::Bot(giphy.clone()))));
+        let named = app.update(slack(Update::Bot(Bot {
+            id: giphy,
+            name: "giphy".into(),
+            avatar: None,
+        })));
+        assert_eq!(notified(&named), [("giphy", "a gif")]);
     }
 
     #[test]
