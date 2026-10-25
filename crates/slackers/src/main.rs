@@ -9,6 +9,7 @@
 //! work as in vim (see [`app`]); `:q` quits. Logs go to `$XDG_STATE_HOME/slackers/slackers.log`; `RUST_LOG` sets
 //! their level.
 
+mod activity;
 mod app;
 mod config;
 mod credentials;

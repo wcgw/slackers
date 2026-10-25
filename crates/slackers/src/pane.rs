@@ -56,9 +56,15 @@ pub(crate) struct Block {
 
 impl Pane {
     /// The selected Message; `None` for the newest.
-    #[cfg(test)]
     pub(crate) fn cursor(&self) -> Option<Ts> {
         self.cursor
+    }
+
+    /// Selects the Message at `ts`, and scrolls to show it. One not loaded yet stays selected, and shows once it is;
+    /// until then the newest shows.
+    pub(crate) fn select(&mut self, ts: Ts) {
+        self.cursor = Some(ts);
+        self.anchor = Anchor::Cursor;
     }
 
     /// The selected Message: the one under the cursor, else the newest in `timeline`.

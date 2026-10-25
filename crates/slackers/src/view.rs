@@ -12,14 +12,16 @@ use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, Borders, Clear, Paragraph, Wrap};
 use slackers_gfx::{CellBox, Fit};
 use slackers_model::{
-    Activity, Author, Block as TextBlock, Broadcast, Conversation, ConversationKind, Emoji, File,
-    Image, Inline, Message, Reaction, RichText, Style as TextStyle, Timeline, Ts,
+    Author, Block as TextBlock, Broadcast, Conversation, ConversationId, ConversationKind, Emoji,
+    File, Happened, Image, Inline, MentionOf, Message, Reaction, RichText, Style as TextStyle,
+    Timeline, Ts, Unread,
 };
 use slackers_slack::Connection;
 use unicode_width::UnicodeWidthStr as _;
 
+use crate::activity::{Entry, Fetched};
 use crate::app::{
-    App, ConversationRef, Details, Drawn, Focus, LinkKind, Mode, Phase, Place, Suggested,
+    App, ConversationRef, Details, Drawn, Focus, LinkKind, Mode, Opened, Phase, Place, Suggested,
     Suggestions, WantedPicture, Workspace, WorkspaceKey,
 };
 use crate::draft::{Draft, Mentioned};
@@ -74,12 +76,227 @@ pub(crate) fn draw(frame: &mut Frame<'_>, app: &App) -> Drawn {
     } else {
         main
     };
-    match &app.open {
-        Some(open) => draw_conversation(frame, messages, app, open, &mut drawn),
+    match &app.opened {
+        Some(Opened::Conversation(open)) => {
+            draw_conversation(frame, messages, app, open, &mut drawn)
+        }
+        Some(Opened::Activity) => draw_activity(frame, messages, app, &mut drawn),
         None => draw_sign_ins(frame, messages, app),
     }
     draw_status(frame, status, app);
     drawn
+}
+
+/// How many lines each Activity item takes.
+const ACTIVITY_LINES: usize = 2;
+
+/// The room left of an Activity item's words: whether it's unread, its Workspace's icon, and what happened.
+const ACTIVITY_LEAD: usize = 7;
+
+/// Draws Activity in `area`: a title, then every item, newest first, the selected one tinted and kept in view.
+fn draw_activity(frame: &mut Frame<'_>, area: Rect, app: &App, drawn: &mut Drawn) {
+    let [header, body] = Layout::vertical([Constraint::Length(1), Constraint::Fill(1)]).areas(area);
+    let mut title = vec![
+        Span::styled(icons::ACTIVITY, ACCENT),
+        Span::styled("Activity", Style::new().add_modifier(Modifier::BOLD)),
+    ];
+    let unread = app.activity.unread();
+    if unread > 0 {
+        title.push(Span::styled(format!("  {unread} unread"), DIM));
+    }
+    frame.render_widget(Paragraph::new(Line::from(title)), header);
+    let body = body.inner(Margin {
+        horizontal: 1,
+        vertical: 0,
+    });
+    let entries = app.activity.entries();
+    if entries.is_empty() {
+        let empty = if app.activity.is_loading() {
+            Line::from(vec![
+                Span::styled(icons::LOADING, ACCENT),
+                Span::styled("loading…", DIM),
+            ])
+        } else {
+            Line::styled("nothing yet", DIM)
+        };
+        frame.render_widget(Paragraph::new(empty), body);
+        return;
+    }
+    let (zone, now) = (TimeZone::system(), Timestamp::now());
+    let selected = app.activity.selected();
+    let fit = (usize::from(body.height) / ACTIVITY_LINES).max(1);
+    let first = (selected + 1).saturating_sub(fit);
+    let mut lines = Vec::with_capacity(fit * ACTIVITY_LINES);
+    for entry in entries.iter().skip(first).take(fit) {
+        lines.extend(activity_item(app, entry, body.width, &zone, now, drawn));
+    }
+    frame.render_widget(Paragraph::new(lines), body);
+    // Tint the selected item across the whole pane.
+    let row = u16::try_from((selected - first) * ACTIVITY_LINES).unwrap_or(u16::MAX);
+    let rows = Rect {
+        y: body.y.saturating_add(row),
+        height: u16::try_from(ACTIVITY_LINES).unwrap_or(1),
+        ..area
+    }
+    .intersection(area);
+    let tint = if app.focus == Focus::Activity {
+        SELECTED
+    } else {
+        SELECTED_UNFOCUSED
+    };
+    frame.buffer_mut().set_style(rows, tint);
+}
+
+/// An Activity item's lines, `width` cells wide: whether it's unread, its Workspace's icon, what happened, by whom,
+/// where and when; then the gist of its Message, by whom for Replies and DMs.
+fn activity_item(
+    app: &App,
+    entry: &Entry<'_>,
+    width: u16,
+    zone: &TimeZone,
+    now: Timestamp,
+    drawn: &mut Drawn,
+) -> [Line<'static>; ACTIVITY_LINES] {
+    let Some(workspace) = app.workspaces.get(entry.workspace) else {
+        return [Line::default(), Line::default()];
+    };
+    let item = entry.item;
+    let mut renderer = Renderer::new(app, workspace, entry.workspace, width, zone);
+    let name = |id| workspace.user_name(id).to_owned();
+    let place = place_name(workspace, &item.message.conversation);
+    let icon = |icon: &'static str, style| Span::styled(format!("{icon} "), style);
+    let (what, words) = match &item.happened {
+        Happened::Mention { author, of } => {
+            let whom = match of {
+                MentionOf::User => "you",
+                MentionOf::Group => "your group",
+                MentionOf::Everyone => "everyone",
+            };
+            let words = format!("{} mentioned {whom} in {place}", name(author));
+            (icon(icons::MENTION, MENTION_ME), words)
+        }
+        Happened::Reaction { user, emoji } => {
+            let glyph = match renderer.emoji(emoji) {
+                Piece::Atom(glyph, cells) => {
+                    let pad = usize::from(EMOJI_CELLS.saturating_sub(cells).max(1));
+                    Span::styled(format!("{}{}", glyph.content, " ".repeat(pad)), glyph.style)
+                }
+                Piece::Text(..) => icon(icons::REACTION, ACCENT),
+            };
+            (
+                glyph,
+                format!("{} reacted to your message in {place}", name(user)),
+            )
+        }
+        Happened::Replies { unread } => {
+            let words = match unread {
+                0 => format!("Replies in a thread in {place}"),
+                1 => format!("1 new reply in a thread in {place}"),
+                count => format!("{count} new replies in a thread in {place}"),
+            };
+            (icon(icons::THREAD, ACCENT), words)
+        }
+        Happened::Dm => (icon(icons::DM, ACCENT), format!("Message from {place}")),
+        Happened::Added { author } => (
+            icon(icons::ADDED, ACCENT),
+            format!("{} added you to {place}", name(author)),
+        ),
+    };
+    let when = when(item.at, zone, now);
+    let marker = workspace_marker(app, entry.workspace, workspace, drawn);
+    let unread = if item.unread {
+        Span::styled(icons::UNREAD, ACCENT)
+    } else {
+        Span::raw("  ")
+    };
+    let style = if item.unread {
+        Style::new().add_modifier(Modifier::BOLD)
+    } else {
+        READ
+    };
+    let room = usize::from(width).saturating_sub(ACTIVITY_LEAD + when.width() + 1);
+    let mut first = vec![unread, marker, what];
+    first.extend(cut(&words, style, room));
+    let used: usize = first.iter().map(Span::width).sum();
+    first.push(Span::raw(
+        " ".repeat(usize::from(width).saturating_sub(used + when.width())),
+    ));
+    first.push(Span::styled(when, DIM));
+
+    let gist = match app.activity_message(entry.workspace, &item.message) {
+        Fetched::Got(message) => {
+            let by = match item.happened {
+                Happened::Replies { .. } | Happened::Dm => {
+                    format!("{}: ", author_name(workspace, &message.author))
+                }
+                Happened::Mention { .. } | Happened::Reaction { .. } | Happened::Added { .. } => {
+                    String::new()
+                }
+            };
+            Span::raw(by + &gist(workspace, &message.content))
+        }
+        Fetched::Unasked => {
+            drawn
+                .wanted_messages
+                .push((entry.workspace, item.message.clone()));
+            Span::styled("…", DIM)
+        }
+        Fetched::Fetching => Span::styled("…", DIM),
+        Fetched::Unavailable => Span::styled("message unavailable", DIM),
+    };
+    let mut second = vec![Span::raw(" ".repeat(ACTIVITY_LEAD))];
+    let room = usize::from(width).saturating_sub(ACTIVITY_LEAD);
+    second.extend(cut(&gist.content, gist.style.patch(DIM), room));
+    drawn.wanted_pictures.extend(renderer.wanted);
+    drawn.next_change = earliest(drawn.next_change, renderer.next_change);
+    [Line::from(first), Line::from(second)]
+}
+
+/// What to call where `conversation` is: `#name` for a Channel, else the DM's name.
+fn place_name(workspace: &Workspace, conversation: &ConversationId) -> String {
+    match workspace.conversation(conversation) {
+        Some(
+            found @ Conversation {
+                kind: ConversationKind::Channel { .. },
+                ..
+            },
+        ) => format!("#{}", found.name),
+        Some(found) => workspace.conversation_name(found).to_owned(),
+        None => "a conversation you're not in".to_owned(),
+    }
+}
+
+/// What `author` is called.
+fn author_name(workspace: &Workspace, author: &Author) -> String {
+    match author {
+        Author::User(id) => workspace.user_name(id).to_owned(),
+        Author::Bot { name, .. } => name.clone(),
+    }
+}
+
+/// As much of `text` in `style` as fits in `room` cells, ending with an ellipsis if it doesn't all fit.
+fn cut(text: &str, style: Style, room: usize) -> Vec<Span<'static>> {
+    if text.width() <= room {
+        return vec![Span::styled(text.to_owned(), style)];
+    }
+    let (mut spans, _) = highlighted(text, style, &[], room.saturating_sub(1));
+    spans.push(Span::styled("…", style));
+    spans
+}
+
+/// When `ts` was, from `now`: the time of day if it's today, else the day, and the year if it's another.
+fn when(ts: Ts, zone: &TimeZone, now: Timestamp) -> String {
+    let (Some(then), today) = (zoned(ts, zone), now.to_zoned(zone.clone())) else {
+        return String::new();
+    };
+    let format = if then.date() == today.date() {
+        "%H:%M"
+    } else if then.year() == today.year() {
+        "%d %b"
+    } else {
+        "%d %b %Y"
+    };
+    then.strftime(format).to_string()
 }
 
 /// Says, in the middle of `area`, how signing in goes for each Workspace not signed in to yet.
@@ -161,6 +378,10 @@ fn draw_sidebar(frame: &mut Frame<'_>, area: Rect, app: &App, drawn: &mut Drawn)
                 .take(height)
                 .map(|(index, row)| {
                     let (line, is_open) = match row {
+                        Row::Activity => (
+                            activity_row(app, list.width),
+                            app.opened == Some(Opened::Activity),
+                        ),
                         Row::Header(section) => {
                             (header_row(app, section, list.width, drawn), false)
                         }
@@ -172,7 +393,7 @@ fn draw_sidebar(frame: &mut Frame<'_>, area: Rect, app: &App, drawn: &mut Drawn)
                             let marked = !matches!(section, Section::Workspace(_));
                             let line =
                                 conversation_row(app, conversation, marked, &[], list.width, drawn);
-                            (line, app.open.as_ref() == Some(conversation))
+                            (line, app.open_conversation() == Some(conversation))
                         }
                         Row::Item {
                             item:
@@ -183,14 +404,16 @@ fn draw_sidebar(frame: &mut Frame<'_>, area: Rect, app: &App, drawn: &mut Drawn)
                             ..
                         } => {
                             let line = thread_row(app, conversation, *parent, list.width, drawn);
-                            let is_open = app.open.as_ref() == Some(conversation)
+                            let is_open = app.open_conversation() == Some(conversation)
                                 && app.open_thread == Some(*parent);
                             (line, is_open)
                         }
                     };
                     match (index == cursor, app.focus) {
                         (true, Focus::Sidebar) => line.patch_style(SELECTED),
-                        (true, Focus::Timeline | Focus::Thread) | (false, _) if is_open => {
+                        (true, Focus::Timeline | Focus::Thread | Focus::Activity) | (false, _)
+                            if is_open =>
+                        {
                             line.patch_style(SELECTED_UNFOCUSED)
                         }
                         _ => line,
@@ -210,24 +433,24 @@ struct Badge {
 }
 
 impl Badge {
-    fn of(activity: Option<&Activity>) -> Self {
+    fn of(unread: Option<&Unread>) -> Self {
         Self {
-            unread: activity.is_some_and(Activity::has_unread),
-            mentions: activity.map_or(0, Activity::mentions),
+            unread: unread.is_some_and(Unread::has_unread),
+            mentions: unread.map_or(0, Unread::mentions),
         }
     }
 
-    /// `item`'s: a Conversation's Activity, or a Followed Thread's.
+    /// `item`'s: what's Unread in a Conversation, or in a Followed Thread.
     fn of_item(app: &App, item: &Item) -> Self {
         match item {
-            Item::Conversation(conversation) => Self::of(app.workspaces.activity(conversation)),
+            Item::Conversation(conversation) => Self::of(app.workspaces.unread(conversation)),
             Item::Thread {
                 conversation,
                 parent,
             } => Self::of(
                 app.workspaces
                     .followed(conversation, *parent)
-                    .map(|followed| &followed.activity),
+                    .map(|followed| &followed.unread),
             ),
         }
     }
@@ -250,6 +473,19 @@ impl Badge {
     }
 }
 
+/// Activity's row: its icon and name, bold while items are unread, and on the right how many are.
+fn activity_row(app: &App, width: u16) -> Line<'static> {
+    let unread = app.activity.unread();
+    let (icon_style, name_style, badge) = if unread > 0 {
+        let bold = Style::new().add_modifier(Modifier::BOLD);
+        (ACCENT, bold, Span::styled(unread.to_string(), MENTION_ME))
+    } else {
+        (DIM, READ, Span::raw(""))
+    };
+    let lead = vec![Span::raw("  "), Span::styled(icons::ACTIVITY, icon_style)];
+    entry(lead, "Activity", name_style, &[], badge, width)
+}
+
 /// A section's header: whether it's folded, its icon and name, and the combined badge of what it holds.
 fn header_row(app: &App, section: &Section, width: u16, drawn: &mut Drawn) -> Line<'static> {
     let fold = if app.sidebar.is_folded(section) {
@@ -270,7 +506,7 @@ fn header_row(app: &App, section: &Section, width: u16, drawn: &mut Drawn) -> Li
         &name,
         bold,
         &[],
-        badge,
+        badge.span(),
         width,
     )
 }
@@ -312,7 +548,7 @@ fn conversation_row(
     let Some((workspace, found)) = app.workspaces.conversation(conversation) else {
         return Line::default();
     };
-    let badge = Badge::of(workspace.activity.get(&conversation.id));
+    let badge = Badge::of(workspace.unread.get(&conversation.id));
     let (icon, name) = label(workspace, found);
     let marker = if marked {
         workspace_marker(app, conversation.workspace, workspace, drawn)
@@ -325,7 +561,7 @@ fn conversation_row(
         (DIM, READ)
     };
     let lead = vec![marker, Span::styled(icon, icon_style)];
-    entry(lead, name, name_style, matched, badge, width)
+    entry(lead, name, name_style, matched, badge.span(), width)
 }
 
 /// A Followed Thread's row: its Workspace's icon; a Thread icon; its Conversation's name and the gist of its parent
@@ -341,7 +577,7 @@ fn thread_row(
         return Line::default();
     };
     let followed = workspace.followed.get(&(conversation.id.clone(), parent));
-    let badge = Badge::of(followed.map(|followed| &followed.activity));
+    let badge = Badge::of(followed.map(|followed| &followed.unread));
     let (_, name) = label(workspace, found);
     let parent_message = followed
         .and_then(|followed| followed.parent.as_ref())
@@ -357,7 +593,7 @@ fn thread_row(
     };
     let marker = workspace_marker(app, conversation.workspace, workspace, drawn);
     let lead = vec![marker, Span::styled(icons::THREAD, icon_style)];
-    entry(lead, &text, name_style, &[], badge, width)
+    entry(lead, &text, name_style, &[], badge.span(), width)
 }
 
 /// `text` as one line of plain words: people, Channels and emoji by name, links by their label.
@@ -393,10 +629,9 @@ fn entry(
     name: &str,
     name_style: Style,
     matched: &[usize],
-    badge: Badge,
+    badge: Span<'static>,
     width: u16,
 ) -> Line<'static> {
-    let badge = badge.span();
     let room = usize::from(width).saturating_sub(LEAD + badge.width() + 1);
     let limit = if name.width() > room {
         room.saturating_sub(1)
@@ -1488,6 +1723,7 @@ fn draw_status(frame: &mut Frame<'_>, area: Rect, app: &App) {
         (_, Focus::Timeline) => {
             "j/k message · ⏎ thread · K details · o open · ^e/^y line · ^d/^u page · g/G · i write · \\ sidebar · :q quit"
         }
+        (_, Focus::Activity) => "j/k choose · ⏎ open · g/G newest/oldest · \\ sidebar · :q quit",
         (_, Focus::Thread) => {
             "j/k message · K details · o open · ^e/^y line · i reply · esc close · \\ sidebar · :q quit"
         }
@@ -1606,7 +1842,7 @@ mod tests {
     use crossterm::event::{Event as TerminalEvent, KeyCode, KeyEvent, KeyModifiers};
     use ratatui::Terminal;
     use ratatui::backend::TestBackend;
-    use slackers_model::{Activity, ConversationId, Message, RichText, Ts, UserId, WorkspaceId};
+    use slackers_model::{ConversationId, Message, RichText, Ts, Unread, UserId, WorkspaceId};
     use slackers_slack::{HistoryPage, Permalinks, Snapshot, Update};
 
     use super::*;
@@ -1683,21 +1919,17 @@ mod tests {
         }
     }
 
-    fn channel(id: &str, name: &str) -> (Conversation, Activity) {
+    fn channel(id: &str, name: &str) -> (Conversation, Unread) {
         let channel = Conversation {
             id: ConversationId::new(id),
             kind: ConversationKind::Channel { private: false },
             name: name.into(),
         };
-        (channel, Activity::default())
+        (channel, Unread::default())
     }
 
     /// A Workspace called `name`, holding `conversations`.
-    fn ready(
-        name: &str,
-        icon: Option<&str>,
-        conversations: Vec<(Conversation, Activity)>,
-    ) -> Update {
+    fn ready(name: &str, icon: Option<&str>, conversations: Vec<(Conversation, Unread)>) -> Update {
         Update::Ready(Box::new(Snapshot {
             workspace: WorkspaceId::new("T1"),
             name: name.into(),
@@ -2089,9 +2321,10 @@ mod tests {
         press(&mut app, KeyCode::Tab, KeyModifiers::NONE);
         assert_eq!(app.focus, Focus::Sidebar);
         let rows = screen(&app);
-        assert!(rows[0].starts_with(&format!("{}{}Threads", icons::UNFOLDED, icons::THREAD)));
+        assert!(rows[0].starts_with(&format!("  {}Activity", icons::ACTIVITY)));
+        assert!(rows[1].starts_with(&format!("{}{}Threads", icons::UNFOLDED, icons::THREAD)));
         assert!(
-            rows[1].starts_with(&format!("{}T Test", icons::UNFOLDED)),
+            rows[2].starts_with(&format!("{}T Test", icons::UNFOLDED)),
             "then the Workspace's section"
         );
 
@@ -2151,11 +2384,11 @@ mod tests {
             virtual_workspaces,
             CELL,
         );
-        let unread = Activity::counted(Ts::from_micros(1), Ts::from_micros(5), true, 0);
+        let unread = Unread::counted(Ts::from_micros(1), Ts::from_micros(5), true, 0);
         let random = (channel("C2", "random").0, unread);
         let test = ready("Test", None, vec![channel("C1", "general"), random]);
         app.update(Event::Slack(w(0), test));
-        let mentioned = Activity::counted(Ts::from_micros(1), Ts::from_micros(5), true, 2);
+        let mentioned = Unread::counted(Ts::from_micros(1), Ts::from_micros(5), true, 2);
         let dev = (channel("C6", "dev").0, mentioned);
         let other = ready("Other", Some("https://i/other.png"), vec![dev]);
         app.update(Event::Slack(w(1), other));
@@ -2176,8 +2409,8 @@ mod tests {
                     .to_owned()
             })
             .collect();
-        // Below the Threads section, empty here.
-        let sidebar = &sidebar[1..];
+        // Below Activity's row and the Threads section, empty here.
+        let sidebar = &sidebar[2..];
         let header = format!("{}{}K", icons::UNFOLDED, icons::VIRTUAL_WORKSPACE);
         assert!(sidebar[0].starts_with(&header), "{sidebar:#?}");
         assert!(
@@ -2312,6 +2545,162 @@ mod tests {
     }
 
     #[test]
+    fn activity_lists_what_happened_newest_first_and_the_gist_of_each_message() {
+        let mut app = App::new(vec!["test".into()], Vec::new(), CELL);
+        let dm = Conversation {
+            id: ConversationId::new("D1"),
+            kind: ConversationKind::Dm {
+                with: UserId::new("U2"),
+            },
+            name: String::new(),
+        };
+        let conversations = vec![
+            channel("C1", "general"),
+            channel("C2", "random"),
+            (dm, Unread::default()),
+        ];
+        app.update(Event::Slack(w(0), ready("Test", None, conversations)));
+        for (id, name) in [("U2", "Ana"), ("U3", "Bob")] {
+            let user = slackers_slack::User {
+                id: UserId::new(id),
+                name: name.into(),
+                full_name: String::new(),
+                title: String::new(),
+                time_zone: None,
+                avatar: None,
+            };
+            app.update(Event::Slack(w(0), Update::User(user)));
+        }
+        let at = |seconds: u64| Ts::from_micros(seconds * 1_000_000);
+        let item = |key: &str, when: u64, conversation: &str, thread, happened, unread| {
+            slackers_model::ActivityItem {
+                key: key.into(),
+                at: at(when),
+                unread,
+                message: slackers_model::MessageRef {
+                    conversation: ConversationId::new(conversation),
+                    ts: at(when - 1),
+                    thread,
+                },
+                happened,
+            }
+        };
+        let items = vec![
+            item(
+                "m",
+                50,
+                "C1",
+                None,
+                Happened::Mention {
+                    author: UserId::new("U2"),
+                    of: MentionOf::User,
+                },
+                true,
+            ),
+            item(
+                "r",
+                40,
+                "C1",
+                None,
+                Happened::Reaction {
+                    user: UserId::new("U3"),
+                    emoji: Emoji::named("+1"),
+                },
+                false,
+            ),
+            item(
+                "t",
+                30,
+                "C1",
+                Some(at(10)),
+                Happened::Replies { unread: 2 },
+                true,
+            ),
+            item("d", 20, "D1", None, Happened::Dm, false),
+            item(
+                "a",
+                15,
+                "C2",
+                None,
+                Happened::Added {
+                    author: UserId::new("U3"),
+                },
+                false,
+            ),
+        ];
+        let page = slackers_slack::ActivityPage { items, next: None };
+        app.update(Event::Slack(
+            w(0),
+            Update::Activity {
+                cursor: None,
+                result: Ok(page),
+            },
+        ));
+        type_text(&mut app, "g");
+        press(&mut app, KeyCode::Enter, KeyModifiers::NONE);
+
+        let (rows, drawn, buffer) = render_sized(&app, 100);
+        let sidebar: String = rows[0].chars().take(29).collect();
+        assert!(
+            sidebar.starts_with(&format!("  {}Activity", icons::ACTIVITY))
+                && sidebar.trim_end().ends_with('2'),
+            "two unread: {sidebar:?}"
+        );
+        let row_of = |text: &str| rows.iter().position(|row| row.contains(text));
+        assert_eq!(row_of("Activity  2 unread"), Some(0), "{rows:#?}");
+        let said = [
+            "Ana mentioned you in #general",
+            "Bob reacted to your message in #general",
+            "2 new replies in a thread in #general",
+            "Message from Ana",
+            "Bob added you to #random",
+        ];
+        let found: Vec<Option<usize>> = said.iter().map(|text| row_of(text)).collect();
+        assert_eq!(found, [1, 3, 5, 7, 9].map(Some), "{rows:#?}");
+        assert!(rows[3].contains("👍"), "the reaction's emoji: {rows:#?}");
+        assert!(rows[2].contains('…'), "its gist is on its way");
+        let wanted: Vec<&str> = drawn
+            .wanted_messages
+            .iter()
+            .map(|(_, at)| at.conversation.as_str())
+            .collect();
+        assert_eq!(wanted, ["C1", "C1", "C1", "D1", "C2"]);
+        let x = u16::try_from(
+            rows[1]
+                .find("Ana")
+                .map_or(0, |at| rows[1][..at].chars().count()),
+        )
+        .unwrap();
+        assert_eq!(
+            buffer[(x, 1)].bg,
+            SELECTED.bg.unwrap(),
+            "the newest is selected"
+        );
+        assert_eq!(buffer[(x, 2)].bg, SELECTED.bg.unwrap(), "both its lines");
+
+        let mut fetched = Message {
+            ts: at(39),
+            content: RichText::plain("the plan is ready"),
+            ..reading_general_message()
+        };
+        fetched.author = Author::User(UserId::new("UME"));
+        app.update(Event::Slack(
+            w(0),
+            Update::Message {
+                conversation: ConversationId::new("C1"),
+                ts: at(39),
+                result: Ok(Some(fetched)),
+            },
+        ));
+        let rows = render_sized(&app, 100).0;
+        assert!(rows[4].contains("the plan is ready"), "{rows:#?}");
+        assert!(
+            rows.last().unwrap().contains("j/k choose · ⏎ open"),
+            "{rows:#?}"
+        );
+    }
+
+    #[test]
     fn the_status_line_says_which_workspaces_arent_live() {
         let mut app = App::new(vec!["test".into(), "other".into()], Vec::new(), CELL);
         app.update(Event::Slack(w(0), ready("Test", None, Vec::new())));
@@ -2377,7 +2766,7 @@ mod tests {
         let read = parent.ts;
         let thread = slackers_slack::FollowedThread {
             conversation: ConversationId::new("C1"),
-            activity: Activity::counted(read, Ts::from_micros(read.as_micros() + 1), true, 0),
+            unread: Unread::counted(read, Ts::from_micros(read.as_micros() + 1), true, 0),
             parent,
         };
         let snapshot = Snapshot {
@@ -2391,7 +2780,7 @@ mod tests {
         };
         app.update(Event::Slack(w(0), Update::Ready(Box::new(snapshot))));
         let rows = screen(&app);
-        let row: String = rows[1].chars().take(29).collect();
+        let row: String = rows[2].chars().take(29).collect();
         // Its words run together on one line, cut to fit.
         assert!(
             row.starts_with(&format!("T {}general: can someone …", icons::THREAD)),
@@ -2401,7 +2790,7 @@ mod tests {
             row.trim_end().ends_with(icons::UNREAD.trim_end()),
             "{row:?}"
         );
-        let header: String = rows[0].chars().take(29).collect();
+        let header: String = rows[1].chars().take(29).collect();
         assert!(
             header.trim_end().ends_with(icons::UNREAD.trim_end()),
             "the header adds it up: {header:?}"

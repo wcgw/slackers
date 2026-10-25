@@ -11,6 +11,12 @@ pub(crate) const PRIVATE_CHANNEL: &str = "\u{f456} ";
 pub(crate) const DM: &str = "\u{f415} ";
 /// `oct-people`: a group DM.
 pub(crate) const GROUP_DM: &str = "\u{f4fd} ";
+/// `oct-bell`: Activity.
+pub(crate) const ACTIVITY: &str = "\u{f49a} ";
+/// `oct-smiley`: a reaction whose emoji can't be drawn.
+pub(crate) const REACTION: &str = "\u{f4a2} ";
+/// `oct-person_add`: being added to a Channel.
+pub(crate) const ADDED: &str = "\u{f4fe} ";
 /// `oct-mention`: Mentions waiting.
 pub(crate) const MENTION: &str = "\u{f486} ";
 /// `oct-dot_fill`: unread Messages waiting.

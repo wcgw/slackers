@@ -2,8 +2,8 @@ use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 
 use slackers_model::{
-    Activity, Broadcast, Conversation, ConversationId, CustomEmojiSet, Emoji, Message, Reaction,
-    ReactionChange, Ts, UserId, WorkspaceId,
+    ActivityItem, Broadcast, Conversation, ConversationId, CustomEmojiSet, Emoji, Message,
+    Reaction, ReactionChange, Ts, Unread, UserId, WorkspaceId,
 };
 use tokio::sync::mpsc;
 use tokio::task::JoinSet;
@@ -62,6 +62,18 @@ pub enum Request {
         /// Where.
         conversation: ConversationId,
         /// Which Message.
+        ts: Ts,
+    },
+    /// A page of the user's Activity, newest first; answered by [`Update::Activity`].
+    Activity {
+        /// Where the page starts: `None` for the newest, else as the page before said.
+        cursor: Option<ActivityCursor>,
+    },
+    /// One Message, a Reply or not; answered by [`Update::Message`].
+    Message {
+        /// Where.
+        conversation: ConversationId,
+        /// Which.
         ts: Ts,
     },
     /// A Thread, parent and Replies; answered by [`Update::Replies`].
@@ -136,6 +148,22 @@ pub enum Update {
         /// Who, best first, or why no one.
         result: Result<Vec<Person>, Error>,
     },
+    /// The answer to [`Request::Activity`].
+    Activity {
+        /// Where the page asked for starts.
+        cursor: Option<ActivityCursor>,
+        /// The page, or why there isn't one.
+        result: Result<ActivityPage, Error>,
+    },
+    /// The answer to [`Request::Message`].
+    Message {
+        /// Where.
+        conversation: ConversationId,
+        /// Which.
+        ts: Ts,
+        /// The Message; `None` if it's gone, or why it isn't known.
+        result: Result<Option<Message>, Error>,
+    },
     /// The answer to [`Request::Reactions`].
     Reactions {
         /// Where.
@@ -171,8 +199,8 @@ pub struct Snapshot {
     pub me: UserId,
     /// Builds links to the Workspace's Messages.
     pub permalinks: Permalinks,
-    /// The Conversations in the user's sidebar, with their Activity, in no particular order.
-    pub conversations: Vec<(Conversation, Activity)>,
+    /// The Conversations in the user's sidebar, with what's Unread in each, in no particular order.
+    pub conversations: Vec<(Conversation, Unread)>,
     /// The Followed Threads with the latest Replies; possibly not all of them.
     pub followed_threads: Vec<FollowedThread>,
 }
@@ -186,7 +214,7 @@ pub struct FollowedThread {
     pub parent: Message,
     /// Its Replies past its Read Marker. Mentions in them aren't counted: Slack only counts them across every
     /// Thread.
-    pub activity: Activity,
+    pub unread: Unread,
 }
 
 /// A page of a Conversation's history.
@@ -214,6 +242,19 @@ pub struct User {
     /// Where their avatar image is, about 48 pixels square; `None` when they have none.
     pub avatar: Option<String>,
 }
+
+/// A page of a Workspace's Activity.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ActivityPage {
+    /// Its items, newest first.
+    pub items: Vec<ActivityItem>,
+    /// Where the next, older page starts; `None` after the last.
+    pub next: Option<ActivityCursor>,
+}
+
+/// Where a page of Activity starts, as Slack says: what [`ActivityPage::next`] holds.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ActivityCursor(pub String);
 
 /// The emoji a Workspace has.
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
@@ -256,8 +297,8 @@ pub enum LiveEvent {
     Joined {
         /// Which.
         conversation: Conversation,
-        /// Its Activity up to its Read Marker; Messages that brought it arrive after.
-        activity: Activity,
+        /// What's Unread in it, as of its Read Marker; the Messages that made it appear arrive after.
+        unread: Unread,
     },
     /// A Message was posted. A Reply carries [`Message::reply_to`].
     Posted {
@@ -290,6 +331,8 @@ pub enum LiveEvent {
         emoji: Emoji,
         /// Who.
         user: UserId,
+        /// Who wrote the Message, when Slack says.
+        author: Option<UserId>,
         /// Added or taken back.
         change: ReactionChange,
     },
@@ -455,7 +498,7 @@ async fn relay<F, Found>(
     notify: Notify,
 ) where
     F: Fn(ConversationId) -> Found,
-    Found: Future<Output = Result<Option<(Conversation, Activity)>, Error>>,
+    Found: Future<Output = Result<Option<(Conversation, Unread)>, Error>>,
 {
     while let Some(item) = heard.recv().await {
         let (conversation, event) = match item {
@@ -471,11 +514,11 @@ async fn relay<F, Found>(
         if !known.contains(&conversation) {
             // Wait for it, so that the app hears of the Conversation before anything else about it.
             match look_up(conversation.clone()).await {
-                Ok(Some((conversation, activity))) => {
+                Ok(Some((conversation, unread))) => {
                     known.insert(conversation.id.clone());
                     notify(Update::Live(LiveEvent::Joined {
                         conversation,
-                        activity,
+                        unread,
                     }));
                 }
                 Ok(None) => {}
@@ -536,6 +579,18 @@ async fn serve(api: &Api, request: Request, workspace: &WorkspaceId, notify: &No
             notify(Update::Replies {
                 conversation,
                 parent,
+                result,
+            });
+        }
+        Request::Activity { cursor } => {
+            let result = api.activity(cursor.as_ref()).await;
+            notify(Update::Activity { cursor, result });
+        }
+        Request::Message { conversation, ts } => {
+            let result = api.message(&conversation, ts).await;
+            notify(Update::Message {
+                conversation,
+                ts,
                 result,
             });
         }
@@ -628,7 +683,7 @@ mod tests {
                             },
                             name: String::new(),
                         },
-                        Activity::default(),
+                        Unread::default(),
                     ))),
                     "C8" => Ok(None),
                     _ => Err(Error::refused("conversations.info", "channel_not_found")),

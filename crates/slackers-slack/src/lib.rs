@@ -16,7 +16,7 @@ mod wire;
 pub use credentials::Credentials;
 pub use error::Error;
 pub use session::{
-    Connection, EmojiList, FollowedThread, HistoryPage, LiveEvent, Part, Person, Request, Session,
-    Snapshot, Update, User,
+    ActivityCursor, ActivityPage, Connection, EmojiList, FollowedThread, HistoryPage, LiveEvent,
+    Part, Person, Request, Session, Snapshot, Update, User,
 };
 pub use web::Permalinks;

@@ -9,14 +9,16 @@ use reqwest::{RequestBuilder, StatusCode};
 use serde::de::DeserializeOwned;
 use serde_json::{Value, json};
 use slackers_model::{
-    Activity, Conversation, ConversationId, Message, Reaction, Ts, UserId, WorkspaceId,
+    Conversation, ConversationId, Message, Reaction, Ts, Unread, UserId, WorkspaceId,
 };
 use tokio::sync::Semaphore;
 
-use crate::session::{EmojiList, HistoryPage, Part, Person, Snapshot, User};
+use crate::session::{
+    ActivityCursor, ActivityPage, EmojiList, HistoryPage, Part, Person, Snapshot, User,
+};
 use crate::wire::{
-    AuthTest, ConversationInfo, Counts, History, ListedEmoji, PeopleSearch, Posted, Prefs,
-    ReactedTo, Replies, ThreadView, UserBoot, UserInfo,
+    ACTIVITY_KINDS, ActivityFeed, AuthTest, ConversationInfo, Counts, History, ListedEmoji,
+    PeopleSearch, Posted, Prefs, ReactedTo, Replies, ThreadView, UserBoot, UserInfo,
 };
 use crate::{Credentials, Error};
 
@@ -133,7 +135,7 @@ impl Api {
         Err(Error::refused(method, "ratelimited"))
     }
 
-    /// Signs in and lists the user's Conversations and Followed Threads with their Activity.
+    /// Signs in and lists the user's Conversations and Followed Threads with what's Unread in each.
     pub(crate) async fn snapshot(&self) -> Result<Snapshot, Error> {
         let auth: AuthTest = self.call("auth.test", &[]).await?;
         let (boot, counts, threads) = tokio::join!(
@@ -167,12 +169,12 @@ impl Api {
         Ok(history.into_page())
     }
 
-    /// The Conversation `id` as the sidebar lists it, with its Activity up to its Read Marker; `None` when the
+    /// The Conversation `id` as the sidebar lists it, with what's Unread in it as of its Read Marker; `None` when the
     /// sidebar wouldn't list it, being archived or not the user's.
     pub(crate) async fn conversation(
         &self,
         id: &ConversationId,
-    ) -> Result<Option<(Conversation, Activity)>, Error> {
+    ) -> Result<Option<(Conversation, Unread)>, Error> {
         let info: ConversationInfo = self
             .call("conversations.info", &[("channel", id.as_str())])
             .await?;
@@ -201,6 +203,43 @@ impl Api {
         posted
             .into_message()
             .ok_or_else(|| Error::refused("chat.postMessage", "unreadable_message"))
+    }
+
+    /// A page of the user's Activity, newest first, of the kinds slackers shows: the newest when `cursor` is `None`.
+    pub(crate) async fn activity(
+        &self,
+        cursor: Option<&ActivityCursor>,
+    ) -> Result<ActivityPage, Error> {
+        let mut params = vec![
+            ("mode", "chrono_reads_and_unreads"),
+            ("types", ACTIVITY_KINDS),
+            ("limit", "50"),
+        ];
+        if let Some(ActivityCursor(cursor)) = cursor {
+            params.push(("cursor", cursor));
+        }
+        let feed: ActivityFeed = self.call("activity.feed", &params).await?;
+        Ok(feed.into_page())
+    }
+
+    /// The Message at `ts` in `conversation`, a Reply or not; `None` if it's gone.
+    pub(crate) async fn message(
+        &self,
+        conversation: &ConversationId,
+        ts: Ts,
+    ) -> Result<Option<Message>, Error> {
+        let ts_text = ts.to_string();
+        // Given a Reply's ts, `conversations.replies` answers for its Thread; the bounds keep it to the one.
+        let params = [
+            ("channel", conversation.as_str()),
+            ("ts", ts_text.as_str()),
+            ("oldest", ts_text.as_str()),
+            ("latest", ts_text.as_str()),
+            ("inclusive", "true"),
+            ("limit", "1"),
+        ];
+        let replies: Replies = self.call("conversations.replies", &params).await?;
+        Ok(replies.into_messages().find(|message| message.ts == ts))
     }
 
     /// Every reaction to the Message at `ts`, naming everyone who reacted.

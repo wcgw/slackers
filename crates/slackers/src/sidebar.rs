@@ -1,5 +1,5 @@
-//! What the sidebar lists: sections of Conversations and Threads, under headers that fold them, and the cursor
-//! moving through them.
+//! What the sidebar lists: Activity first, then sections of Conversations and Threads, under headers that fold them;
+//! and the cursor moving through them.
 //!
 //! The app decides which sections there are and what each holds; the sidebar keeps track of which are folded, and
 //! keeps the cursor on the same row as sections fill and change.
@@ -44,6 +44,8 @@ impl Item {
 /// One line of the sidebar.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) enum Row {
+    /// Activity, merged from every Workspace: always the first row, in no section.
+    Activity,
     /// A section's header.
     Header(Section),
     /// An item in a section. The same one can be in several.
@@ -51,18 +53,19 @@ pub(crate) enum Row {
 }
 
 impl Row {
-    /// The item on this row; `None` on a header.
+    /// The item on this row; `None` on Activity's row and on a header.
     pub(crate) fn item(&self) -> Option<&Item> {
         match self {
-            Self::Header(_) => None,
+            Self::Activity | Self::Header(_) => None,
             Self::Item { item, .. } => Some(item),
         }
     }
 
-    /// The section this row heads or belongs to.
-    fn section(&self) -> &Section {
+    /// The section this row heads or belongs to; `None` for Activity's row.
+    fn section(&self) -> Option<&Section> {
         match self {
-            Self::Header(section) | Self::Item { section, .. } => section,
+            Self::Activity => None,
+            Self::Header(section) | Self::Item { section, .. } => Some(section),
         }
     }
 }
@@ -156,7 +159,7 @@ impl Sidebar {
         let selected = self
             .selected()
             .filter(|row| row.item().map(Item::conversation) == Some(conversation));
-        selected.map(Row::section).or_else(|| {
+        selected.and_then(Row::section).or_else(|| {
             let wanted = Item::Conversation(conversation.clone());
             self.sections
                 .iter()
@@ -231,31 +234,31 @@ impl Sidebar {
 
     /// Folds or unfolds sections. Folding the cursor's section moves the cursor to its header.
     pub(crate) fn fold(&mut self, change: Fold) {
-        let Some(section) = self.selected().map(|row| row.section().clone()) else {
-            return;
-        };
-        match change {
-            Fold::Toggle if self.folded.contains(&section) => {
-                self.folded.remove(&section);
+        // Activity's row is in no section: only folding every section does anything there.
+        let section = self.selected().and_then(Row::section).cloned();
+        match (change, &section) {
+            (Fold::Toggle, Some(section)) if self.folded.contains(section) => {
+                self.folded.remove(section);
             }
-            Fold::Toggle | Fold::Close => {
+            (Fold::Toggle | Fold::Close, Some(section)) => {
                 self.folded.insert(section.clone());
             }
-            Fold::Open => {
-                self.folded.remove(&section);
+            (Fold::Open, Some(section)) => {
+                self.folded.remove(section);
             }
-            Fold::OpenAll => self.folded.clear(),
-            Fold::CloseAll => {
+            (Fold::Toggle | Fold::Close | Fold::Open, None) => return,
+            (Fold::OpenAll, _) => self.folded.clear(),
+            (Fold::CloseAll, _) => {
                 self.folded = self.sections.iter().map(|(s, _)| s.clone()).collect();
             }
         }
         self.relist();
         // Rather than to the same item in another section, which `relist` would pick.
-        if self.folded.contains(&section) {
+        if let Some(section) = section.filter(|section| self.folded.contains(section)) {
             self.cursor = self
                 .rows
                 .iter()
-                .position(|row| row == &Row::Header(section.clone()))
+                .position(|row| *row == Row::Header(section.clone()))
                 .unwrap_or(0);
         }
         self.moved = true;
@@ -265,32 +268,33 @@ impl Sidebar {
     /// says.
     fn relist(&mut self) {
         let was = self.selected().cloned();
-        self.rows = self
-            .sections
-            .iter()
-            .flat_map(|(section, items)| {
-                let shown = if self.folded.contains(section) {
-                    &[][..]
-                } else {
-                    items.as_slice()
-                };
-                let header = Row::Header(section.clone());
-                let rows = shown.iter().map(|item| Row::Item {
-                    section: section.clone(),
-                    item: item.clone(),
-                });
-                std::iter::once(header).chain(rows)
-            })
-            .collect();
+        let sections = self.sections.iter().flat_map(|(section, items)| {
+            let shown = if self.folded.contains(section) {
+                &[][..]
+            } else {
+                items.as_slice()
+            };
+            let header = Row::Header(section.clone());
+            let rows = shown.iter().map(|item| Row::Item {
+                section: section.clone(),
+                item: item.clone(),
+            });
+            std::iter::once(header).chain(rows)
+        });
+        self.rows = std::iter::once(Row::Activity).chain(sections).collect();
         let found = was.and_then(|was| {
             let same = |row: &Row| *row == was;
             let same_item = |row: &Row| row.item().is_some() && row.item() == was.item();
-            let header = Row::Header(was.section().clone());
+            let header = was.section().map(|section| Row::Header(section.clone()));
             self.rows
                 .iter()
                 .position(same)
                 .or_else(|| self.rows.iter().position(same_item))
-                .or_else(|| self.rows.iter().position(|row| *row == header))
+                .or_else(|| {
+                    self.rows
+                        .iter()
+                        .position(|row| Some(row) == header.as_ref())
+                })
         });
         self.cursor = found
             .unwrap_or(self.cursor)
@@ -348,6 +352,7 @@ mod tests {
             .rows()
             .iter()
             .map(|row| match row {
+                Row::Activity => "activity".to_owned(),
                 Row::Header(Section::Threads) => ">threads".to_owned(),
                 Row::Header(Section::VirtualWorkspace(name)) => format!(">{name}"),
                 Row::Header(Section::Workspace(key)) => format!(">{}", key.index()),
@@ -377,12 +382,9 @@ mod tests {
         let sidebar = listed();
         assert_eq!(
             shown(&sidebar),
-            [">K", "0:C1", "1:C1", ">0", "0:C2", ">1", "1:D1"]
+            ["activity", ">K", "0:C1", "1:C1", ">0", "0:C2", ">1", "1:D1"]
         );
-        assert_eq!(
-            sidebar.selected(),
-            Some(&Row::Header(virtual_workspace("K")))
-        );
+        assert_eq!(sidebar.selected(), Some(&Row::Activity), "always first");
         assert_eq!(sidebar.conversations().len(), 4);
         assert_eq!(
             sidebar.section_of(&conversation(1, "C1")),
@@ -394,23 +396,28 @@ mod tests {
     #[test]
     fn folding_hides_a_sections_items_and_brings_the_cursor_to_its_header() {
         let mut sidebar = listed();
-        sidebar.move_by(2);
         sidebar.fold(Fold::Toggle);
-        assert_eq!(shown(&sidebar), [">K", ">0", "0:C2", ">1", "1:D1"]);
-        assert_eq!(sidebar.cursor(), 0);
+        assert_eq!(shown(&sidebar).len(), 8, "Activity's row folds nothing");
+        sidebar.move_by(3);
+        sidebar.fold(Fold::Toggle);
+        assert_eq!(
+            shown(&sidebar),
+            ["activity", ">K", ">0", "0:C2", ">1", "1:D1"]
+        );
+        assert_eq!(sidebar.cursor(), 1);
         assert!(sidebar.is_folded(&virtual_workspace("K")));
         assert_eq!(sidebar.items_in(&virtual_workspace("K")).len(), 2);
 
         sidebar.fold(Fold::Toggle);
-        assert_eq!(shown(&sidebar).len(), 7);
+        assert_eq!(shown(&sidebar).len(), 8);
 
         sidebar.move_by(4);
         sidebar.fold(Fold::CloseAll);
-        assert_eq!(shown(&sidebar), [">K", ">0", ">1"]);
-        assert_eq!(sidebar.cursor(), 1, "on its section's header");
+        assert_eq!(shown(&sidebar), ["activity", ">K", ">0", ">1"]);
+        assert_eq!(sidebar.cursor(), 2, "on its section's header");
         sidebar.fold(Fold::OpenAll);
-        assert_eq!(shown(&sidebar).len(), 7);
-        assert_eq!(sidebar.cursor(), 3);
+        assert_eq!(shown(&sidebar).len(), 8);
+        assert_eq!(sidebar.cursor(), 4);
     }
 
     #[test]
@@ -431,7 +438,7 @@ mod tests {
     #[test]
     fn the_cursor_keeps_its_row_as_sections_change() {
         let mut sidebar = listed();
-        sidebar.move_by(4);
+        sidebar.move_by(5);
         assert_eq!(sidebar.selected().and_then(Row::item), Some(&item(0, "C2")));
 
         // A Workspace above signs in: the cursor stays on its row.
@@ -439,7 +446,7 @@ mod tests {
             (workspace(2), vec![item(2, "C9"), item(2, "C8")]),
             (workspace(0), vec![item(0, "C2")]),
         ]);
-        assert_eq!(sidebar.cursor(), 4);
+        assert_eq!(sidebar.cursor(), 5);
 
         // Its Conversation moves to a Virtual Workspace: the cursor follows it.
         sidebar.list(vec![
@@ -456,7 +463,7 @@ mod tests {
 
         // The Virtual Workspace goes, and the Conversation with it: the cursor stays in bounds.
         sidebar.list(vec![(workspace(0), Vec::new())]);
-        assert_eq!(sidebar.cursor(), 0);
+        assert_eq!(sidebar.cursor(), 1);
     }
 
     #[test]
@@ -466,16 +473,16 @@ mod tests {
             (Section::Threads, Vec::new()),
             (workspace(0), vec![item(0, "C1")]),
         ]);
-        sidebar.move_by(2);
+        sidebar.move_by(3);
         sidebar.set(
             &Section::Threads,
             vec![thread(0, "C1", 5), thread(0, "C1", 3)],
         );
         assert_eq!(
             shown(&sidebar),
-            [">threads", "0:C1/5", "0:C1/3", ">0", "0:C1"]
+            ["activity", ">threads", "0:C1/5", "0:C1/3", ">0", "0:C1"]
         );
-        assert_eq!(sidebar.cursor(), 4, "still on #C1");
+        assert_eq!(sidebar.cursor(), 5, "still on #C1");
         assert_eq!(
             sidebar.conversations().len(),
             1,
@@ -503,10 +510,10 @@ mod tests {
     fn a_suggestion_moves_the_cursor_only_until_the_user_does() {
         let mut sidebar = listed();
         sidebar.suggest(|row| row.item() == Some(&item(1, "D1")));
-        assert_eq!(sidebar.cursor(), 6);
+        assert_eq!(sidebar.cursor(), 7);
         sidebar.move_by(-1);
         sidebar.suggest(|row| row.item().is_some());
-        assert_eq!(sidebar.cursor(), 5);
+        assert_eq!(sidebar.cursor(), 6);
     }
 
     #[test]
@@ -514,8 +521,8 @@ mod tests {
         let mut sidebar = listed();
         sidebar.fold(Fold::CloseAll);
         sidebar.select(&conversation(1, "D1"));
-        assert_eq!(shown(&sidebar), [">K", ">0", ">1", "1:D1"]);
-        assert_eq!(sidebar.cursor(), 3);
+        assert_eq!(shown(&sidebar), ["activity", ">K", ">0", ">1", "1:D1"]);
+        assert_eq!(sidebar.cursor(), 4);
 
         sidebar.select(&conversation(1, "C1"));
         assert_eq!(
@@ -534,10 +541,10 @@ mod tests {
         sidebar.move_by(-3);
         assert_eq!(sidebar.cursor(), 0);
         sidebar.move_by(100);
-        assert_eq!(sidebar.cursor(), 6);
+        assert_eq!(sidebar.cursor(), 7);
         sidebar.first();
         assert_eq!(sidebar.cursor(), 0);
         sidebar.last();
-        assert_eq!(sidebar.cursor(), 6);
+        assert_eq!(sidebar.cursor(), 7);
     }
 }

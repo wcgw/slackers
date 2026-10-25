@@ -5,13 +5,16 @@ use std::collections::HashMap;
 use serde::Deserialize;
 use serde_json::Value;
 use slackers_model::{
-    Activity, Author, Block, Broadcast, Conversation, ConversationId, ConversationKind,
-    CustomEmojiSet, Emoji, File, Image, Inline, Message, Reaction, ReactionChange, RichText, Style,
-    ThreadSummary, Ts, UserId, WorkspaceId,
+    ActivityItem, Author, Block, Broadcast, Conversation, ConversationId, ConversationKind,
+    CustomEmojiSet, Emoji, File, Happened, Image, Inline, MentionOf, Message, MessageRef, Reaction,
+    ReactionChange, RichText, Style, ThreadSummary, Ts, Unread, UserId, WorkspaceId,
 };
 
 use crate::mrkdwn;
-use crate::session::{EmojiList, FollowedThread, HistoryPage, LiveEvent, Person, Snapshot, User};
+use crate::session::{
+    ActivityCursor, ActivityPage, EmojiList, FollowedThread, HistoryPage, LiveEvent, Person,
+    Snapshot, User,
+};
 use crate::web::Permalinks;
 
 /// Slack's timestamp text as a [`Ts`]; anything unparsable, such as an absent `latest`, reads as zero.
@@ -67,7 +70,7 @@ impl ThreadView {
                 Some(FollowedThread {
                     conversation: ConversationId::new(state.channel),
                     parent: message(thread.root_msg)?,
-                    activity: Activity::counted(read, latest, latest > read, 0),
+                    unread: Unread::counted(read, latest, latest > read, 0),
                 })
             })
             .collect()
@@ -157,8 +160,8 @@ pub(crate) fn snapshot(
     let channels: HashMap<&str, &BootChannel> =
         boot.channels.iter().map(|c| (c.id.as_str(), c)).collect();
     let ims: HashMap<&str, &BootIm> = boot.ims.iter().map(|im| (im.id.as_str(), im)).collect();
-    let activity = |count: &Count| {
-        Activity::counted(
+    let unread = |count: &Count| {
+        Unread::counted(
             ts(&count.last_read),
             ts(&count.latest),
             count.has_unreads,
@@ -190,7 +193,7 @@ pub(crate) fn snapshot(
                 kind,
                 name,
             },
-            activity(count),
+            unread(count),
         ));
     }
     for count in &counts.ims {
@@ -206,7 +209,7 @@ pub(crate) fn snapshot(
                 kind,
                 name: String::new(),
             },
-            activity(count),
+            unread(count),
         ));
     }
     let icon = boot.team.icon;
@@ -256,9 +259,9 @@ struct InfoChannel {
 }
 
 impl ConversationInfo {
-    /// The Conversation as the sidebar lists it, with its Activity up to its Read Marker; `None` when the sidebar
+    /// The Conversation as the sidebar lists it, with what's Unread in it as of its Read Marker; `None` when the sidebar
     /// wouldn't list it: it's archived, or the user isn't in it.
-    pub(crate) fn into_listed(self) -> Option<(Conversation, Activity)> {
+    pub(crate) fn into_listed(self) -> Option<(Conversation, Unread)> {
         let channel = self.channel;
         if channel.is_archived || channel.is_member == Some(false) {
             return None;
@@ -278,7 +281,7 @@ impl ConversationInfo {
             kind,
             name,
         };
-        Some((conversation, Activity::counted(read, read, false, 0)))
+        Some((conversation, Unread::counted(read, read, false, 0)))
     }
 }
 
@@ -801,6 +804,100 @@ impl Posted {
     }
 }
 
+/// The kinds of Activity item slackers shows, as `activity.feed` takes them: Mentions, Reactions, Followed
+/// Threads' Replies, DMs and being added to Channels.
+pub(crate) const ACTIVITY_KINDS: &str = "at_user,at_user_group,at_channel,at_everyone,message_reaction,thread_v2,dm,\
+     internal_channel_invite";
+
+/// `activity.feed`'s reply: a page of the user's Activity, newest first.
+#[derive(Deserialize)]
+pub(crate) struct ActivityFeed {
+    #[serde(default)]
+    items: Vec<Value>,
+    #[serde(default)]
+    response_metadata: Option<ResponseMetadata>,
+}
+
+impl ActivityFeed {
+    /// The page: its items of the [kinds slackers shows](ACTIVITY_KINDS), and where the next one starts.
+    pub(crate) fn into_page(self) -> ActivityPage {
+        let next = self
+            .response_metadata
+            .map(|metadata| metadata.next_cursor)
+            .filter(|cursor| !cursor.is_empty())
+            .map(ActivityCursor);
+        ActivityPage {
+            items: self.items.iter().filter_map(activity_item).collect(),
+            next,
+        }
+    }
+}
+
+/// One `activity.feed` item; `None` for a kind slackers doesn't show, or one in an unknown shape.
+fn activity_item(item: &Value) -> Option<ActivityItem> {
+    let inner = &item["item"];
+    let at = |text: &Value| text.as_str()?.parse::<Ts>().ok();
+    let message_at = |message: &Value| -> Option<MessageRef> {
+        let ts = at(&message["ts"])?;
+        Some(MessageRef {
+            conversation: ConversationId::new(message["channel"].as_str()?),
+            ts,
+            // A Thread's parent carries its own ts here.
+            thread: at(&message["thread_ts"]).filter(|&parent| parent != ts),
+        })
+    };
+    let author = |message: &Value| message["author_user_id"].as_str().map(UserId::new);
+    let (message, happened) = match inner["type"].as_str()? {
+        kind @ ("at_user" | "at_user_group" | "at_channel" | "at_everyone") => {
+            let message = &inner["message"];
+            let of = match kind {
+                "at_user" => MentionOf::User,
+                "at_user_group" => MentionOf::Group,
+                _ => MentionOf::Everyone,
+            };
+            let author = author(message)?;
+            (message_at(message)?, Happened::Mention { author, of })
+        }
+        "message_reaction" => {
+            let reaction = &inner["reaction"];
+            let happened = Happened::Reaction {
+                user: UserId::new(reaction["user"].as_str()?),
+                emoji: reaction_emoji(reaction["name"].as_str()?),
+            };
+            (message_at(&inner["message"])?, happened)
+        }
+        "thread_v2" => {
+            let thread = &inner["bundle_info"]["payload"]["thread_entry"];
+            let message = MessageRef {
+                conversation: ConversationId::new(thread["channel_id"].as_str()?),
+                ts: at(&thread["latest_ts"])?,
+                thread: Some(at(&thread["thread_ts"])?),
+            };
+            let unread = thread["unread_msg_count"]
+                .as_u64()
+                .map_or(0, |count| u32::try_from(count).unwrap_or(u32::MAX));
+            (message, Happened::Replies { unread })
+        }
+        "dm" => {
+            let latest = &inner["bundle_info"]["payload"]["dm_entry"]["latest_message"];
+            (message_at(latest)?, Happened::Dm)
+        }
+        "internal_channel_invite" => {
+            let message = &inner["message"];
+            let author = author(message)?;
+            (message_at(message)?, Happened::Added { author })
+        }
+        _ => return None,
+    };
+    Some(ActivityItem {
+        key: item["key"].as_str()?.to_owned(),
+        at: at(&item["feed_ts"])?,
+        unread: item["is_unread"].as_bool().unwrap_or(false),
+        message,
+        happened,
+    })
+}
+
 /// `reactions.get`'s reply: the Message reacted to.
 #[derive(Deserialize)]
 pub(crate) struct ReactedTo {
@@ -1023,6 +1120,7 @@ pub(crate) fn socket_message(frame: &str) -> SocketMessage {
             ts: ts(event["item"]["ts"].as_str().unwrap_or_default()),
             emoji: reaction_emoji(text("reaction")),
             user: UserId::new(text("user")),
+            author: event["item_user"].as_str().map(UserId::new),
             change: if kind == "reaction_added" {
                 ReactionChange::Added
             } else {
@@ -1306,13 +1404,14 @@ mod tests {
         );
         assert_eq!(
             socket_message(
-                r#"{"type":"reaction_added","user":"UME","reaction":"tada","item":{"type":"message","channel":"C1","ts":"7.000000"}}"#
+                r#"{"type":"reaction_added","user":"UME","reaction":"tada","item_user":"U2","item":{"type":"message","channel":"C1","ts":"7.000000"}}"#
             ),
             SocketMessage::Live(LiveEvent::Reacted {
                 conversation: ConversationId::new("C1"),
                 ts: seconds(7),
                 emoji: Emoji::named("tada"),
                 user: me(),
+                author: Some(UserId::new("U2")),
                 change: ReactionChange::Added,
             })
         );
@@ -1361,7 +1460,7 @@ mod tests {
                 serde_json::from_value(json!({ "channel": channel })).unwrap();
             info.into_listed()
         };
-        let (dm, activity) =
+        let (dm, unread) =
             listed(json!({"id": "D9", "is_im": true, "user": "U2", "last_read": "4.000000"}))
                 .unwrap();
         assert_eq!(
@@ -1374,7 +1473,7 @@ mod tests {
             )
         );
         assert_eq!(
-            (activity.read_up_to(), activity.has_unread()),
+            (unread.read_up_to(), unread.has_unread()),
             (seconds(4), false)
         );
 
@@ -1536,9 +1635,9 @@ mod tests {
             "subscribed and well-formed only"
         );
         assert_eq!(followed[0].conversation, ConversationId::new("C1"));
-        assert_eq!(followed[0].activity.read_up_to(), seconds(11));
-        assert!(followed[0].activity.has_unread());
-        assert!(!followed[1].activity.has_unread());
+        assert_eq!(followed[0].unread.read_up_to(), seconds(11));
+        assert!(followed[0].unread.has_unread());
+        assert!(!followed[1].unread.has_unread());
     }
 
     #[test]
@@ -1658,6 +1757,113 @@ mod tests {
                 },
             ]
         );
+    }
+
+    #[test]
+    fn activity_items_point_at_their_message_and_say_what_happened() {
+        let feed: ActivityFeed = serde_json::from_value(json!({
+            "items": [
+                {"key": "k1", "feed_ts": "9.000000", "is_unread": true, "item": {
+                    "type": "at_user",
+                    "message": {"channel": "C1", "ts": "8.000000", "thread_ts": "7.000000",
+                                "author_user_id": "U2", "is_broadcast": false}}},
+                {"key": "k2", "feed_ts": "8.500000", "is_unread": false, "item": {
+                    "type": "at_channel",
+                    "message": {"channel": "C1", "ts": "7.000000", "thread_ts": "7.000000",
+                                "author_user_id": "U3", "is_broadcast": false}}},
+                {"key": "k3", "feed_ts": "8.000000", "item": {
+                    "type": "message_reaction",
+                    "message": {"channel": "C2", "ts": "6.000000"},
+                    "reaction": {"name": "+1::skin-tone-3", "user": "U4"}}},
+                {"key": "k4", "feed_ts": "7.000000", "item": {
+                    "type": "thread_v2",
+                    "bundle_info": {"payload": {"thread_entry": {
+                        "channel_id": "C3", "thread_ts": "5.000000", "latest_ts": "6.500000",
+                        "unread_msg_count": 2}}}}},
+                {"key": "k5", "feed_ts": "6.000000", "item": {
+                    "type": "dm",
+                    "bundle_info": {"payload": {"dm_entry": {
+                        "latest_message": {"channel": "D1", "ts": "5.500000"}}}}}},
+                {"key": "k6", "feed_ts": "5.000000", "item": {
+                    "type": "internal_channel_invite",
+                    "message": {"channel": "C4", "ts": "4.000000", "author_user_id": "U5",
+                                "is_broadcast": false}}},
+                {"key": "k7", "feed_ts": "4.000000", "item": {"type": "list_record_edited"}},
+                {"key": "k8", "feed_ts": "3.000000", "item": {"type": "at_user", "message": {}}}
+            ],
+            "response_metadata": {"next_cursor": "older"}
+        }))
+        .unwrap();
+        let page = feed.into_page();
+        let micros = |seconds: f64| Ts::from_micros((seconds * 1e6) as u64);
+        let at = |conversation: &str, ts: f64, thread: Option<f64>| MessageRef {
+            conversation: ConversationId::new(conversation),
+            ts: micros(ts),
+            thread: thread.map(micros),
+        };
+        let mut toned = Emoji::named("+1");
+        toned.skin_tone = Some(3);
+        let found: Vec<(&str, bool, MessageRef, Happened)> = page
+            .items
+            .iter()
+            .map(|item| {
+                let happened = item.happened.clone();
+                (
+                    item.key.as_str(),
+                    item.unread,
+                    item.message.clone(),
+                    happened,
+                )
+            })
+            .collect();
+        let mention = |author: &str, of| Happened::Mention {
+            author: UserId::new(author),
+            of,
+        };
+        assert_eq!(
+            found,
+            [
+                (
+                    "k1",
+                    true,
+                    at("C1", 8.0, Some(7.0)),
+                    mention("U2", MentionOf::User)
+                ),
+                (
+                    "k2",
+                    false,
+                    at("C1", 7.0, None),
+                    mention("U3", MentionOf::Everyone)
+                ),
+                (
+                    "k3",
+                    false,
+                    at("C2", 6.0, None),
+                    Happened::Reaction {
+                        user: UserId::new("U4"),
+                        emoji: toned
+                    }
+                ),
+                (
+                    "k4",
+                    false,
+                    at("C3", 6.5, Some(5.0)),
+                    Happened::Replies { unread: 2 }
+                ),
+                ("k5", false, at("D1", 5.5, None), Happened::Dm),
+                (
+                    "k6",
+                    false,
+                    at("C4", 4.0, None),
+                    Happened::Added {
+                        author: UserId::new("U5")
+                    }
+                ),
+            ],
+            "a list edit isn't shown, and an item missing its Message is skipped"
+        );
+        assert_eq!(page.items[0].at, seconds(9));
+        assert_eq!(page.next, Some(ActivityCursor("older".into())));
     }
 
     #[test]

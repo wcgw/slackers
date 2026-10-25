@@ -63,14 +63,20 @@ _Avoid_: subscription
 The point in a Conversation, or in a Followed Thread, up to which the user has read.
 _Avoid_: last_read, cursor
 
-**Activity**:
+**Unread**:
 What the user hasn't read yet: Messages past the Read Marker in a Conversation they're a member of, or Replies past
 the Read Marker of a Followed Thread.
-_Avoid_: notification, unreads
+_Avoid_: new, unseen
 
 **Mention**:
-A Message that @-mentions the user. Mentions are counted separately, on top of Activity.
+A Message that @-mentions the user. Mentions are counted separately, on top of what's Unread.
 _Avoid_: ping, highlight
+
+**Activity**:
+What happens in the user's Workspaces that concerns them, as Slack's Activity lists it: Mentions, Reactions to their
+Messages, Replies in their Followed Threads, DM Messages, and being added to Channels. Each item is about one Message.
+slackers merges every Workspace's, newest first.
+_Avoid_: notifications, feed, inbox
 
 ## Relationships
 
@@ -82,14 +88,16 @@ _Avoid_: ping, highlight
 - A **Message** belongs to one **Conversation**; a **Reply** also belongs to one **Thread**.
 - A **Custom Emoji** belongs to one **Workspace**: `:yay:` in one **Workspace** and `:yay:` in another are different
   emoji.
-- A **Virtual Workspace** shows the combined **Activity** and **Mentions** of its **Channels**. Reading a **Channel**
+- **Activity** is merged from every **Workspace**: each of its items belongs to one **Workspace**, and is about one
+  **Message** there.
+- A **Virtual Workspace** shows the combined **Unread** Messages and **Mentions** of its **Channels**. Reading a **Channel**
   in one **Virtual Workspace** clears it in all of them, because the **Read Marker** belongs to the **Channel**.
 
 ## Example dialogue
 
 > **Dev:** "Project X has channels in both the Red Hat and the CNCF **Workspaces**. Is that one **Virtual Workspace**?"
 > **User:** "Yes. One **Virtual Workspace**, 'Project X', holding the Red Hat channel and the CNCF channel. It lights up
-> when either has **Activity**."
+> when either has anything **Unread**."
 > **Dev:** "And when a Project X maintainer DMs me in both **Workspaces**?"
 > **User:** "Those are two **DMs**, one under each **Workspace**. slackers doesn't link people across **Workspaces**."
 
@@ -108,3 +116,5 @@ _Avoid_: ping, highlight
 - An @-mention the user writes in a **Draft**, of a person or of `@here`/`@channel`, notifies others. It isn't a
   **Mention**: only a **Message** that @-mentions the user is.
 - Open: a Slack Connect **Channel** shared between two of the user's **Workspaces**. Is it one **Channel** or two?
+- Slack's "Activity" tab is **Activity**; what it calls "unreads" is **Unread**. Until 2026-10-25, slackers called
+  **Unread** "Activity".
