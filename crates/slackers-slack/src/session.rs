@@ -75,6 +75,20 @@ pub enum Request {
         /// Which Message.
         ts: Ts,
     },
+    /// Runs a slash command, as if typed in the Conversation or Thread; answered by [`Update::RanCommand`]. What it
+    /// does, such as posting or replying for the user's eyes only, arrives live.
+    RunCommand {
+        /// Where.
+        conversation: ConversationId,
+        /// The Thread it's run in, by its parent; `None` for the Conversation.
+        thread: Option<Ts>,
+        /// Which, `/` included.
+        command: String,
+        /// What follows it, in order.
+        text: Vec<Part>,
+        /// Any number the caller picks, to match the answer to the request.
+        id: u64,
+    },
     /// Replaces the text of one of the user's Messages; answered by [`Update::Edited`].
     Edit {
         /// Where.
@@ -167,6 +181,15 @@ pub enum Update {
         query: String,
         /// Who, best first, or why no one.
         result: Result<Vec<Person>, Error>,
+    },
+    /// The Workspace's slash commands. Arrives once, some time after [`Update::Ready`].
+    Commands(Vec<SlashCommand>),
+    /// The answer to [`Request::RunCommand`].
+    RanCommand {
+        /// The request's `id`.
+        id: u64,
+        /// What Slack replied for the user's eyes only, if anything, or why the command didn't run.
+        result: Result<Option<RichText>, Error>,
     },
     /// The answer to [`Request::Edit`].
     Edited {
@@ -283,6 +306,17 @@ pub struct User {
     pub time_zone: Option<String>,
     /// Where their avatar image is, about 48 pixels square; `None` when they have none.
     pub avatar: Option<String>,
+}
+
+/// A slash command a Workspace offers.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct SlashCommand {
+    /// What's typed to run it, `/` included.
+    pub name: String,
+    /// What it does, in a few words; may be empty.
+    pub description: String,
+    /// What it takes after its name, such as `[text]`; may be empty.
+    pub usage: String,
 }
 
 /// A page of a Workspace's Activity.
@@ -506,6 +540,10 @@ async fn run(
                 Ok(used) => notify(Update::EmojiUse(used)),
                 Err(error) => tracing::warn!(%error, "couldn't tell which emoji are used most"),
             }
+            match api.commands().await {
+                Ok(commands) => notify(Update::Commands(commands)),
+                Err(error) => tracing::warn!(%error, "couldn't list slash commands"),
+            }
         });
     }
     let (heard, hearing) = mpsc::unbounded_channel();
@@ -619,6 +657,18 @@ async fn serve(api: &Api, request: Request, workspace: &WorkspaceId, notify: &No
                 conversation,
                 result,
             });
+        }
+        Request::RunCommand {
+            conversation,
+            thread,
+            command,
+            text,
+            id,
+        } => {
+            let result = api
+                .run_command(&conversation, thread, &command, &text)
+                .await;
+            notify(Update::RanCommand { id, result });
         }
         Request::Edit {
             conversation,

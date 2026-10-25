@@ -17,6 +17,6 @@ pub use credentials::Credentials;
 pub use error::Error;
 pub use session::{
     ActivityCursor, ActivityPage, Connection, EmojiList, FollowedThread, HistoryPage, LiveEvent,
-    Part, Person, Request, Session, Snapshot, Update, User,
+    Part, Person, Request, Session, SlashCommand, Snapshot, Update, User,
 };
 pub use web::Permalinks;

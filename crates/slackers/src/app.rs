@@ -15,6 +15,9 @@
 //! While the terminal window doesn't have focus, a DM, a Message that mentions the user, or a Reply in one of their
 //! Followed Threads shows a desktop notification.
 //!
+//! A Draft starting with `/` and a word runs that slash command rather than posting: `/` brings up the Workspace's
+//! commands to choose from, as `@` does people. Starting it with a space posts it as text instead.
+//!
 //! On one of the user's Messages, `e` edits it in its pane's composer, as `↑` does in an empty one for their newest
 //! there: `Enter` saves the edit and `Esc` gives it up, bringing back what was being written before.
 //!
@@ -34,7 +37,8 @@ use slackers_model::{
     Inline, Message, MessageRef, ReactionChange, RichText, Style, Timeline, Ts, Unread, UserId,
 };
 use slackers_slack::{
-    Connection, EmojiList, Error, LiveEvent, Permalinks, Person, Request, Snapshot, Update, User,
+    Connection, EmojiList, Error, LiveEvent, Permalinks, Person, Request, SlashCommand, Snapshot,
+    Update, User,
 };
 
 use crate::activity::{Activity, Fetched};
@@ -288,6 +292,8 @@ pub(crate) enum Suggested {
     Mention(Mentioned),
     /// The emoji the suggestion names.
     Emoji,
+    /// The slash command the suggestion names.
+    Command,
 }
 
 impl Suggestion {
@@ -295,8 +301,10 @@ impl Suggestion {
     fn writes_as(&self, other: &Self) -> bool {
         match (&self.suggested, &other.suggested) {
             (Suggested::Mention(mentioned), Suggested::Mention(other)) => mentioned == other,
-            (Suggested::Emoji, Suggested::Emoji) => self.name == other.name,
-            (Suggested::Mention(_) | Suggested::Emoji, _) => false,
+            (Suggested::Emoji, Suggested::Emoji) | (Suggested::Command, Suggested::Command) => {
+                self.name == other.name
+            }
+            (Suggested::Mention(_) | Suggested::Emoji | Suggested::Command, _) => false,
         }
     }
 }
@@ -519,6 +527,8 @@ pub(crate) struct Workspace {
     loading_threads: HashSet<(ConversationId, Ts)>,
     /// Followed Threads, by their Conversation and parent.
     pub(crate) followed: HashMap<(ConversationId, Ts), Followed>,
+    /// Its slash commands, by name; empty until Slack lists them.
+    pub(crate) commands: Vec<SlashCommand>,
     /// Whom Slack found by name, by the name searched for, in lower case. A failed search found no one.
     found: HashMap<String, Vec<Person>>,
     /// The name Slack is searching for, if any.
@@ -579,6 +589,8 @@ pub(crate) struct App {
     pub(crate) suggestions: Option<Suggestions>,
     /// Messages posted but not yet confirmed, oldest first.
     pub(crate) outbox: Vec<Outgoing>,
+    /// Slash commands run but not yet answered, by request id, to put back in their Drafts should they fail.
+    commands_sent: Vec<(u64, Place, Written)>,
     /// Edits being written, by where: in that Place's Draft, set aside meanwhile.
     editing: HashMap<Place, Editing>,
     /// Edits saved but not yet confirmed, to put back should Slack refuse them.
@@ -637,6 +649,7 @@ impl App {
             drafts: HashMap::new(),
             suggestions: None,
             outbox: Vec::new(),
+            commands_sent: Vec::new(),
             editing: HashMap::new(),
             edits_sent: Vec::new(),
             next_post: 0,
@@ -978,6 +991,7 @@ impl App {
                         Suggested::Mention(mentioned) => {
                             self.draft(&place).pick(mentioned, &picked.name);
                         }
+                        Suggested::Command => self.draft(&place).pick_command(&picked.name),
                         Suggested::Emoji => {
                             self.draft(&place).pick_emoji(&picked.name);
                             if let Some(workspace) =
@@ -1241,6 +1255,7 @@ impl App {
                 workspace.find_people(key, &name, commands);
                 workspace.suggest(&place, &name)
             }
+            Completing::Command(name) => workspace.suggest_commands(&name),
             Completing::Emoji(name) => workspace
                 .emojis
                 .complete(&name, SUGGESTIONS)
@@ -1674,6 +1689,32 @@ impl App {
         };
         let id = self.next_post;
         self.next_post += 1;
+        if let Some((command, text)) = written.command() {
+            let known = self
+                .workspaces
+                .get(place.conversation.workspace)
+                .map(|workspace| &workspace.commands);
+            // Until Slack lists them, let it say whether there's such a command.
+            if known.is_some_and(|known| {
+                !known.is_empty() && !known.iter().any(|offered| offered.name == command)
+            }) {
+                self.notice = Some(format!(
+                    "no {command} command here: start with a space to post it as text"
+                ));
+                self.draft(&place).put_back(written);
+                return;
+            }
+            let request = Request::RunCommand {
+                conversation: place.conversation.id.clone(),
+                thread: place.thread,
+                command,
+                text,
+                id,
+            };
+            commands.push(Command::Slack(place.conversation.workspace, request));
+            self.commands_sent.push((id, place, written));
+            return;
+        }
         match place.thread {
             Some(_) => self.thread_pane.newest(),
             None => self.conversation_pane.newest(),
@@ -2004,6 +2045,36 @@ impl App {
             Update::SignInFailed(error) => {
                 self.workspaces
                     .set_phase(key, Phase::Failed(error.to_string()));
+            }
+            Update::Commands(offered) => {
+                if let Some(workspace) = self.workspaces.get_mut(key) {
+                    workspace.commands = offered;
+                }
+            }
+            Update::RanCommand { id, result } => {
+                let Some(at) = self.commands_sent.iter().position(|(sent, ..)| *sent == id) else {
+                    return;
+                };
+                let (_, place, written) = self.commands_sent.remove(at);
+                match result {
+                    Ok(Some(reply)) => {
+                        if let Some(workspace) = self.workspaces.get(key) {
+                            self.notice = Some(workspace.gist(&reply));
+                        }
+                    }
+                    Ok(None) => {}
+                    Err(error) => {
+                        let command = written
+                            .command()
+                            .map(|(command, _)| command)
+                            .unwrap_or_default();
+                        self.notice = Some(format!(
+                            "couldn't run {command}, back in the draft: {}",
+                            describe(&error)
+                        ));
+                        self.draft(&place).put_back(written);
+                    }
+                }
             }
             Update::Edited {
                 conversation,
@@ -2484,6 +2555,7 @@ impl Workspace {
             loading: HashSet::new(),
             loading_threads: HashSet::new(),
             followed,
+            commands: Vec::new(),
             found: HashMap::new(),
             finding: None,
         }
@@ -2764,6 +2836,35 @@ impl Workspace {
             ConversationKind::Dm { with } => self.user_name(with),
             ConversationKind::Channel { .. } | ConversationKind::GroupDm => &conversation.name,
         }
+    }
+
+    /// The slash commands to offer for `name`, being written after a `/`, best first: those whose names it starts, then
+    /// those it starts a later word of, each by name.
+    fn suggest_commands(&self, name: &str) -> Vec<Suggestion> {
+        let mut found: Vec<Suggestion> = self
+            .commands
+            .iter()
+            .filter_map(|command| {
+                let bare = command.name.strip_prefix('/').unwrap_or(&command.name);
+                let positions = search::word_start(bare, name)?;
+                let detail = [command.usage.as_str(), command.description.as_str()]
+                    .into_iter()
+                    .filter(|part| !part.is_empty())
+                    .collect::<Vec<_>>()
+                    .join("  ");
+                Some(Suggestion {
+                    suggested: Suggested::Command,
+                    name: command.name.clone(),
+                    detail,
+                    // Past the `/`.
+                    positions: positions.into_iter().map(|at| at + 1).collect(),
+                })
+            })
+            .collect();
+        // Stable: those equally good stay by name.
+        found.sort_by_key(|suggestion| suggestion.positions.first().is_some_and(|&at| at > 1));
+        found.truncate(SUGGESTIONS);
+        found
     }
 
     /// Asks Slack, through this Workspace at `key`, whom it knows by `name`, unless it was asked already. One search
@@ -5168,6 +5269,139 @@ mod tests {
         );
         let (_, kept) = app.message(&place, seconds(7)).unwrap();
         assert_eq!(kept.content, RichText::plain("typo"));
+    }
+
+    /// `reading_random` with `/giphy` and `/remind` on offer.
+    fn with_commands() -> App {
+        let mut app = reading_random();
+        let command = |name: &str, usage: &str, description: &str| SlashCommand {
+            name: name.into(),
+            usage: usage.into(),
+            description: description.into(),
+        };
+        app.update(slack(Update::Commands(vec![
+            command("/app-remind", "", "Another app's reminders"),
+            command("/giphy", "[text]", "Post a random gif to channel"),
+            command("/remind", "", "Set a reminder"),
+        ])));
+        app
+    }
+
+    fn run(command: &str, text: Vec<Part>, thread: Option<u64>, request: u64) -> Command {
+        ask(Request::RunCommand {
+            conversation: id("C2"),
+            thread: thread.map(seconds),
+            command: command.into(),
+            text,
+            id: request,
+        })
+    }
+
+    #[test]
+    fn a_slash_offers_the_workspaces_commands_and_enter_runs_one() {
+        let mut app = with_commands();
+        keys(&mut app, "i/re");
+        assert_eq!(
+            suggested(&app),
+            ["/remind", "/app-remind"],
+            "names it starts first"
+        );
+        app.update(key(KeyCode::Backspace));
+        app.update(key(KeyCode::Backspace));
+        assert_eq!(suggested(&app), ["/app-remind", "/giphy", "/remind"]);
+        keys(&mut app, "gi");
+        let offered = &app.suggestions.as_ref().unwrap().items;
+        assert_eq!(
+            (
+                offered[0].name.as_str(),
+                offered[0].detail.as_str(),
+                &offered[0].positions[..]
+            ),
+            (
+                "/giphy",
+                "[text]  Post a random gif to channel",
+                &[1, 2][..]
+            )
+        );
+        app.update(key(KeyCode::Tab));
+        keys(&mut app, "cats");
+        assert_eq!(app.drafts[&place("C2", None)].text(), "/giphy cats");
+        let commands = app.update(key(KeyCode::Enter));
+        assert_eq!(
+            commands,
+            [run("/giphy", vec![Part::Text("cats".into())], None, 0)]
+        );
+        assert!(app.drafts[&place("C2", None)].is_empty());
+        assert!(app.outbox.is_empty(), "nothing posted");
+
+        let reply = RichText::plain("Here's your gif");
+        app.update(slack(Update::RanCommand {
+            id: 0,
+            result: Ok(Some(reply)),
+        }));
+        assert_eq!(app.notice.as_deref(), Some("Here's your gif"));
+    }
+
+    #[test]
+    fn an_unknown_command_stays_in_the_draft_and_a_space_posts_it_as_text() {
+        let mut app = with_commands();
+        keys(&mut app, "i/gif cats");
+        assert!(app.update(key(KeyCode::Enter)).is_empty());
+        assert_eq!(
+            app.notice.as_deref(),
+            Some("no /gif command here: start with a space to post it as text")
+        );
+        assert_eq!(app.drafts[&place("C2", None)].text(), "/gif cats");
+
+        for _ in 0.."/gif cats".len() {
+            app.update(key(KeyCode::Backspace));
+        }
+        keys(&mut app, " /gif cats");
+        let commands = app.update(key(KeyCode::Enter));
+        assert!(
+            matches!(
+                commands.as_slice(),
+                [Command::Slack(_, Request::Post { .. })]
+            ),
+            "{commands:?}"
+        );
+    }
+
+    #[test]
+    fn a_command_runs_in_its_thread_and_a_failed_one_comes_back() {
+        let mut app = with_commands();
+        app.update(key(KeyCode::Enter));
+        keys(&mut app, "i/remind me");
+        let commands = app.update(key(KeyCode::Enter));
+        assert_eq!(
+            commands,
+            [run("/remind", vec![Part::Text("me".into())], Some(5), 0)]
+        );
+        app.update(slack(Update::RanCommand {
+            id: 0,
+            result: Err(Error::Refused {
+                method: "chat.command",
+                code: "restricted_action".into(),
+            }),
+        }));
+        assert_eq!(
+            app.notice.as_deref(),
+            Some(
+                "couldn't run /remind, back in the draft: slack refused chat.command: restricted_action"
+            )
+        );
+        assert_eq!(app.drafts[&place("C2", Some(5))].text(), "/remind me");
+
+        let (mut app, _) = ready_app();
+        app.update(key(KeyCode::Enter));
+        keys(&mut app, "i/whatever");
+        assert!(
+            matches!(
+                app.update(key(KeyCode::Enter)).as_slice(),
+                [Command::Slack(_, Request::RunCommand { .. })]
+            ),
+            "until Slack lists its commands, it says whether there's one"
+        );
     }
 
     fn named(id: &str, name: &str) -> Event {

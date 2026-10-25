@@ -17,6 +17,8 @@ pub(crate) const ACTIVITY: &str = "\u{f49a} ";
 pub(crate) const REACTION: &str = "\u{f4a2} ";
 /// `oct-person_add`: being added to a Channel.
 pub(crate) const ADDED: &str = "\u{f4fe} ";
+/// `oct-terminal`: a slash command.
+pub(crate) const COMMAND: &str = "\u{f489} ";
 /// `oct-mention`: Mentions waiting.
 pub(crate) const MENTION: &str = "\u{f486} ";
 /// `oct-dot_fill`: unread Messages waiting.

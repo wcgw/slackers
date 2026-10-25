@@ -1160,6 +1160,7 @@ fn draw_suggestions(
                 Suggested::Mention(Mentioned::UserGroup(_)) => {
                     vec![Span::styled(icons::GROUP_DM, ACCENT)]
                 }
+                Suggested::Command => vec![Span::styled(icons::COMMAND, ACCENT)],
                 Suggested::Emoji => match renderer.emoji(&Emoji::named(suggestion.name.clone())) {
                     // Followed by a space, in three cells, those of a wide character and a space.
                     Piece::Atom(glyph, cells) => {
@@ -1727,6 +1728,7 @@ fn draw_status(frame: &mut Frame<'_>, area: Rect, app: &App) {
             match suggestions.items[suggestions.selected].suggested {
                 Suggested::Mention(_) => "↑/↓ choose · ⇥/⏎ mention · esc normal",
                 Suggested::Emoji => "↑/↓ choose · ⇥/⏎ insert · esc normal",
+                Suggested::Command => "↑/↓ choose · ⇥/⏎ pick · esc normal",
             }
         }
         (Mode::Insert, _)

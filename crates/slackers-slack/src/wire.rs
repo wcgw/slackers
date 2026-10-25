@@ -13,7 +13,7 @@ use slackers_model::{
 use crate::mrkdwn;
 use crate::session::{
     ActivityCursor, ActivityPage, EmojiList, FollowedThread, HistoryPage, LiveEvent, Person,
-    Snapshot, User,
+    SlashCommand, Snapshot, User,
 };
 use crate::web::Permalinks;
 
@@ -796,6 +796,55 @@ pub(crate) fn reaction_name(emoji: &Emoji) -> String {
     match emoji.skin_tone {
         Some(tone) => format!("{}::skin-tone-{tone}", emoji.name),
         None => emoji.name.clone(),
+    }
+}
+
+/// `commands.list`'s reply: the Workspace's slash commands, by name.
+#[derive(Deserialize)]
+pub(crate) struct CommandList {
+    #[serde(default)]
+    commands: HashMap<String, WireCommand>,
+}
+
+#[derive(Deserialize)]
+struct WireCommand {
+    name: String,
+    #[serde(default)]
+    desc: String,
+    #[serde(default)]
+    usage: String,
+}
+
+impl CommandList {
+    /// The commands, by name.
+    pub(crate) fn into_commands(self) -> Vec<SlashCommand> {
+        let mut commands: Vec<SlashCommand> = self
+            .commands
+            .into_values()
+            .filter(|command| command.name.starts_with('/'))
+            .map(|command| SlashCommand {
+                name: command.name,
+                description: command.desc,
+                usage: command.usage,
+            })
+            .collect();
+        commands.sort_by(|a, b| a.name.cmp(&b.name));
+        commands
+    }
+}
+
+/// `chat.command`'s reply.
+#[derive(Deserialize)]
+pub(crate) struct CommandRun {
+    /// What Slack replies for the user's eyes only, as `mrkdwn`; empty for nothing.
+    #[serde(default)]
+    response: String,
+}
+
+impl CommandRun {
+    /// What Slack replied, if anything.
+    pub(crate) fn into_response(self) -> Option<RichText> {
+        (!self.response.trim().is_empty()).then(|| mrkdwn::parse(&self.response))
     }
 }
 
@@ -1901,6 +1950,26 @@ mod tests {
         );
         assert_eq!(page.items[0].at, seconds(9));
         assert_eq!(page.next, Some(ActivityCursor("older".into())));
+    }
+
+    #[test]
+    fn slash_commands_are_listed_by_name_and_replies_read_as_mrkdwn() {
+        let listed: CommandList = serde_json::from_value(json!({"commands": {
+            "/remind": {"name": "/remind", "desc": "Set a reminder", "usage": "[who] [what] [when]", "type": "core"},
+            "/giphy": {"name": "/giphy", "desc": "Post a random gif to channel", "usage": "[text]", "type": "service"},
+            "odd": {"name": "odd"}
+        }}))
+        .unwrap();
+        let names: Vec<String> = listed.into_commands().into_iter().map(|c| c.name).collect();
+        assert_eq!(names, ["/giphy", "/remind"]);
+        let replied: CommandRun =
+            serde_json::from_value(json!({"response": "Done &amp; dusted"})).unwrap();
+        assert_eq!(
+            replied.into_response(),
+            Some(RichText::plain("Done & dusted"))
+        );
+        let silent: CommandRun = serde_json::from_value(json!({})).unwrap();
+        assert_eq!(silent.into_response(), None);
     }
 
     #[test]

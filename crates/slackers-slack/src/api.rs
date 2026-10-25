@@ -15,12 +15,13 @@ use slackers_model::{
 use tokio::sync::Semaphore;
 
 use crate::session::{
-    ActivityCursor, ActivityPage, EmojiList, HistoryPage, Part, Person, Snapshot, User,
+    ActivityCursor, ActivityPage, EmojiList, HistoryPage, Part, Person, SlashCommand, Snapshot,
+    User,
 };
 use crate::wire::{
-    ACTIVITY_KINDS, ActivityFeed, AuthTest, ConversationInfo, Counts, History, ListedEmoji,
-    PeopleSearch, Posted, Prefs, ReactedTo, Replies, ThreadView, Updated, UserBoot, UserInfo,
-    reaction_name,
+    ACTIVITY_KINDS, ActivityFeed, AuthTest, CommandList, CommandRun, ConversationInfo, Counts,
+    History, ListedEmoji, PeopleSearch, Posted, Prefs, ReactedTo, Replies, ThreadView, Updated,
+    UserBoot, UserInfo, reaction_name,
 };
 use crate::{Credentials, Error};
 
@@ -186,6 +187,35 @@ impl Api {
     pub(crate) async fn user(&self, id: &UserId) -> Result<User, Error> {
         let info: UserInfo = self.call("users.info", &[("user", id.as_str())]).await?;
         Ok(info.into_user())
+    }
+
+    /// The Workspace's slash commands, by name.
+    pub(crate) async fn commands(&self) -> Result<Vec<SlashCommand>, Error> {
+        let listed: CommandList = self.call("commands.list", &[]).await?;
+        Ok(listed.into_commands())
+    }
+
+    /// Runs the slash command `command` with `text` in `conversation`, in the Thread under `thread` if any, and
+    /// returns what Slack replied for the user's eyes only, if anything.
+    pub(crate) async fn run_command(
+        &self,
+        conversation: &ConversationId,
+        thread: Option<Ts>,
+        command: &str,
+        text: &[Part],
+    ) -> Result<Option<RichText>, Error> {
+        let text = crate::mrkdwn::write(text);
+        let parent = thread.map(|ts| ts.to_string());
+        let mut params = vec![
+            ("channel", conversation.as_str()),
+            ("command", command),
+            ("text", text.as_str()),
+        ];
+        if let Some(parent) = &parent {
+            params.push(("thread_ts", parent));
+        }
+        let ran: CommandRun = self.call("chat.command", &params).await?;
+        Ok(ran.into_response())
     }
 
     /// Replaces the text of the user's Message at `ts` with `text`, and returns its new content as Slack stored it.

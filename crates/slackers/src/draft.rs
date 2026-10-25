@@ -32,6 +32,8 @@ pub(crate) enum Completing {
     Mention(String),
     /// `:` and at least two characters of an emoji's name: the name.
     Emoji(String),
+    /// `/` and a slash command's name, as the Draft's first word: the name, which is empty right after the `/`.
+    Command(String),
 }
 
 /// Who an @-mention notifies.
@@ -116,6 +118,16 @@ impl Draft {
     /// rest could be a name. A word with either inside, such as an email address or a time, isn't one.
     pub(crate) fn completing(&self) -> Option<Completing> {
         let word = self.word()?;
+        if let Some(name) = word.strip_prefix('/')
+            && self.area.cursor().0 == 0
+            && self.lines()[0].starts_with(word)
+        {
+            let in_name = |c: char| c.is_alphanumeric() || matches!(c, '-' | '_');
+            return name
+                .chars()
+                .all(in_name)
+                .then(|| Completing::Command(name.to_owned()));
+        }
         if let Some(name) = word.strip_prefix('@') {
             let in_name = |c: char| c.is_alphanumeric() || matches!(c, '.' | '-' | '_' | '\'');
             return name
@@ -208,6 +220,11 @@ impl Draft {
         }
     }
 
+    /// Writes the slash command `name`, `/` included, and a space, in place of the word being completed.
+    pub(crate) fn pick_command(&mut self, name: &str) {
+        self.complete(name);
+    }
+
     /// Writes the emoji `name`, between colons, and a space, in place of the word being completed. Slack draws it
     /// once posted.
     pub(crate) fn pick_emoji(&mut self, name: &str) {
@@ -268,6 +285,31 @@ impl Widget for &Draft {
 }
 
 impl Written {
+    /// The slash command it runs, `/` included, and what follows it, when it starts with one: a `/` and a word.
+    /// To post text starting with `/`, start it with a space instead, as in Slack.
+    pub(crate) fn command(&self) -> Option<(String, Vec<Part>)> {
+        let rest = self.text.strip_prefix('/')?;
+        let name_length = rest.find(char::is_whitespace).unwrap_or(rest.len());
+        if name_length == 0 || rest[..name_length].contains('/') {
+            return None;
+        }
+        let command = format!("/{}", &rest[..name_length]);
+        let mut parts = self.parts();
+        // The command is all plain text: no label starts with `/`.
+        let Some(Part::Text(first)) = parts.first_mut() else {
+            return None;
+        };
+        let after = first.strip_prefix(command.as_str())?;
+        *first = after
+            .strip_prefix(char::is_whitespace)
+            .unwrap_or(after)
+            .to_owned();
+        if first.is_empty() {
+            parts.remove(0);
+        }
+        Some((command, parts))
+    }
+
     /// Its text, with what each picked label stands for in its place.
     pub(crate) fn parts(&self) -> Vec<Part> {
         split(&self.text, &self.picked)
@@ -416,6 +458,34 @@ mod tests {
             ":", ":D", ":-)", "12:30", "note:ab", ":tada:", ":tada: ", "::std",
         ] {
             assert_eq!(draft(not_one).completing(), None, "{not_one}");
+        }
+    }
+
+    #[test]
+    fn a_slash_and_a_word_starting_a_draft_is_a_command() {
+        let command = |name: &str| Some(Completing::Command(name.into()));
+        assert_eq!(draft("/").completing(), command(""));
+        assert_eq!(draft("/gi").completing(), command("gi"));
+        assert_eq!(draft("/my-app_x").completing(), command("my-app_x"));
+        for not_one in ["hi /gi", "/giphy cats", "first\n/gi", "//x", "/a.b"] {
+            assert_eq!(draft(not_one).completing(), None, "{not_one}");
+        }
+
+        let mut written = draft("/giphy cats and @");
+        written.pick(person("U1"), "Ada");
+        assert_eq!(
+            written.take().unwrap().command(),
+            Some((
+                "/giphy".to_owned(),
+                vec![text("cats and "), Part::User(UserId::new("U1")), text(" ")]
+            ))
+        );
+        assert_eq!(
+            draft("/dnd").take().unwrap().command(),
+            Some(("/dnd".to_owned(), Vec::new()))
+        );
+        for text in [" /giphy cats", "/ x", "//x", "a/b"] {
+            assert_eq!(draft(text).take().unwrap().command(), None, "{text}");
         }
     }
 
