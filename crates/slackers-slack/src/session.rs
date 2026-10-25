@@ -56,6 +56,17 @@ pub enum Request {
         /// What they're called, or the start of it.
         query: String,
     },
+    /// Adds the user's reaction to a Message, or takes it back; answered by [`Update::Reacted`].
+    React {
+        /// Where.
+        conversation: ConversationId,
+        /// To which Message.
+        ts: Ts,
+        /// With what.
+        emoji: Emoji,
+        /// Added or taken back.
+        change: ReactionChange,
+    },
     /// Every reaction to a Message, naming everyone who reacted, where its history names only the first 50
     /// people of each; answered by [`Update::Reactions`].
     Reactions {
@@ -163,6 +174,19 @@ pub enum Update {
         ts: Ts,
         /// The Message; `None` if it's gone, or why it isn't known.
         result: Result<Option<Message>, Error>,
+    },
+    /// The answer to [`Request::React`]: done, or why not. A reaction that was as asked already counts as done.
+    Reacted {
+        /// Where.
+        conversation: ConversationId,
+        /// To which Message.
+        ts: Ts,
+        /// With what.
+        emoji: Emoji,
+        /// Added or taken back.
+        change: ReactionChange,
+        /// Why it wasn't done, if it wasn't.
+        result: Result<(), Error>,
     },
     /// The answer to [`Request::Reactions`].
     Reactions {
@@ -591,6 +615,21 @@ async fn serve(api: &Api, request: Request, workspace: &WorkspaceId, notify: &No
             notify(Update::Message {
                 conversation,
                 ts,
+                result,
+            });
+        }
+        Request::React {
+            conversation,
+            ts,
+            emoji,
+            change,
+        } => {
+            let result = api.react(&conversation, ts, &emoji, change).await;
+            notify(Update::Reacted {
+                conversation,
+                ts,
+                emoji,
+                change,
                 result,
             });
         }

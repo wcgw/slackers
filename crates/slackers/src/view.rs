@@ -865,10 +865,21 @@ fn draw_pane(
     });
     let inserting = app.mode == Mode::Insert && app.writing_place().as_ref() == Some(&view.place);
     let body = draw_composer(frame, body, app.drafts.get(&view.place), inserting);
+    // What to complete the Draft with, or what to react to one of the pane's Messages with.
+    let reacting = match &app.mode {
+        Mode::React(reacting) if reacting.place == view.place => reacting.choices.as_ref(),
+        Mode::Normal
+        | Mode::Insert
+        | Mode::Command(_)
+        | Mode::Search(_)
+        | Mode::Details(_)
+        | Mode::React(_) => None,
+    };
     let suggestions = app
         .suggestions
         .as_ref()
         .filter(|_| inserting)
+        .or(reacting)
         .map(|suggestions| {
             let key = view.place.conversation.workspace;
             (
@@ -1668,7 +1679,7 @@ impl<'a> Renderer<'a> {
 }
 
 fn draw_status(frame: &mut Frame<'_>, area: Rect, app: &App) {
-    // Command and Search modes take the line, as in vim.
+    // Command, Search and React modes take the line, as in vim.
     let cursor = Span::styled(" ", Style::new().add_modifier(Modifier::REVERSED));
     match &app.mode {
         Mode::Command(line) => {
@@ -1683,6 +1694,26 @@ fn draw_status(frame: &mut Frame<'_>, area: Rect, app: &App) {
                 search.hits.len(),
                 search.searched
             );
+            frame.render_widget(Paragraph::new(query), area);
+            frame.render_widget(
+                Paragraph::new(Line::styled(hints, DIM)).alignment(Alignment::Right),
+                area,
+            );
+            return;
+        }
+        Mode::React(reacting) => {
+            let query = Line::from(vec![Span::raw(format!("+{}", reacting.query)), cursor]);
+            let chosen = reacting
+                .choices
+                .as_ref()
+                .and_then(|choices| choices.items.get(choices.selected));
+            let hints = match chosen {
+                Some(chosen) if chosen.detail == "remove" => {
+                    "↑/↓ choose · ⇥/⏎ take back · esc cancel"
+                }
+                Some(_) => "↑/↓ choose · ⇥/⏎ react · esc cancel",
+                None => "no emoji by that name · esc cancel",
+            };
             frame.render_widget(Paragraph::new(query), area);
             frame.render_widget(
                 Paragraph::new(Line::styled(hints, DIM)).alignment(Alignment::Right),
@@ -1721,11 +1752,11 @@ fn draw_status(frame: &mut Frame<'_>, area: Rect, app: &App) {
             "j/k select · ⏎ open · za fold · / search · \\ hide · i write · :q quit"
         }
         (_, Focus::Timeline) => {
-            "j/k message · ⏎ thread · K details · o open · ^e/^y line · ^d/^u page · g/G · i write · \\ sidebar · :q quit"
+            "j/k message · ⏎ thread · + react · K details · o open · ^e/^y line · ^d/^u page · g/G · i write · \\ sidebar · :q quit"
         }
         (_, Focus::Activity) => "j/k choose · ⏎ open · g/G newest/oldest · \\ sidebar · :q quit",
         (_, Focus::Thread) => {
-            "j/k message · K details · o open · ^e/^y line · i reply · esc close · \\ sidebar · :q quit"
+            "j/k message · + react · K details · o open · ^e/^y line · i reply · esc close · \\ sidebar · :q quit"
         }
     };
     let left = Line::from(left);
@@ -2697,6 +2728,70 @@ mod tests {
         assert!(
             rows.last().unwrap().contains("j/k choose · ⏎ open"),
             "{rows:#?}"
+        );
+    }
+
+    #[test]
+    fn reacting_asks_on_the_status_line_and_lists_the_emoji_over_the_messages() {
+        let mut app = reading_general();
+        let list = slackers_slack::EmojiList {
+            custom: slackers_model::CustomEmojiSet::default(),
+            standard: vec!["tada".into(), "taco".into()],
+        };
+        app.update(Event::Slack(w(0), Update::Emoji(list)));
+        let mine = Reaction {
+            emoji: Emoji::named("tada"),
+            users: vec![UserId::new("UME")],
+            count: 1,
+        };
+        let edited = slackers_slack::LiveEvent::Edited {
+            conversation: ConversationId::new("C1"),
+            message: Message {
+                reactions: vec![mine],
+                ..reading_general_message()
+            },
+        };
+        app.update(Event::Slack(w(0), Update::Live(edited)));
+        type_text(&mut app, "+ta");
+        let rows = screen(&app);
+        let status = rows.last().unwrap();
+        assert!(status.starts_with("+ta"), "{status}");
+        assert!(status.contains("⇥/⏎ take back"), "{status}");
+        let row_of = |text: &str| rows.iter().position(|row| row.contains(text));
+        let (tada, taco) = (row_of("tada  remove"), row_of("taco"));
+        assert!(tada.is_some_and(|tada| Some(tada + 1) == taco), "{rows:#?}");
+        assert!(rows[tada.unwrap()].contains("🎉"), "{rows:#?}");
+
+        press(&mut app, KeyCode::Down, KeyModifiers::NONE);
+        assert!(screen(&app).last().unwrap().contains("⇥/⏎ react"));
+        type_text(&mut app, "x");
+        assert!(
+            screen(&app)
+                .last()
+                .unwrap()
+                .contains("no emoji by that name")
+        );
+    }
+
+    #[test]
+    fn reacting_in_a_thread_lists_the_emoji_over_the_thread_only() {
+        let mut app = reading_a_thread();
+        assert_eq!(app.focus, Focus::Thread);
+        let list = slackers_slack::EmojiList {
+            custom: slackers_model::CustomEmojiSet::default(),
+            standard: vec!["tada".into()],
+        };
+        app.update(Event::Slack(w(0), Update::Emoji(list)));
+        type_text(&mut app, "+");
+        let (rows, _, _) = render_sized(&app, 200);
+        let shown: Vec<usize> = rows
+            .iter()
+            .filter_map(|row| row.find("tada").map(|at| row[..at].chars().count()))
+            .collect();
+        // The sidebar takes 30 columns, and the Thread's pane the right 45% of the other 170.
+        assert!(
+            shown.len() == 1 && shown[0] > 30 + 170 * 55 / 100,
+            "{shown:?}: {rows:#?}"
         );
     }
 

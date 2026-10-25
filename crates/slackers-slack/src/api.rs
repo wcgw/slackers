@@ -9,7 +9,8 @@ use reqwest::{RequestBuilder, StatusCode};
 use serde::de::DeserializeOwned;
 use serde_json::{Value, json};
 use slackers_model::{
-    Conversation, ConversationId, Message, Reaction, Ts, Unread, UserId, WorkspaceId,
+    Conversation, ConversationId, Emoji, Message, Reaction, ReactionChange, Ts, Unread, UserId,
+    WorkspaceId,
 };
 use tokio::sync::Semaphore;
 
@@ -18,7 +19,7 @@ use crate::session::{
 };
 use crate::wire::{
     ACTIVITY_KINDS, ActivityFeed, AuthTest, ConversationInfo, Counts, History, ListedEmoji,
-    PeopleSearch, Posted, Prefs, ReactedTo, Replies, ThreadView, UserBoot, UserInfo,
+    PeopleSearch, Posted, Prefs, ReactedTo, Replies, ThreadView, UserBoot, UserInfo, reaction_name,
 };
 use crate::{Credentials, Error};
 
@@ -240,6 +241,37 @@ impl Api {
         ];
         let replies: Replies = self.call("conversations.replies", &params).await?;
         Ok(replies.into_messages().find(|message| message.ts == ts))
+    }
+
+    /// Adds the user's reaction with `emoji` to the Message at `ts`, or takes it back, as `change` says. A reaction
+    /// that's as asked already is fine.
+    pub(crate) async fn react(
+        &self,
+        conversation: &ConversationId,
+        ts: Ts,
+        emoji: &Emoji,
+        change: ReactionChange,
+    ) -> Result<(), Error> {
+        let method = match change {
+            ReactionChange::Added => "reactions.add",
+            ReactionChange::Removed => "reactions.remove",
+        };
+        let (ts, name) = (ts.to_string(), reaction_name(emoji));
+        let params = [
+            ("channel", conversation.as_str()),
+            ("timestamp", ts.as_str()),
+            ("name", name.as_str()),
+        ];
+        match self.call::<serde::de::IgnoredAny>(method, &params).await {
+            Ok(_) => Ok(()),
+            // Another client got there first, or this one did and its live event hasn't come yet.
+            Err(Error::Refused { code, .. })
+                if code == "already_reacted" || code == "no_reaction" =>
+            {
+                Ok(())
+            }
+            Err(error) => Err(error),
+        }
     }
 
     /// Every reaction to the Message at `ts`, naming everyone who reacted.

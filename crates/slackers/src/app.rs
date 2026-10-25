@@ -12,7 +12,8 @@
 //! The sidebar's first row opens Activity, merged from every Workspace, newest first: `j`/`k` choose an item and
 //! `Enter` opens its Message, in its Thread if it has one.
 //!
-//! On a Message, `K` shows its details: who wrote it, who reacted, and where it leads (its links, its files and the
+//! On a Message, `+` reacts: it lists the emoji the user uses most, which typing narrows down, for `↑`/`↓` to
+//! choose and `Enter` or `Tab` to react with, or to take back one of the user's reactions. `K` shows its details: who wrote it, who reacted, and where it leads (its links, its files and the
 //! Message itself on Slack's web client), for `j`/`k` to choose, `Enter` or `1`-`9` to open and `y` to copy. `o`
 //! opens a Message's link or file when it has just one, and shows its details to choose from otherwise.
 
@@ -23,8 +24,8 @@ use std::time::{Duration, Instant};
 use crossterm::event::{Event as TerminalEvent, KeyCode, KeyEvent, KeyEventKind, KeyModifiers};
 use slackers_gfx::{CellSize, Fit, Picture};
 use slackers_model::{
-    Author, Broadcast, Conversation, ConversationId, ConversationKind, Happened, Inline, Message,
-    MessageRef, ReactionChange, Timeline, Ts, Unread, UserId,
+    Author, Broadcast, Conversation, ConversationId, ConversationKind, Emoji, Happened, Inline,
+    Message, MessageRef, ReactionChange, Timeline, Ts, Unread, UserId,
 };
 use slackers_slack::{
     Connection, EmojiList, Error, LiveEvent, Permalinks, Person, Request, Snapshot, Update, User,
@@ -175,6 +176,20 @@ pub(crate) enum Mode {
     Search(Search),
     /// Keys choose where a Message leads, from its details shown over its pane.
     Details(Details),
+    /// Keys choose an emoji to react to a Message with, shown after `+` on the status line.
+    React(Reacting),
+}
+
+/// Choosing an emoji to react to a Message with, or to take back the user's reaction with.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) struct Reacting {
+    /// Where the Message is held: its Conversation, or the Thread whose pane it was chosen in.
+    pub(crate) place: Place,
+    pub(crate) ts: Ts,
+    /// The emoji's name, as far as typed.
+    pub(crate) query: String,
+    /// The emoji to choose from, the user's reactions among them saying so; `None` when none matches.
+    pub(crate) choices: Option<Suggestions>,
 }
 
 /// A Message whose details show: who wrote it and when, who reacted, and where it leads.
@@ -704,6 +719,7 @@ impl App {
         self.refresh_search();
         self.refresh_suggestions(&mut commands);
         self.refresh_details(&mut commands);
+        self.refresh_reacting();
         self.reach_selected(&mut commands);
         commands
     }
@@ -716,6 +732,7 @@ impl App {
             Mode::Command(_) => self.command_key(key, commands),
             Mode::Search(_) => self.search_key(key, commands),
             Mode::Details(_) => self.details_key(key, commands),
+            Mode::React(_) => self.react_key(key, commands),
         }
     }
 
@@ -827,6 +844,7 @@ impl App {
             },
             Focus::Timeline => match key.code {
                 KeyCode::Enter => self.open_selected_thread(commands),
+                KeyCode::Char('+') => self.start_reacting(),
                 KeyCode::Char('K') => self.show_details(commands),
                 KeyCode::Char('o') => self.open_selected_link(commands),
                 KeyCode::Char('h') | KeyCode::Left | KeyCode::Esc => self.focus_sidebar(),
@@ -844,6 +862,7 @@ impl App {
                 }
             },
             Focus::Thread => match key.code {
+                KeyCode::Char('+') => self.start_reacting(),
                 KeyCode::Char('K') => self.show_details(commands),
                 KeyCode::Char('o') => self.open_selected_link(commands),
                 KeyCode::Char('h') | KeyCode::Left | KeyCode::Esc => {
@@ -1341,6 +1360,146 @@ impl App {
         }
     }
 
+    /// Starts choosing an emoji to react to the focused pane's selected Message with.
+    fn start_reacting(&mut self) {
+        let Some((place, ts)) = self.selected_message() else {
+            return;
+        };
+        self.mode = Mode::React(Reacting {
+            place,
+            ts,
+            query: String::new(),
+            choices: None,
+        });
+        self.refresh_reacting();
+    }
+
+    fn react_key(&mut self, key: KeyEvent, commands: &mut Vec<Command>) {
+        let Mode::React(reacting) = &mut self.mode else {
+            return;
+        };
+        let control = key.modifiers.contains(KeyModifiers::CONTROL);
+        let count = reacting
+            .choices
+            .as_ref()
+            .map_or(0, |choices| choices.items.len());
+        let select = |reacting: &mut Reacting, by: usize| {
+            if let Some(choices) = &mut reacting.choices {
+                choices.selected = (choices.selected + by) % count;
+            }
+        };
+        match (key.code, control) {
+            (KeyCode::Esc, _) | (KeyCode::Char('c'), true) => self.mode = Mode::Normal,
+            (KeyCode::Down, _) | (KeyCode::Char('n'), true) => select(reacting, 1),
+            (KeyCode::Up | KeyCode::BackTab, _) | (KeyCode::Char('p'), true) => {
+                select(reacting, count.saturating_sub(1));
+            }
+            (KeyCode::Enter | KeyCode::Tab, _) => {
+                let picked = reacting
+                    .choices
+                    .as_ref()
+                    .and_then(|choices| choices.items.get(choices.selected));
+                if let Some(picked) = picked {
+                    let (place, ts, name) =
+                        (reacting.place.clone(), reacting.ts, picked.name.clone());
+                    self.mode = Mode::Normal;
+                    self.react(&place, ts, &name, commands);
+                }
+            }
+            (KeyCode::Backspace, _) => {
+                reacting.query.pop();
+            }
+            // Out of habit, emoji are often typed between colons: those aren't part of the name.
+            (KeyCode::Char(':'), false) => {}
+            (KeyCode::Char(c), false) => reacting.query.push(c),
+            _ => {}
+        }
+    }
+
+    /// Keeps what to react with current: what matches the query, the user's reactions among them saying so, the
+    /// selected one selected. Stops choosing when the Message goes.
+    fn refresh_reacting(&mut self) {
+        let Mode::React(reacting) = &self.mode else {
+            return;
+        };
+        let key = reacting.place.conversation.workspace;
+        let Some((workspace, message)) = self.message(&reacting.place, reacting.ts) else {
+            self.mode = Mode::Normal;
+            return;
+        };
+        let mine: HashSet<String> = message
+            .reactions
+            .iter()
+            .filter(|reaction| reaction.users.contains(&workspace.me))
+            .map(|reaction| reaction.emoji.name.clone())
+            .collect();
+        let query = reacting.query.clone();
+        let Some(workspace) = self.workspaces.get_mut(key) else {
+            return;
+        };
+        let items: Vec<Suggestion> = workspace
+            .emojis
+            .complete(&query, SUGGESTIONS)
+            .into_iter()
+            .map(|found| Suggestion {
+                suggested: Suggested::Emoji,
+                detail: if mine.contains(&found.name) {
+                    "remove".to_owned()
+                } else {
+                    found.alias.to_owned()
+                },
+                name: found.name,
+                positions: found.positions,
+            })
+            .collect();
+        let Mode::React(reacting) = &mut self.mode else {
+            return;
+        };
+        let was_selected = reacting
+            .choices
+            .as_ref()
+            .and_then(|old| old.items.get(old.selected));
+        let selected = was_selected
+            .and_then(|old| items.iter().position(|item| item.writes_as(old)))
+            .unwrap_or(0);
+        reacting.choices = (!items.is_empty()).then_some(Suggestions { items, selected });
+    }
+
+    /// Reacts to the Message at `ts`, held at `place`, with the emoji `name`; or, when the user has reacted with it
+    /// already, in any skin tone, takes that back. Shows it straight away, and undoes it should Slack refuse.
+    fn react(&mut self, place: &Place, ts: Ts, name: &str, commands: &mut Vec<Command>) {
+        let Some((workspace, message)) = self.message(place, ts) else {
+            return;
+        };
+        let mine = message
+            .reactions
+            .iter()
+            .find(|reaction| reaction.emoji.name == name && reaction.users.contains(&workspace.me))
+            .map(|reaction| reaction.emoji.clone());
+        let (emoji, change) = match mine {
+            Some(emoji) => (emoji, ReactionChange::Removed),
+            None => (Emoji::named(name), ReactionChange::Added),
+        };
+        let key = place.conversation.workspace;
+        let Some(workspace) = self.workspaces.get_mut(key) else {
+            return;
+        };
+        let me = workspace.me.clone();
+        for timeline in workspace.timelines_of(&place.conversation.id) {
+            timeline.react(ts, &emoji, &me, change);
+        }
+        if change == ReactionChange::Added {
+            workspace.emojis.note_use(name);
+        }
+        let request = Request::React {
+            conversation: place.conversation.id.clone(),
+            ts,
+            emoji,
+            change,
+        };
+        commands.push(Command::Slack(key, request));
+    }
+
     /// Opens the Thread under `parent` in the open Conversation, in its own pane with focus, and asks for its
     /// Replies unless they're held or on their way.
     fn open_thread(&mut self, parent: Ts, commands: &mut Vec<Command>) {
@@ -1682,6 +1841,35 @@ impl App {
                 self.workspaces
                     .set_phase(key, Phase::Failed(error.to_string()));
             }
+            Update::Reacted {
+                conversation,
+                ts,
+                emoji,
+                change,
+                result: Err(error),
+            } => {
+                // Undo what was shown.
+                if let Some(workspace) = self.workspaces.get_mut(key) {
+                    let me = workspace.me.clone();
+                    let undo = match change {
+                        ReactionChange::Added => ReactionChange::Removed,
+                        ReactionChange::Removed => ReactionChange::Added,
+                    };
+                    for timeline in workspace.timelines_of(&conversation) {
+                        timeline.react(ts, &emoji, &me, undo);
+                    }
+                }
+                let what = match change {
+                    ReactionChange::Added => "react with",
+                    ReactionChange::Removed => "take back",
+                };
+                self.notice = Some(format!(
+                    "couldn't {what} :{}:: {}",
+                    emoji.name,
+                    describe(&error)
+                ));
+            }
+            Update::Reacted { result: Ok(()), .. } => {}
             Update::Activity { cursor, result } => {
                 let next = match result {
                     Ok(page) => {
@@ -4408,6 +4596,175 @@ mod tests {
         })));
         app.focus = Focus::Timeline;
         app
+    }
+
+    /// `reading_random_with` its Message holding `reactions`, and the emoji `tada`, `taco` and `+1` on offer, `taco`
+    /// used three times and `+1` once.
+    fn reacting_to(reactions: Vec<slackers_model::Reaction>) -> App {
+        let mut app = reading_random_with(RichText::plain("lunch?"), Vec::new(), reactions);
+        app.update(slack(Update::Emoji(EmojiList {
+            custom: slackers_model::CustomEmojiSet::default(),
+            standard: ["tada", "taco", "+1"].map(String::from).into(),
+        })));
+        let used = HashMap::from([("taco".to_owned(), 3), ("+1".to_owned(), 1)]);
+        app.update(slack(Update::EmojiUse(used)));
+        app
+    }
+
+    /// The emoji to react with, best first, and what each says beside it.
+    fn choices(app: &App) -> Vec<(String, String)> {
+        let Mode::React(reacting) = &app.mode else {
+            return Vec::new();
+        };
+        reacting
+            .choices
+            .iter()
+            .flat_map(|choices| &choices.items)
+            .map(|item| (item.name.clone(), item.detail.clone()))
+            .collect()
+    }
+
+    /// The first Workspace's `#random` Message at 5 seconds' reactions, as emoji name and how many reacted, and
+    /// whether the user is among them.
+    fn reactions(app: &App) -> Vec<(String, u32, bool)> {
+        let place = place("C2", None);
+        let (_, message) = app.message(&place, seconds(5)).unwrap();
+        message
+            .reactions
+            .iter()
+            .map(|reaction| {
+                let mine = reaction.users.contains(&UserId::new("UME"));
+                (reaction.emoji.name.clone(), reaction.count, mine)
+            })
+            .collect()
+    }
+
+    fn react_request(name: &str, change: ReactionChange) -> Command {
+        ask(Request::React {
+            conversation: id("C2"),
+            ts: seconds(5),
+            emoji: Emoji::named(name),
+            change,
+        })
+    }
+
+    #[test]
+    fn plus_offers_the_emoji_used_most_and_typing_narrows_them_down() {
+        let mut app = reacting_to(Vec::new());
+        assert!(keys(&mut app, "+").is_empty());
+        let names =
+            |app: &App| -> Vec<String> { choices(app).into_iter().map(|(name, _)| name).collect() };
+        assert_eq!(names(&app), ["taco", "+1", "tada"]);
+        keys(&mut app, ":ta");
+        assert_eq!(
+            names(&app),
+            ["taco", "tada"],
+            "a colon is no part of a name"
+        );
+        app.update(key(KeyCode::Down));
+        assert_eq!(
+            app.update(key(KeyCode::Enter)),
+            [react_request("tada", ReactionChange::Added)]
+        );
+        assert_eq!(app.mode, Mode::Normal);
+        assert_eq!(
+            reactions(&app),
+            [("tada".to_owned(), 1, true)],
+            "shown straight away"
+        );
+
+        keys(&mut app, "+tq");
+        assert_eq!(choices(&app), [], "nothing by that name");
+        assert!(app.update(key(KeyCode::Enter)).is_empty());
+        app.update(key(KeyCode::Backspace));
+        assert_eq!(
+            choices(&app)[..2],
+            [
+                ("taco".to_owned(), String::new()),
+                ("tada".to_owned(), "remove".to_owned())
+            ],
+            "the user's own says so, and counts as used once now"
+        );
+        app.update(key(KeyCode::Esc));
+        assert_eq!(app.mode, Mode::Normal);
+        assert_eq!(reactions(&app).len(), 1, "nothing changed");
+        keys(&mut app, "+");
+        assert_eq!(
+            names(&app),
+            ["taco", "tada", "+1"],
+            "used as often as +1 now, and Slack lists it first"
+        );
+    }
+
+    #[test]
+    fn someone_elses_reaction_is_joined_and_a_message_going_ends_the_choice() {
+        let mut taco = reacted(&["U2"], 1);
+        taco.emoji = Emoji::named("taco");
+        let mut app = reacting_to(vec![taco]);
+        keys(&mut app, "+taco");
+        assert_eq!(choices(&app), [("taco".to_owned(), String::new())]);
+        assert_eq!(
+            app.update(key(KeyCode::Enter)),
+            [react_request("taco", ReactionChange::Added)]
+        );
+        assert_eq!(reactions(&app), [("taco".to_owned(), 2, true)]);
+
+        keys(&mut app, "+");
+        app.update(slack(Update::Live(LiveEvent::Deleted {
+            conversation: id("C2"),
+            ts: seconds(5),
+        })));
+        assert_eq!(app.mode, Mode::Normal);
+    }
+
+    #[test]
+    fn picking_ones_own_reaction_takes_it_back_and_a_refusal_undoes_what_was_shown() {
+        let mut thumbs = reacted(&["U2", "UME"], 2);
+        thumbs.emoji = Emoji::named("+1");
+        thumbs.emoji.skin_tone = Some(3);
+        let mut app = reacting_to(vec![thumbs.clone()]);
+        keys(&mut app, "++");
+        assert_eq!(
+            choices(&app),
+            [("+1".to_owned(), "remove".to_owned())],
+            "in any skin tone"
+        );
+        let commands = app.update(key(KeyCode::Tab));
+        let request = ask(Request::React {
+            conversation: id("C2"),
+            ts: seconds(5),
+            emoji: thumbs.emoji.clone(),
+            change: ReactionChange::Removed,
+        });
+        assert_eq!(commands, [request]);
+        assert_eq!(reactions(&app), [("+1".to_owned(), 1, false)]);
+
+        app.update(slack(Update::Reacted {
+            conversation: id("C2"),
+            ts: seconds(5),
+            emoji: thumbs.emoji,
+            change: ReactionChange::Removed,
+            result: Err(Error::Refused {
+                method: "reactions.remove",
+                code: "ratelimited".into(),
+            }),
+        }));
+        assert_eq!(
+            reactions(&app),
+            [("+1".to_owned(), 2, true)],
+            "back as it was"
+        );
+        assert_eq!(
+            app.notice.as_deref(),
+            Some("couldn't take back :+1:: slack refused reactions.remove: ratelimited")
+        );
+    }
+
+    #[test]
+    fn plus_needs_a_message() {
+        let (mut app, _) = ready_app();
+        keys(&mut app, "+");
+        assert_eq!(app.mode, Mode::Normal, "the sidebar has none");
     }
 
     fn reacted(users: &[&str], count: u32) -> slackers_model::Reaction {

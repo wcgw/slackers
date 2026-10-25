@@ -791,6 +791,14 @@ fn reaction_emoji(name: &str) -> Emoji {
     }
 }
 
+/// `emoji` as a reaction's name, as Slack takes it: `thumbsup::skin-tone-2`, say.
+pub(crate) fn reaction_name(emoji: &Emoji) -> String {
+    match emoji.skin_tone {
+        Some(tone) => format!("{}::skin-tone-{tone}", emoji.name),
+        None => emoji.name.clone(),
+    }
+}
+
 /// `chat.postMessage`'s reply.
 #[derive(Deserialize)]
 pub(crate) struct Posted {
@@ -1864,6 +1872,13 @@ mod tests {
         );
         assert_eq!(page.items[0].at, seconds(9));
         assert_eq!(page.next, Some(ActivityCursor("older".into())));
+    }
+
+    #[test]
+    fn a_reactions_name_carries_its_skin_tone_both_ways() {
+        for name in ["tada", "+1::skin-tone-3"] {
+            assert_eq!(reaction_name(&reaction_emoji(name)), name);
+        }
     }
 
     #[test]
