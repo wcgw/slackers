@@ -1,4 +1,4 @@
-//! Drafts: what the user writes before posting it, and whom it @-mentions.
+//! Drafts: what the user writes before posting it, whom it @-mentions, and the word being completed.
 
 use crossterm::event::KeyEvent;
 use ratatui::buffer::Buffer;
@@ -22,6 +22,15 @@ pub(crate) struct Draft {
     picked: Vec<Picked>,
     /// What an empty Draft shows: whether it's a Message or a Reply.
     placeholder: &'static str,
+}
+
+/// A word being written that can be completed, by what it starts with.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) enum Completing {
+    /// `@` and a name, to @-mention someone or some broadcast: the name, which is empty right after the `@`.
+    Mention(String),
+    /// `:` and at least two characters of an emoji's name: the name.
+    Emoji(String),
 }
 
 /// Who an @-mention notifies.
@@ -90,9 +99,26 @@ impl Draft {
         self.area = text_area(text, self.placeholder);
     }
 
-    /// The name being written as an @-mention, if one is: the word before the cursor, less the `@` it starts with.
-    /// It's empty right after the `@`. A word with an `@` inside, such as an email address, isn't one.
-    pub(crate) fn mentioning(&self) -> Option<&str> {
+    /// The word being completed, if one is: the word before the cursor, when it starts with `@` or `:` and the
+    /// rest could be a name. A word with either inside, such as an email address or a time, isn't one.
+    pub(crate) fn completing(&self) -> Option<Completing> {
+        let word = self.word()?;
+        if let Some(name) = word.strip_prefix('@') {
+            let in_name = |c: char| c.is_alphanumeric() || matches!(c, '.' | '-' | '_' | '\'');
+            return name
+                .chars()
+                .all(in_name)
+                .then(|| Completing::Mention(name.to_owned()));
+        }
+        // Two characters at least, so that `:D` and the like stay as typed.
+        let name = word.strip_prefix(':')?;
+        let in_name = |c: char| c.is_alphanumeric() || matches!(c, '-' | '_' | '+' | '\'');
+        (name.chars().nth(1).is_some() && name.chars().all(in_name))
+            .then(|| Completing::Emoji(name.to_owned()))
+    }
+
+    /// The word before the cursor: what's between the cursor and the whitespace before it, or the line's start.
+    fn word(&self) -> Option<&str> {
         let cursor = self.area.cursor();
         let line = self.area.lines().get(cursor.0)?;
         let end = line
@@ -100,25 +126,30 @@ impl Draft {
             .nth(cursor.1)
             .map_or(line.len(), |(at, _)| at);
         let before = &line[..end];
-        let word = before
-            .rsplit_once(char::is_whitespace)
-            .map_or(before, |(_, word)| word);
-        let name = word.strip_prefix('@')?;
-        name.chars()
-            .all(|c| c.is_alphanumeric() || matches!(c, '.' | '-' | '_' | '\''))
-            .then_some(name)
+        Some(
+            before
+                .rsplit_once(char::is_whitespace)
+                .map_or(before, |(_, word)| word),
+        )
     }
 
-    /// Writes an @-mention of `mentioned`, called `name`, and a space, in place of the one being written. A name
-    /// already picked for someone else is told apart by a number.
-    pub(crate) fn pick(&mut self, mentioned: Mentioned, name: &str) {
-        let Some(written) = self.mentioning().map(|name| name.chars().count()) else {
-            return;
-        };
-        // The name, and its `@`.
-        for _ in 0..=written {
+    /// Writes `with` and a space in place of the word being completed, if there's one.
+    fn complete(&mut self, with: &str) -> bool {
+        if self.completing().is_none() {
+            return false;
+        }
+        // The word, its `@` or `:` included.
+        let written = self.word().map_or(0, |word| word.chars().count());
+        for _ in 0..written {
             self.area.delete_char();
         }
+        self.area.insert_str(format!("{with} "));
+        true
+    }
+
+    /// Writes an @-mention of `mentioned`, called `name`, and a space, in place of the word being completed. A name
+    /// already picked for someone else is told apart by a number.
+    pub(crate) fn pick(&mut self, mentioned: Mentioned, name: &str) {
         let label = (1..)
             .map(|n| match n {
                 1 => format!("@{name}"),
@@ -130,10 +161,15 @@ impl Draft {
                     .all(|picked| picked.label != *label || picked.mentioned == mentioned)
             })
             .expect("only as many labels are taken as there are picks");
-        self.area.insert_str(format!("{label} "));
-        if !self.picked.iter().any(|picked| picked.label == label) {
+        if self.complete(&label) && !self.picked.iter().any(|picked| picked.label == label) {
             self.picked.push(Picked { label, mentioned });
         }
+    }
+
+    /// Writes the emoji `name`, between colons, and a space, in place of the word being completed. Slack draws it
+    /// once posted.
+    pub(crate) fn pick_emoji(&mut self, name: &str) {
+        self.complete(&format!(":{name}:"));
     }
 
     /// The labels of the @-mentions its text holds, in the order they were picked.
@@ -292,13 +328,21 @@ mod tests {
         Part::Text(text.into())
     }
 
+    fn mention(name: &str) -> Option<Completing> {
+        Some(Completing::Mention(name.into()))
+    }
+
+    fn emoji(name: &str) -> Option<Completing> {
+        Some(Completing::Emoji(name.into()))
+    }
+
     #[test]
     fn a_word_starting_with_an_at_is_a_mention_being_written() {
-        assert_eq!(draft("hi @ad").mentioning(), Some("ad"));
-        assert_eq!(draft("@").mentioning(), Some(""));
-        assert_eq!(draft("first\n@o'bri").mentioning(), Some("o'bri"));
+        assert_eq!(draft("hi @ad").completing(), mention("ad"));
+        assert_eq!(draft("@").completing(), mention(""));
+        assert_eq!(draft("first\n@o'bri").completing(), mention("o'bri"));
         for not_one in ["hi", "hi @ada ", "ada@example.com", "@ada,", "(@ada"] {
-            assert_eq!(draft(not_one).mentioning(), None, "{not_one}");
+            assert_eq!(draft(not_one).completing(), None, "{not_one}");
         }
         // It's the word before the cursor that counts.
         let mut moved = draft("@ada and more");
@@ -306,7 +350,31 @@ mod tests {
         for _ in 0.."@ad".len() {
             moved.area.move_cursor(CursorMove::Forward);
         }
-        assert_eq!(moved.mentioning(), Some("ad"));
+        assert_eq!(moved.completing(), mention("ad"));
+    }
+
+    #[test]
+    fn a_word_starting_with_a_colon_and_two_more_is_an_emoji_being_written() {
+        assert_eq!(draft("nice :ta").completing(), emoji("ta"));
+        assert_eq!(draft(":+1").completing(), emoji("+1"));
+        assert_eq!(draft(":it's-a_ok").completing(), emoji("it's-a_ok"));
+        assert_eq!(draft(":お疲").completing(), emoji("お疲"));
+        for not_one in [
+            ":", ":D", ":-)", "12:30", "note:ab", ":tada:", ":tada: ", "::std",
+        ] {
+            assert_eq!(draft(not_one).completing(), None, "{not_one}");
+        }
+    }
+
+    #[test]
+    fn picking_an_emoji_writes_its_name_between_colons_as_slack_reads_it() {
+        let mut draft = draft("nice :ta");
+        draft.pick_emoji("tada");
+        assert_eq!(draft.text(), "nice :tada: ");
+        assert_eq!(draft.completing(), None);
+        draft.pick_emoji("tada");
+        assert_eq!(draft.text(), "nice :tada: ", "nothing to complete");
+        assert_eq!(sent(&mut draft), [text("nice :tada: ")]);
     }
 
     #[test]
@@ -315,7 +383,7 @@ mod tests {
         draft.pick(person("U1"), "Ada Lovelace");
         draft.input(KeyEvent::new(KeyCode::Char('!'), KeyModifiers::NONE));
         assert_eq!(draft.text(), "thanks @Ada Lovelace !");
-        assert_eq!(draft.mentioning(), None);
+        assert_eq!(draft.completing(), None);
         assert_eq!(draft.mentions().collect::<Vec<_>>(), ["@Ada Lovelace"]);
         assert_eq!(
             sent(&mut draft),

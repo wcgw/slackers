@@ -19,8 +19,8 @@ use slackers_slack::Connection;
 use unicode_width::UnicodeWidthStr as _;
 
 use crate::app::{
-    App, ConversationRef, Details, Drawn, Focus, LinkKind, Mode, Phase, Place, Suggestions,
-    WantedPicture, Workspace, WorkspaceKey,
+    App, ConversationRef, Details, Drawn, Focus, LinkKind, Mode, Phase, Place, Suggested,
+    Suggestions, WantedPicture, Workspace, WorkspaceKey,
 };
 use crate::draft::{Draft, Mentioned};
 use crate::emoji::Drawable;
@@ -48,8 +48,11 @@ const GUTTER: u16 = 3;
 /// The most room an image shared in a Message takes; one smaller than this shows at its own size.
 const IMAGE: CellBox = CellBox { cols: 60, rows: 15 };
 
-/// The widest the list of whom to @-mention gets, in cells.
+/// The widest the list of suggestions to complete a word with gets, in cells.
 const SUGGESTIONS_WIDTH: u16 = 48;
+
+/// The room an emoji gets in a list of suggestions, a space after it included.
+const EMOJI_CELLS: u16 = 3;
 
 /// The widest a Message's details get, in cells.
 const DETAILS_WIDTH: u16 = 80;
@@ -632,15 +635,25 @@ fn draw_pane(
     });
     let inserting = app.mode == Mode::Insert && app.writing_place().as_ref() == Some(&view.place);
     let body = draw_composer(frame, body, app.drafts.get(&view.place), inserting);
-    let suggestions = app.suggestions.as_ref().filter(|_| inserting);
+    let suggestions = app
+        .suggestions
+        .as_ref()
+        .filter(|_| inserting)
+        .map(|suggestions| {
+            let key = view.place.conversation.workspace;
+            (
+                suggestions,
+                Renderer::new(app, workspace, key, body.width, zone),
+            )
+        });
     let Some(timeline) = view.timeline else {
         let loading = Line::from(vec![
             Span::styled(icons::LOADING, ACCENT),
             Span::styled("loading…", DIM),
         ]);
         frame.render_widget(Paragraph::new(loading), body);
-        if let Some(suggestions) = suggestions {
-            draw_suggestions(frame, body, suggestions);
+        if let Some((suggestions, renderer)) = suggestions {
+            draw_suggestions(frame, body, suggestions, renderer, drawn);
         }
         return None;
     };
@@ -720,8 +733,8 @@ fn draw_pane(
             && middle >= usize::from(body.y) + usize::from(body.height) / 2;
         draw_details(frame, body, at_top, app, details, zone, drawn);
     }
-    if let Some(suggestions) = suggestions {
-        draw_suggestions(frame, body, suggestions);
+    if let Some((suggestions, renderer)) = suggestions {
+        draw_suggestions(frame, body, suggestions, renderer, drawn);
     }
     Some(settled)
 }
@@ -890,9 +903,16 @@ fn who(names: &[&str], count: usize, room: usize) -> String {
     listed + &others(named)
 }
 
-/// Draws the list of whom to @-mention over the bottom left of `area`, just above the draft, the selected one
-/// highlighted.
-fn draw_suggestions(frame: &mut Frame<'_>, area: Rect, suggestions: &Suggestions) {
+/// Draws the list of what to complete the word being written with over the bottom left of `area`, just above the
+/// draft, the selected one highlighted: whom to @-mention after their icons, emoji after themselves, as `renderer`
+/// draws them. The pictures they want, and when they next change, go into `drawn`.
+fn draw_suggestions(
+    frame: &mut Frame<'_>,
+    area: Rect,
+    suggestions: &Suggestions,
+    mut renderer: Renderer<'_>,
+    drawn: &mut Drawn,
+) {
     let rows = u16::try_from(suggestions.items.len()).unwrap_or(u16::MAX);
     let height = rows.saturating_add(2).min(area.height);
     let width = area.width.min(SUGGESTIONS_WIDTH);
@@ -914,11 +934,23 @@ fn draw_suggestions(frame: &mut Frame<'_>, area: Rect, suggestions: &Suggestions
         .enumerate()
         .skip(skip)
         .map(|(index, suggestion)| {
-            let icon = match suggestion.mentioned {
-                Mentioned::Person(_) => icons::AVATAR,
-                Mentioned::Broadcast(_) => icons::BROADCAST,
+            let mut spans = match &suggestion.suggested {
+                Suggested::Mention(Mentioned::Person(_)) => {
+                    vec![Span::styled(icons::AVATAR, ACCENT)]
+                }
+                Suggested::Mention(Mentioned::Broadcast(_)) => {
+                    vec![Span::styled(icons::BROADCAST, ACCENT)]
+                }
+                Suggested::Emoji => match renderer.emoji(&Emoji::named(suggestion.name.clone())) {
+                    // Followed by a space, in three cells, those of a wide character and a space.
+                    Piece::Atom(glyph, cells) => {
+                        let pad = usize::from(EMOJI_CELLS.saturating_sub(cells).max(1));
+                        vec![glyph, Span::raw(" ".repeat(pad))]
+                    }
+                    // Its picture isn't loaded yet, or there's nothing to draw it with.
+                    Piece::Text(..) => vec![Span::raw(" ".repeat(usize::from(EMOJI_CELLS)))],
+                },
             };
-            let mut spans = vec![Span::styled(icon, ACCENT)];
             let (name, _) = highlighted(
                 &suggestion.name,
                 Style::new(),
@@ -938,6 +970,8 @@ fn draw_suggestions(frame: &mut Frame<'_>, area: Rect, suggestions: &Suggestions
         })
         .collect();
     frame.render_widget(Paragraph::new(lines), inner);
+    drawn.wanted_pictures.extend(renderer.wanted);
+    drawn.next_change = earliest(drawn.next_change, renderer.next_change);
 }
 
 /// Lays out `timeline`'s Messages for `place`, `width` cells wide, followed by those still being sent there. A
@@ -1451,7 +1485,12 @@ fn draw_status(frame: &mut Frame<'_>, area: Rect, app: &App) {
     }
     let hints = match (&app.mode, app.focus) {
         (Mode::Details(_), _) => "j/k choose · ⏎ open · 1-9 open · y copy · esc close",
-        (Mode::Insert, _) if app.suggestions.is_some() => "↑/↓ choose · ⇥/⏎ mention · esc normal",
+        (Mode::Insert, _) if let Some(suggestions) = &app.suggestions => {
+            match suggestions.items[suggestions.selected].suggested {
+                Suggested::Mention(_) => "↑/↓ choose · ⇥/⏎ mention · esc normal",
+                Suggested::Emoji => "↑/↓ choose · ⇥/⏎ insert · esc normal",
+            }
+        }
         (Mode::Insert, _) => "⏎ send · ⇧⏎ new line · ^x^e $EDITOR · esc normal",
         (_, Focus::Sidebar) => {
             "j/k select · ⏎ open · za fold · / search · \\ hide · i write · :q quit"
@@ -1752,6 +1791,42 @@ mod tests {
         assert!(
             rows[draft - 1].contains(" @here ─"),
             "the rule names it: {rows:#?}"
+        );
+    }
+
+    #[test]
+    fn emoji_to_insert_show_as_themselves_by_name_and_custom_ones_load() {
+        let mut app = reading_general();
+        let mut custom = slackers_model::CustomEmojiSet::default();
+        custom.insert_image("parrot", "https://e/parrot.gif");
+        let list = slackers_slack::EmojiList {
+            custom,
+            standard: vec!["+1".into(), "partying_face".into()],
+        };
+        app.update(Event::Slack(w(0), Update::Emoji(list)));
+        type_text(&mut app, "i:pa");
+        let (rows, drawn) = render(&app);
+        let row_of = |text: &str| rows.iter().position(|row| row.contains(text)).unwrap();
+        let (partying, parrot) = (row_of("partying_face"), row_of("parrot"));
+        assert_eq!(partying + 1, parrot, "{rows:#?}");
+        assert!(rows[partying].contains("🥳"), "{rows:#?}");
+        assert!(rows.last().unwrap().contains("⇥/⏎ insert"), "{rows:#?}");
+        let wanted: Vec<(&str, Fit)> = drawn
+            .wanted_pictures
+            .iter()
+            .map(|wanted| (wanted.url.as_str(), wanted.fit))
+            .collect();
+        assert_eq!(wanted, [("https://e/parrot.gif", Fit::Emoji)]);
+
+        for _ in 0..2 {
+            press(&mut app, KeyCode::Backspace, KeyModifiers::NONE);
+        }
+        type_text(&mut app, "thumbsu");
+        let rows = screen(&app);
+        let found = rows.iter().find(|row| row.contains("👍"));
+        assert!(
+            found.is_some_and(|row| row.contains("+1  thumbsup")),
+            "{rows:#?}"
         );
     }
 

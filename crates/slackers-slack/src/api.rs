@@ -1,6 +1,7 @@
 //! Slack's Web API, called as the web client calls it: a form `POST` carrying the session token, with the
 //! session cookies alongside.
 
+use std::collections::HashMap;
 use std::time::Duration;
 
 use reqwest::header::{CONTENT_TYPE, COOKIE, RETRY_AFTER};
@@ -8,15 +9,14 @@ use reqwest::{RequestBuilder, StatusCode};
 use serde::de::DeserializeOwned;
 use serde_json::{Value, json};
 use slackers_model::{
-    Activity, Conversation, ConversationId, CustomEmojiSet, Message, Reaction, Ts, UserId,
-    WorkspaceId,
+    Activity, Conversation, ConversationId, Message, Reaction, Ts, UserId, WorkspaceId,
 };
 use tokio::sync::Semaphore;
 
-use crate::session::{HistoryPage, Part, Person, Snapshot, User};
+use crate::session::{EmojiList, HistoryPage, Part, Person, Snapshot, User};
 use crate::wire::{
-    AuthTest, ConversationInfo, Counts, EmojiList, History, PeopleSearch, Posted, ReactedTo,
-    Replies, ThreadView, UserBoot, UserInfo,
+    AuthTest, ConversationInfo, Counts, History, ListedEmoji, PeopleSearch, Posted, Prefs,
+    ReactedTo, Replies, ThreadView, UserBoot, UserInfo,
 };
 use crate::{Credentials, Error};
 
@@ -301,9 +301,19 @@ impl Api {
         Ok(found.into_people())
     }
 
-    pub(crate) async fn custom_emoji(&self) -> Result<CustomEmojiSet, Error> {
-        let list: EmojiList = self.call("emoji.list", &[]).await?;
-        Ok(list.into_set())
+    pub(crate) async fn emoji(&self) -> Result<EmojiList, Error> {
+        let listed: ListedEmoji = self
+            .call("emoji.list", &[("include_categories", "true")])
+            .await?;
+        Ok(listed.into_list())
+    }
+
+    /// How many times the user used each emoji, by name, as Slack's clients count it.
+    pub(crate) async fn emoji_use(&self) -> Result<HashMap<String, u32>, Error> {
+        let prefs: Prefs = self.call("users.prefs.get", &[]).await?;
+        prefs
+            .into_emoji_use()
+            .ok_or_else(|| Error::refused("users.prefs.get", "unreadable_emoji_use"))
     }
 
     /// The bytes at `url`. Slack's own hosts get the session's credentials, as private files need; any other host,

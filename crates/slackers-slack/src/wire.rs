@@ -11,7 +11,7 @@ use slackers_model::{
 };
 
 use crate::mrkdwn;
-use crate::session::{FollowedThread, HistoryPage, LiveEvent, Person, Snapshot, User};
+use crate::session::{EmojiList, FollowedThread, HistoryPage, LiveEvent, Person, Snapshot, User};
 use crate::web::Permalinks;
 
 /// Slack's timestamp text as a [`Ts`]; anything unparsable, such as an absent `latest`, reads as zero.
@@ -910,21 +910,60 @@ impl PeopleSearch {
 }
 
 #[derive(Deserialize)]
-pub(crate) struct EmojiList {
+pub(crate) struct ListedEmoji {
+    /// The Custom Emoji: an image's URL, or `alias:` and the name of another emoji, by name.
     #[serde(default)]
     emoji: HashMap<String, String>,
+    /// The standard emoji, as `include_categories` asks for.
+    #[serde(default)]
+    categories: Vec<EmojiCategory>,
 }
 
-impl EmojiList {
-    pub(crate) fn into_set(self) -> CustomEmojiSet {
-        let mut set = CustomEmojiSet::default();
+#[derive(Deserialize)]
+struct EmojiCategory {
+    #[serde(default)]
+    emoji_names: Vec<String>,
+}
+
+impl ListedEmoji {
+    pub(crate) fn into_list(self) -> EmojiList {
+        let mut custom = CustomEmojiSet::default();
         for (name, target) in self.emoji {
             match target.strip_prefix("alias:") {
-                Some(of) => set.insert_alias(name, of),
-                None => set.insert_image(name, target),
+                Some(of) => custom.insert_alias(name, of),
+                None => custom.insert_image(name, target),
             }
         }
-        set
+        let standard = self
+            .categories
+            .into_iter()
+            .flat_map(|category| category.emoji_names)
+            .collect();
+        EmojiList { custom, standard }
+    }
+}
+
+#[derive(Deserialize)]
+pub(crate) struct Prefs {
+    #[serde(default)]
+    prefs: PrefValues,
+}
+
+#[derive(Default, Deserialize)]
+struct PrefValues {
+    /// A JSON object, as a string: how many times the user used each emoji, by name.
+    #[serde(default)]
+    emoji_use: String,
+}
+
+impl Prefs {
+    /// How many times the user used each emoji, by name; `None` when that's unreadable.
+    pub(crate) fn into_emoji_use(self) -> Option<HashMap<String, u32>> {
+        let counts = self.prefs.emoji_use;
+        if counts.is_empty() {
+            return Some(HashMap::new());
+        }
+        serde_json::from_str(&counts).ok()
     }
 }
 
@@ -1622,17 +1661,39 @@ mod tests {
     }
 
     #[test]
-    fn emoji_list_keeps_images_and_aliases() {
-        let list: EmojiList = serde_json::from_value(json!({
-            "emoji": {"parrot": "https://emoji/parrot.gif", "pp": "alias:parrot"}
+    fn listed_emoji_keep_images_aliases_and_slacks_order_of_standard_ones() {
+        let listed: ListedEmoji = serde_json::from_value(json!({
+            "emoji": {"parrot": "https://emoji/parrot.gif", "pp": "alias:parrot"},
+            "categories": [
+                {"name": "Smileys & People", "emoji_names": ["grinning", "+1"]},
+                {"name": "Flags", "emoji_names": ["flag-fr"]}
+            ]
         }))
         .unwrap();
-        let set = list.into_set();
+        let list = listed.into_list();
         assert_eq!(
-            set.resolve("pp"),
+            list.custom.resolve("pp"),
             Some(slackers_model::CustomEmoji::Image {
                 url: "https://emoji/parrot.gif"
             })
         );
+        assert_eq!(list.standard, ["grinning", "+1", "flag-fr"]);
+        let custom_only: ListedEmoji = serde_json::from_value(json!({"emoji": {}})).unwrap();
+        assert!(custom_only.into_list().standard.is_empty());
+    }
+
+    #[test]
+    fn emoji_use_is_counted_by_name_and_none_is_no_use() {
+        let prefs =
+            |prefs: Value| serde_json::from_value::<Prefs>(json!({ "prefs": prefs })).unwrap();
+        assert_eq!(
+            prefs(json!({"emoji_use": "{\"+1\":12,\"parrot\":3}"})).into_emoji_use(),
+            Some(HashMap::from([
+                ("+1".to_owned(), 12),
+                ("parrot".to_owned(), 3)
+            ]))
+        );
+        assert_eq!(prefs(json!({})).into_emoji_use(), Some(HashMap::new()));
+        assert_eq!(prefs(json!({"emoji_use": "{oops"})).into_emoji_use(), None);
     }
 }

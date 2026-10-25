@@ -78,6 +78,11 @@ impl CustomEmojiSet {
         None
     }
 
+    /// Every name it holds, aliases included, in no particular order.
+    pub fn names(&self) -> impl Iterator<Item = &str> {
+        self.by_name.keys().map(String::as_str)
+    }
+
     /// How many names it holds, aliases included.
     pub fn len(&self) -> usize {
         self.by_name.len()
@@ -111,6 +116,9 @@ mod tests {
             Some(CustomEmoji::Standard { name: "thumbsup" })
         );
         assert_eq!(set.resolve("thumbsup"), None);
+        let mut names: Vec<&str> = set.names().collect();
+        names.sort_unstable();
+        assert_eq!(names, ["parrot", "partyparrot", "yes"]);
     }
 
     #[test]

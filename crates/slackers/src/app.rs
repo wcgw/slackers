@@ -6,7 +6,8 @@
 //! sections, `\` jumps to the sidebar), `i` enters Insert mode to write in the open Conversation or Thread, `/`
 //! searches the sidebar, and `:` enters Command mode: `:q` quits, `:vw add NAME` puts the open Channel in the
 //! Virtual Workspace called NAME, and `:vw rm NAME` takes it out. In Insert mode, a word starting with `@` brings
-//! up people and broadcasts to @-mention: `↑`/`↓` choose one, `Tab` or `Enter` picks it.
+//! up people and broadcasts to @-mention, and one starting with `:` and two more characters brings up emoji: `↑`/`↓`
+//! choose one, `Tab` or `Enter` picks it.
 //!
 //! On a Message, `K` shows its details: who wrote it, who reacted, and where it leads (its links, its files and the
 //! Message itself on Slack's web client), for `j`/`k` to choose, `Enter` or `1`-`9` to open and `y` to copy. `o`
@@ -23,18 +24,18 @@ use slackers_model::{
     Timeline, Ts, UserId,
 };
 use slackers_slack::{
-    Connection, Error, LiveEvent, Permalinks, Person, Request, Snapshot, Update, User,
+    Connection, EmojiList, Error, LiveEvent, Permalinks, Person, Request, Snapshot, Update, User,
 };
 
 use crate::config::{ChannelRef, VirtualWorkspace};
-use crate::draft::{Draft, Mentioned, Written};
+use crate::draft::{Completing, Draft, Mentioned, Written};
 use crate::emoji::Emojis;
 use crate::pane::{Pane, Settled};
 use crate::pictures::Pictures;
 use crate::search::{self, Finder};
 use crate::sidebar::{Fold, Item, Section, Sidebar};
 
-/// The most people and broadcasts offered to @-mention at once.
+/// The most people and broadcasts offered to @-mention at once, and the most emoji.
 const SUGGESTIONS: usize = 8;
 
 /// The most people named per reaction in a Message's details, whose names are looked up: more wouldn't fit on the
@@ -215,7 +216,8 @@ pub(crate) struct Found {
     pub(crate) positions: Vec<usize>,
 }
 
-/// People and broadcasts to @-mention, offered in Insert mode while the word being written starts with `@`.
+/// What to complete the word being written with, offered in Insert mode while it starts with `@` (people and
+/// broadcasts to @-mention) or `:` (emoji).
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) struct Suggestions {
     /// Best first; never empty.
@@ -224,16 +226,36 @@ pub(crate) struct Suggestions {
     pub(crate) selected: usize,
 }
 
-/// Someone, or some broadcast, to @-mention.
+/// Something to complete the word being written with.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) struct Suggestion {
-    pub(crate) mentioned: Mentioned,
-    /// What the @-mention calls them.
+    pub(crate) suggested: Suggested,
+    /// What it's called: what an @-mention calls someone, or an emoji's name.
     pub(crate) name: String,
-    /// More to tell them apart by, such as their full name; empty when there's nothing more.
+    /// More to tell it by, such as someone's full name, or another name an emoji goes by; empty when there's nothing
+    /// more.
     pub(crate) detail: String,
     /// Which characters of `name` match the name being written, by char index, ascending.
     pub(crate) positions: Vec<usize>,
+}
+
+/// What picking a [`Suggestion`] writes.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) enum Suggested {
+    Mention(Mentioned),
+    /// The emoji the suggestion names.
+    Emoji,
+}
+
+impl Suggestion {
+    /// Whether it writes what `other` does, though perhaps under another name.
+    fn writes_as(&self, other: &Self) -> bool {
+        match (&self.suggested, &other.suggested) {
+            (Suggested::Mention(mentioned), Suggested::Mention(other)) => mentioned == other,
+            (Suggested::Emoji, Suggested::Emoji) => self.name == other.name,
+            (Suggested::Mention(_) | Suggested::Emoji, _) => false,
+        }
+    }
 }
 
 /// Which pane Normal mode's keys move around.
@@ -474,7 +496,7 @@ pub(crate) struct App {
     pub(crate) sidebar_shown: bool,
     /// Unsent text, per Place.
     pub(crate) drafts: HashMap<Place, Draft>,
-    /// Whom to @-mention in the Draft being written, while a name starting with `@` is.
+    /// What to complete the word being written in a Draft with, while it starts with `@` or `:`.
     pub(crate) suggestions: Option<Suggestions>,
     /// Messages posted but not yet confirmed, oldest first.
     pub(crate) outbox: Vec<Outgoing>,
@@ -792,7 +814,19 @@ impl App {
                 }
                 (KeyCode::Tab, _) | (KeyCode::Enter, _) if !new_line => {
                     let picked = suggestions.items[suggestions.selected].clone();
-                    self.draft(&place).pick(picked.mentioned, &picked.name);
+                    match picked.suggested {
+                        Suggested::Mention(mentioned) => {
+                            self.draft(&place).pick(mentioned, &picked.name);
+                        }
+                        Suggested::Emoji => {
+                            self.draft(&place).pick_emoji(&picked.name);
+                            if let Some(workspace) =
+                                self.workspaces.get_mut(place.conversation.workspace)
+                            {
+                                workspace.emojis.note_use(&picked.name);
+                            }
+                        }
+                    }
                     return;
                 }
                 _ => {}
@@ -1004,15 +1038,15 @@ impl App {
         search.selected = search.selected.min(search.hits.len().saturating_sub(1));
     }
 
-    /// Offers whom to @-mention while the Draft being written ends a word starting with `@`, keeping the selected
-    /// one selected, and asks Slack whom it knows by that name.
+    /// Offers what to complete the word being written in a Draft with, keeping the selected one selected; and, for an
+    /// @-mention, asks Slack whom it knows by that name.
     fn refresh_suggestions(&mut self, commands: &mut Vec<Command>) {
         let place = self.writing_place().filter(|_| self.mode == Mode::Insert);
         let writing = place.and_then(|place| {
-            let name = self.drafts.get(&place)?.mentioning()?.to_owned();
-            Some((place, name))
+            let completing = self.drafts.get(&place)?.completing()?;
+            Some((place, completing))
         });
-        let Some((place, name)) = writing else {
+        let Some((place, completing)) = writing else {
             self.suggestions = None;
             return;
         };
@@ -1021,18 +1055,29 @@ impl App {
             self.suggestions = None;
             return;
         };
-        workspace.find_people(key, &name, commands);
-        let items = workspace.suggest(&place, &name);
+        let items: Vec<Suggestion> = match completing {
+            Completing::Mention(name) => {
+                workspace.find_people(key, &name, commands);
+                workspace.suggest(&place, &name)
+            }
+            Completing::Emoji(name) => workspace
+                .emojis
+                .complete(&name, SUGGESTIONS)
+                .into_iter()
+                .map(|found| Suggestion {
+                    suggested: Suggested::Emoji,
+                    name: found.name,
+                    detail: found.alias.to_owned(),
+                    positions: found.positions,
+                })
+                .collect(),
+        };
         let was_selected = self
             .suggestions
             .as_ref()
             .and_then(|old| old.items.get(old.selected));
         let selected = was_selected
-            .and_then(|old| {
-                items
-                    .iter()
-                    .position(|item| item.mentioned == old.mentioned)
-            })
+            .and_then(|old| items.iter().position(|item| item.writes_as(old)))
             .unwrap_or(0);
         self.suggestions = (!items.is_empty()).then_some(Suggestions { items, selected });
     }
@@ -1409,9 +1454,14 @@ impl App {
                 self.workspaces
                     .set_phase(key, Phase::Failed(error.to_string()));
             }
-            Update::CustomEmoji(custom) => {
+            Update::Emoji(EmojiList { custom, standard }) => {
                 if let Some(workspace) = self.workspaces.get_mut(key) {
-                    workspace.emojis.set_custom(custom);
+                    workspace.emojis.set(custom, standard);
+                }
+            }
+            Update::EmojiUse(used) => {
+                if let Some(workspace) = self.workspaces.get_mut(key) {
+                    workspace.emojis.set_used(used);
                 }
             }
             Update::History {
@@ -1922,7 +1972,7 @@ impl Workspace {
             .filter_map(|(mentioned, candidate)| {
                 let positions = search::word_start(&candidate, name)?;
                 Some(Suggestion {
-                    mentioned,
+                    suggested: Suggested::Mention(mentioned),
                     name: candidate,
                     detail: String::new(),
                     positions,
@@ -1940,12 +1990,12 @@ impl Workspace {
             } else {
                 person.full_name.clone()
             };
-            let mentioned = Mentioned::Person(person.id.clone());
-            match suggestions.iter_mut().find(|s| s.mentioned == mentioned) {
+            let suggested = Suggested::Mention(Mentioned::Person(person.id.clone()));
+            match suggestions.iter_mut().find(|s| s.suggested == suggested) {
                 // Known already: Slack can still tell them apart by their full name.
                 Some(known) => known.detail = detail,
                 None => suggestions.push(Suggestion {
-                    mentioned,
+                    suggested,
                     name: person.name.clone(),
                     detail,
                     positions: Vec::new(),
@@ -3313,6 +3363,59 @@ mod tests {
     }
 
     #[test]
+    fn a_colon_and_two_more_offer_emoji_and_tab_or_enter_picks_one() {
+        let mut app = reading_random();
+        let mut custom = slackers_model::CustomEmojiSet::default();
+        custom.insert_image("tacocat", "https://e/tacocat.gif");
+        app.update(slack(Update::Emoji(EmojiList {
+            custom,
+            standard: ["tada", "taco", "+1"].map(String::from).into(),
+        })));
+        app.update(slack(Update::EmojiUse(HashMap::from([(
+            "taco".to_owned(),
+            1,
+        )]))));
+        keys(&mut app, "inice :t");
+        assert_eq!(app.suggestions, None, "two characters at least");
+        assert!(keys(&mut app, "a").is_empty(), "Slack isn't asked");
+        assert_eq!(suggested(&app), ["taco", "tada", "tacocat"]);
+
+        app.update(key(KeyCode::Down));
+        assert!(app.update(key(KeyCode::Tab)).is_empty());
+        assert_eq!(app.suggestions, None);
+        assert_eq!(app.drafts[&place("C2", None)].text(), "nice :tada: ");
+        keys(&mut app, ":ta");
+        assert_eq!(
+            suggested(&app),
+            ["tada", "taco", "tacocat"],
+            "picking it counts as using it"
+        );
+        keys(&mut app, "co:");
+        assert_eq!(app.suggestions, None, "written out in full");
+
+        keys(&mut app, " :thumbsu");
+        let offered = &app.suggestions.as_ref().unwrap().items[0];
+        assert_eq!(
+            (offered.name.as_str(), offered.detail.as_str()),
+            ("+1", "thumbsup")
+        );
+        app.update(key(KeyCode::Esc));
+        assert_eq!(app.suggestions, None, "only while writing");
+        keys(&mut app, "i");
+        assert!(app.update(key(KeyCode::Enter)).is_empty(), "Enter picks");
+        let commands = app.update(key(KeyCode::Enter));
+        assert_eq!(
+            commands,
+            [ask(Request::Post {
+                conversation: id("C2"),
+                thread: None,
+                text: vec![Part::Text("nice :tada: :taco: :+1: ".into())],
+                id: 0
+            })]
+        );
+    }
+
+    #[test]
     fn people_are_searched_for_one_name_at_a_time_and_once() {
         let mut app = reading_random();
         assert_eq!(
@@ -3512,7 +3615,10 @@ mod tests {
         let (mut app, _) = ready_app();
         let mut custom = slackers_model::CustomEmojiSet::default();
         custom.insert_image("parrot", "https://e/p.gif");
-        app.update(slack(Update::CustomEmoji(custom)));
+        app.update(slack(Update::Emoji(EmojiList {
+            custom,
+            standard: Vec::new(),
+        })));
 
         // Each picture is drawn to its own fit, which the request says.
         let fit = Fit::Within(slackers_gfx::CellBox { cols: 4, rows: 2 });

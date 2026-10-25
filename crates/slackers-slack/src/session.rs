@@ -1,4 +1,4 @@
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 
 use slackers_model::{
@@ -97,8 +97,11 @@ pub enum Update {
     Ready(Box<Snapshot>),
     /// Couldn't sign in. The last Update: the Session has stopped.
     SignInFailed(Error),
-    /// The Workspace's Custom Emoji. Arrives once, some time after [`Update::Ready`].
-    CustomEmoji(CustomEmojiSet),
+    /// The Workspace's emoji. Arrives once, some time after [`Update::Ready`].
+    Emoji(EmojiList),
+    /// How many times the user used each emoji, by name, as Slack's clients count it. Arrives once, some time after
+    /// [`Update::Ready`].
+    EmojiUse(HashMap<String, u32>),
     /// The answer to [`Request::History`].
     History {
         /// Whose history was asked for.
@@ -210,6 +213,16 @@ pub struct User {
     pub time_zone: Option<String>,
     /// Where their avatar image is, about 48 pixels square; `None` when they have none.
     pub avatar: Option<String>,
+}
+
+/// The emoji a Workspace has.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct EmojiList {
+    /// Those it defines itself.
+    pub custom: CustomEmojiSet,
+    /// Standard emoji, each by the name Slack lists it under, most common first; empty when Slack didn't list them.
+    /// Slack knows some by other names too, such as `thumbsup` for `+1`.
+    pub standard: Vec<String>,
 }
 
 /// Someone [`Request::FindPeople`] found.
@@ -389,9 +402,13 @@ async fn run(
     {
         let (api, notify) = (Arc::clone(&api), Arc::clone(&notify));
         tasks.spawn(async move {
-            match api.custom_emoji().await {
-                Ok(set) => notify(Update::CustomEmoji(set)),
-                Err(error) => tracing::warn!(%error, "couldn't list custom emoji"),
+            match api.emoji().await {
+                Ok(list) => notify(Update::Emoji(list)),
+                Err(error) => tracing::warn!(%error, "couldn't list emoji"),
+            }
+            match api.emoji_use().await {
+                Ok(used) => notify(Update::EmojiUse(used)),
+                Err(error) => tracing::warn!(%error, "couldn't tell which emoji are used most"),
             }
         });
     }
