@@ -24,8 +24,9 @@
 //! On a Message, `+` reacts: it lists the emoji the user uses most, which typing narrows down, for `↑`/`↓` to
 //! choose and `Enter` or `Tab` to react with, or to take back one of the user's reactions. `K` shows its details: who
 //! wrote it, who reacted, the buttons an app put in it, and where it leads (its links, its files and the Message
-//! itself on Slack's web client), for `j`/`k` to choose, `Enter` or `1`-`9` to press or open and `y` to copy. `o`
-//! opens a Message's link or file when it has just one, and shows its details to choose from otherwise.
+//! itself on Slack's web client), for `j`/`k` to choose, `Enter` or `1`-`9` to press or open and `y` to copy; with
+//! more than one to choose from, they stay up for the next. `o` opens a Message's link or file when it has just one,
+//! and shows its details to choose from otherwise.
 
 use std::cmp::Reverse;
 use std::collections::{HashMap, HashSet};
@@ -1403,7 +1404,9 @@ impl App {
             })
         };
         let control = key.modifiers.contains(KeyModifiers::CONTROL);
-        let command = match (key.code, control) {
+        // Taking a choice closes the details only when there's nothing else to choose.
+        let only = choices.len() <= 1;
+        let (command, close) = match (key.code, control) {
             // `refresh_details` keeps the selection on the last choice.
             (KeyCode::Down | KeyCode::Char('j'), false) | (KeyCode::Char('n'), true) => {
                 return self.select_choice(selected + 1);
@@ -1411,23 +1414,27 @@ impl App {
             (KeyCode::Up | KeyCode::Char('k'), false) | (KeyCode::Char('p'), true) => {
                 return self.select_choice(selected.saturating_sub(1));
             }
-            (KeyCode::Enter | KeyCode::Char('o'), false) => take(selected),
+            (KeyCode::Enter | KeyCode::Char('o'), false) => (take(selected), only),
             (KeyCode::Char('y'), false) => match choices.get(selected) {
-                Some(Choice::Open(link)) => Some(Command::Copy(link.url.clone())),
+                Some(Choice::Open(link)) => (Some(Command::Copy(link.url.clone())), only),
                 // A button has nothing to copy.
                 Some(Choice::Press(_)) => return,
-                None => None,
+                None => (None, true),
             },
             (KeyCode::Char(digit @ '1'..='9'), false) => {
                 let index = digit.to_digit(10).map_or(0, |digit| digit as usize - 1);
                 let Some(command) = take(index) else { return };
-                Some(command)
+                (Some(command), only)
             }
-            (KeyCode::Esc | KeyCode::Char('q' | 'K'), false) | (KeyCode::Char('c'), true) => None,
+            (KeyCode::Esc | KeyCode::Char('q' | 'K'), false) | (KeyCode::Char('c'), true) => {
+                (None, true)
+            }
             _ => return,
         };
         commands.extend(command);
-        self.mode = Mode::Normal;
+        if close {
+            self.mode = Mode::Normal;
+        }
     }
 
     fn select_choice(&mut self, index: usize) {
@@ -6028,15 +6035,19 @@ mod tests {
             app.update(key(KeyCode::Enter)),
             [Command::Open("HTTP://example.com".into())]
         );
-        assert_eq!(app.mode, Mode::Normal, "opening closes the details");
+        assert_eq!(
+            details(&app).map(|details| details.selected),
+            Some(1),
+            "the details stay up for another choice"
+        );
 
-        app.update(key(KeyCode::Char('K')));
+        app.update(key(KeyCode::Char('k')));
         assert_eq!(
             app.update(key(KeyCode::Char('y'))),
             [Command::Copy("https://docs.rs/ratatui".into())]
         );
+        assert!(details(&app).is_some(), "copying too");
 
-        app.update(key(KeyCode::Char('K')));
         for _ in 0..5 {
             app.update(key(KeyCode::Char('j')));
         }
@@ -6048,6 +6059,42 @@ mod tests {
                 "https://test.slack.com/files/U2/F1/a.pdf".into()
             )]
         );
+        assert!(details(&app).is_some());
+        app.update(key(KeyCode::Esc));
+        assert_eq!(app.mode, Mode::Normal);
+
+        let one_link = RichText {
+            blocks: vec![slackers_model::Block::Paragraph(vec![link(
+                "https://a.example/",
+                None,
+            )])],
+        };
+        let mut app = reading_random_with(one_link, Vec::new(), Vec::new());
+        app.update(key(KeyCode::Char('K')));
+        app.update(key(KeyCode::Enter));
+        assert!(
+            details(&app).is_some(),
+            "the Message's own link is still there to choose"
+        );
+
+        let mut app = reading_random_with(RichText::plain("no links"), Vec::new(), Vec::new());
+        app.update(key(KeyCode::Char('K')));
+        let only = "https://test.slack.com/archives/C2/p5000000?thread_ts=5.000000&cid=C2";
+        assert_eq!(
+            app.update(key(KeyCode::Enter)),
+            [Command::Open(only.into())]
+        );
+        assert_eq!(
+            app.mode,
+            Mode::Normal,
+            "taking the only choice closes the details"
+        );
+        app.update(key(KeyCode::Char('K')));
+        assert_eq!(
+            app.update(key(KeyCode::Char('y'))),
+            [Command::Copy(only.into())]
+        );
+        assert_eq!(app.mode, Mode::Normal);
     }
 
     #[test]
@@ -6100,14 +6147,15 @@ mod tests {
 
         app.update(key(KeyCode::Char('K')));
         assert_eq!(app.update(key(KeyCode::Enter)), [press(&send)]);
-        assert_eq!(app.mode, Mode::Normal, "pressing closes the details");
+        assert!(
+            details(&app).is_some(),
+            "pressing leaves the others to choose"
+        );
 
-        app.update(key(KeyCode::Char('K')));
         assert!(app.update(key(KeyCode::Char('y'))).is_empty());
         assert!(details(&app).is_some(), "a button has nothing to copy");
         assert_eq!(app.update(key(KeyCode::Char('2'))), [press(&shuffle)]);
 
-        app.update(key(KeyCode::Char('K')));
         app.update(key(KeyCode::Char('j')));
         app.update(key(KeyCode::Char('j')));
         assert_eq!(
