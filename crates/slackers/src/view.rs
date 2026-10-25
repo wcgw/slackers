@@ -1760,14 +1760,16 @@ fn draw_status(frame: &mut Frame<'_>, area: Rect, app: &App, drawn: &mut Drawn) 
         Mode::Normal | Mode::Insert | Mode::Details(_) => {}
     }
     let mut left = Vec::new();
+    // The connections first, so that they stay put as the mode changes.
+    left.extend(connections(app));
     if app.mode == Mode::Insert {
         let insert = theme::INSERT;
         left.extend([
+            Span::raw("  "),
             Span::styled(icons::INSERT, insert),
-            Span::styled("INSERT  ", insert),
+            Span::styled("INSERT", insert),
         ]);
     }
-    left.extend(connections(app));
     left.extend(typing(app, drawn));
     if let Some(notice) = app.notice(app.animation_time()) {
         // Drawn again once it's had its time.
@@ -2164,7 +2166,8 @@ mod tests {
     #[test]
     fn insert_mode_opens_the_composer_under_the_messages_and_says_so() {
         let mut app = reading_general();
-        assert!(!screen(&app).last().unwrap().contains("INSERT"));
+        let normal = screen(&app).last().unwrap().clone();
+        assert!(!normal.contains("INSERT"));
 
         type_text(&mut app, "i");
         type_text(&mut app, "hello");
@@ -2178,7 +2181,16 @@ mod tests {
             message < hello && hello.map(|h| h + 1) == world,
             "{rows:#?}"
         );
-        assert!(rows.last().unwrap().contains("INSERT"), "{rows:#?}");
+        let status = rows.last().unwrap();
+        assert!(status.contains("INSERT"), "{rows:#?}");
+        let connecting = normal.find("connecting");
+        assert!(connecting.is_some(), "{normal:?}");
+        assert_eq!(
+            status.find("connecting"),
+            connecting,
+            "the connections stay put"
+        );
+        assert!(status.find("INSERT") > connecting, "{status:?}");
 
         // Back in Normal mode the draft stays, dimmed.
         press(&mut app, KeyCode::Esc, KeyModifiers::NONE);
