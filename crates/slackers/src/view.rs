@@ -83,7 +83,7 @@ pub(crate) fn draw(frame: &mut Frame<'_>, app: &App) -> Drawn {
         Some(Opened::Activity) => draw_activity(frame, messages, app, &mut drawn),
         None => draw_sign_ins(frame, messages, app),
     }
-    draw_status(frame, status, app);
+    draw_status(frame, status, app, &mut drawn);
     drawn
 }
 
@@ -1705,7 +1705,7 @@ impl<'a> Renderer<'a> {
     }
 }
 
-fn draw_status(frame: &mut Frame<'_>, area: Rect, app: &App) {
+fn draw_status(frame: &mut Frame<'_>, area: Rect, app: &App, drawn: &mut Drawn) {
     // Command, Search and React modes take the line, as in vim.
     let cursor = Span::styled(" ", Style::new().add_modifier(Modifier::REVERSED));
     match &app.mode {
@@ -1759,11 +1759,13 @@ fn draw_status(frame: &mut Frame<'_>, area: Rect, app: &App) {
         ]);
     }
     left.extend(connections(app));
-    if let Some(notice) = &app.notice {
+    if let Some(notice) = app.notice(app.animation_time()) {
+        // Drawn again once it's had its time.
+        drawn.next_change = earliest(drawn.next_change, Some(notice.until));
         left.extend([
             Span::raw("  "),
             Span::styled(icons::ALERT, ALERT),
-            Span::styled(notice.clone(), ALERT),
+            Span::styled(notice.text.clone(), ALERT),
         ]);
     }
     let hints = match (&app.mode, app.focus) {
@@ -3156,6 +3158,21 @@ mod tests {
         );
         app.update(presence(Presence::Away));
         assert_eq!(icon(&app).0, dm);
+    }
+
+    #[test]
+    fn a_notice_shows_on_the_status_line_and_is_drawn_away_once_over() {
+        let mut app = reading_general();
+        type_text(&mut app, ":bogus");
+        press(&mut app, KeyCode::Enter, KeyModifiers::NONE);
+        let (rows, drawn) = render(&app);
+        assert!(
+            rows.last().unwrap().contains("not a command: :bogus"),
+            "{:?}",
+            rows.last()
+        );
+        let until = app.notice(app.animation_time()).unwrap().until;
+        assert_eq!(drawn.next_change, Some(until));
     }
 
     #[test]

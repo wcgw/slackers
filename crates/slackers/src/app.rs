@@ -74,6 +74,9 @@ const HELD_NOTIFICATIONS: usize = 20;
 /// The most pages of history loaded to reach a Message an Activity item opens.
 const JUMP_PAGES: u32 = 10;
 
+/// How long a notice shows on the status line: long enough to read one that came while the user was busy.
+const NOTICE_FOR: Duration = Duration::from_secs(8);
+
 /// How long after running a slash command a Message the user posts elsewhere counts as the command's doing, in
 /// microseconds.
 const COMMAND_POSTS_WITHIN: u64 = 15 * 1_000_000;
@@ -595,7 +598,7 @@ pub(crate) struct App {
     pub(crate) virtual_workspaces: Vec<VirtualWorkspace>,
     pub(crate) sidebar: Sidebar,
     /// The latest thing worth telling the user, usually a problem.
-    pub(crate) notice: Option<String>,
+    notice: Option<Notice>,
     /// Custom Emoji, avatars, Workspace icons and images, fetched as they come on screen.
     pub(crate) pictures: Pictures,
     /// How big the terminal's cells are, so that a picture takes its room before it loads.
@@ -719,6 +722,19 @@ impl App {
         self.epoch.elapsed()
     }
 
+    /// What to tell the user as of `now`, as animation time; `None` once the latest notice has had its time.
+    pub(crate) fn notice(&self, now: Duration) -> Option<&Notice> {
+        self.notice.as_ref().filter(|notice| now < notice.until)
+    }
+
+    /// Tells the user `text` on the status line, for [`NOTICE_FOR`] or until something else is worth telling.
+    fn tell(&mut self, text: impl Into<String>) {
+        self.notice = Some(Notice {
+            text: text.into(),
+            until: self.animation_time() + NOTICE_FOR,
+        });
+    }
+
     /// When the screen next needs redrawing for animation alone, as animation time.
     pub(crate) fn next_change(&self) -> Option<Duration> {
         self.next_change
@@ -765,13 +781,13 @@ impl App {
             Event::PicturesLost => self.pictures.forget_all(),
             Event::Edited { place, outcome } => match outcome {
                 Ok(text) => self.draft(&place).set_text(&text),
-                Err(reason) => self.notice = Some(reason),
+                Err(reason) => self.tell(reason),
             },
             Event::SaveFailed(reason) => {
-                self.notice = Some(format!("couldn't save the virtual workspaces: {reason}"));
+                self.tell(format!("couldn't save the virtual workspaces: {reason}"));
             }
             Event::OpenFailed(reason) => {
-                self.notice = Some(format!("couldn't open the link: {reason}"));
+                self.tell(format!("couldn't open the link: {reason}"));
             }
             Event::Drawn(drawn) => {
                 for (key, at) in drawn.wanted_messages {
@@ -850,7 +866,7 @@ impl App {
         }
         match (key.code, control) {
             (KeyCode::Char('c'), true) => {
-                self.notice = Some("type :q and press Enter to quit".to_owned());
+                self.tell("type :q and press Enter to quit".to_owned());
                 return;
             }
             (KeyCode::Char(':'), false) => {
@@ -863,7 +879,7 @@ impl App {
                         self.sidebar_shown = false;
                         self.focus = self.beside_sidebar();
                     }
-                    Focus::Sidebar => self.notice = Some("open a conversation first".to_owned()),
+                    Focus::Sidebar => self.tell("open a conversation first".to_owned()),
                     Focus::Timeline | Focus::Thread | Focus::Activity => self.focus_sidebar(),
                 }
                 return;
@@ -887,7 +903,7 @@ impl App {
                         self.draft(&place);
                         self.mode = Mode::Insert;
                     }
-                    None => self.notice = Some("open a conversation first".to_owned()),
+                    None => self.tell("open a conversation first".to_owned()),
                 }
                 return;
             }
@@ -961,8 +977,7 @@ impl App {
             },
             Focus::Thread => match key.code {
                 KeyCode::Char('U') => {
-                    self.notice =
-                        Some("only a conversation's messages can be marked unread".to_owned());
+                    self.tell("only a conversation's messages can be marked unread".to_owned());
                 }
                 KeyCode::Char('+') => self.start_reacting(),
                 KeyCode::Char('e') => self.edit_selected(),
@@ -1129,10 +1144,10 @@ impl App {
                         let saved = self.virtual_workspaces.clone();
                         commands.push(Command::SaveVirtualWorkspaces(saved));
                     }
-                    Err(reason) => self.notice = Some(reason),
+                    Err(reason) => self.tell(reason),
                 }
             }
-            _ => self.notice = Some(format!("not a command: :{line}")),
+            _ => self.tell(format!("not a command: :{line}")),
         }
     }
 
@@ -1240,7 +1255,7 @@ impl App {
                         self.open(conversation, commands);
                         self.focus = Focus::Timeline;
                     }
-                    None => self.notice = Some(format!("no conversation matches /{query}")),
+                    None => self.tell(format!("no conversation matches /{query}")),
                 }
             }
             (KeyCode::Char(c), false) => {
@@ -1531,7 +1546,7 @@ impl App {
             return;
         };
         if !message.is_by(&workspace.me) {
-            self.notice = Some("only your own messages can be edited".to_owned());
+            self.tell("only your own messages can be edited".to_owned());
             return;
         }
         let draft = workspace.draft_of(&place, &message.content);
@@ -1568,7 +1583,7 @@ impl App {
     /// Saves the edit at `place`, unless it's blank, and brings back what was set aside for it.
     fn save_edit(&mut self, place: Place, commands: &mut Vec<Command>) {
         let Some(written) = self.drafts.get_mut(&place).and_then(Draft::take) else {
-            self.notice = Some("an edit can't be empty: esc gives it up".to_owned());
+            self.tell("an edit can't be empty: esc gives it up".to_owned());
             return;
         };
         let Some(editing) = self.editing.get(&place) else {
@@ -1769,7 +1784,7 @@ impl App {
             if known.is_some_and(|known| {
                 !known.is_empty() && !known.iter().any(|offered| offered.name == command)
             }) {
-                self.notice = Some(format!(
+                self.tell(format!(
                     "no {command} command here: start with a space to post it as text"
                 ));
                 self.draft(&place).put_back(written);
@@ -1854,8 +1869,7 @@ impl App {
         };
         commands.push(Command::Slack(conversation.workspace, request));
         self.kept_unread = Some(conversation);
-        self.notice =
-            Some("marked unread: it stays so until you open another conversation".to_owned());
+        self.tell("marked unread: it stays so until you open another conversation".to_owned());
     }
 
     /// Moves the open Thread's Read Marker to its newest Reply, if the user follows it and that's on screen: the
@@ -1962,7 +1976,7 @@ impl App {
             id: at.conversation,
         };
         if self.workspaces.conversation(&conversation).is_none() {
-            self.notice = Some("that conversation isn't in your sidebar".to_owned());
+            self.tell("that conversation isn't in your sidebar".to_owned());
             return;
         }
         self.sidebar.select(&conversation);
@@ -2165,7 +2179,7 @@ impl App {
                 match result {
                     Ok(Some(reply)) => {
                         if let Some(workspace) = self.workspaces.get(key) {
-                            self.notice = Some(workspace.gist(&reply));
+                            self.tell(workspace.gist(&reply));
                         }
                     }
                     Ok(None) => {}
@@ -2181,7 +2195,7 @@ impl App {
                             .command()
                             .map(|(command, _)| command)
                             .unwrap_or_default();
-                        self.notice = Some(format!(
+                        self.tell(format!(
                             "couldn't run {command}, back in the draft: {}",
                             describe(&error)
                         ));
@@ -2212,7 +2226,7 @@ impl App {
                     }
                     Err(error) => {
                         let (place, ts, written) = sent;
-                        self.notice = Some(format!(
+                        self.tell(format!(
                             "not edited, back in the composer: {}",
                             describe(&error)
                         ));
@@ -2244,7 +2258,7 @@ impl App {
                     ReactionChange::Added => "react with",
                     ReactionChange::Removed => "take back",
                 };
-                self.notice = Some(format!(
+                self.tell(format!(
                     "couldn't {what} :{}:: {}",
                     emoji.name,
                     describe(&error)
@@ -2256,7 +2270,7 @@ impl App {
                 result: Err(error),
                 ..
             } => {
-                self.notice = Some(format!(
+                self.tell(format!(
                     "couldn't press {}: {}",
                     button.label,
                     describe(&error)
@@ -2329,7 +2343,7 @@ impl App {
                         let timeline = workspace.timelines.entry(conversation).or_default();
                         timeline.add_history(page.messages, page.has_more);
                     }
-                    Err(error) => self.notice = Some(describe(&error)),
+                    Err(error) => self.tell(describe(&error)),
                 }
             }
             Update::Replies {
@@ -2351,7 +2365,7 @@ impl App {
                             .or_insert_with(|| Timeline::thread(parent))
                             .add_history(messages, false);
                     }
-                    Err(error) => self.notice = Some(describe(&error)),
+                    Err(error) => self.tell(describe(&error)),
                 }
             }
             Update::Posted {
@@ -2382,8 +2396,7 @@ impl App {
                         workspace.add(&conversation, message);
                     }
                     Err(error) => {
-                        self.notice =
-                            Some(format!("not sent, back in the draft: {}", describe(&error)));
+                        self.tell(format!("not sent, back in the draft: {}", describe(&error)));
                         self.draft(&outgoing.place).put_back(outgoing.written);
                     }
                 }
@@ -2413,7 +2426,7 @@ impl App {
                     }
                 }
                 Err(error) => {
-                    self.notice = Some(format!(
+                    self.tell(format!(
                         "couldn't list everyone who reacted: {}",
                         describe(&error)
                     ));
@@ -2474,11 +2487,16 @@ impl App {
                     .filter(|channel| self.workspaces.resolve(channel).is_none())
                     .map(move |channel| (&virtual_workspace.name, channel))
             });
+        // Each is logged; the status line has room for one.
+        let mut missed = None;
         for (name, channel) in missing {
             tracing::warn!(virtual_workspace = %name, %channel, "not among the user's channels");
-            self.notice = Some(format!(
+            missed = Some(format!(
                 "{name} lists {channel}, which isn't among your channels"
             ));
+        }
+        if let Some(missed) = missed {
+            self.tell(missed);
         }
 
         self.list_sidebar();
@@ -2681,6 +2699,14 @@ impl App {
             self.notify_held(key, commands);
         }
     }
+}
+
+/// Something worth telling the user, usually a problem, on the status line for a while.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) struct Notice {
+    pub(crate) text: String,
+    /// When it stops showing, as animation time.
+    pub(crate) until: Duration,
 }
 
 /// A slash command just run, which may post for the user elsewhere, as `/dm` does.
@@ -3476,6 +3502,12 @@ mod tests {
     }
 
     /// A request to the first Workspace.
+    /// What the status line tells the user now.
+    fn told(app: &App) -> Option<&str> {
+        app.notice(app.animation_time())
+            .map(|notice| notice.text.as_str())
+    }
+
     fn ask(request: Request) -> Command {
         Command::Slack(W0, request)
     }
@@ -3780,7 +3812,7 @@ mod tests {
         assert_eq!(sidebar(&app)[6..9], [">Gateway API", "general", ">test"]);
 
         assert!(command(&mut app, "vw add K").is_empty());
-        assert_eq!(app.notice.as_deref(), Some("#general is in K already"));
+        assert_eq!(told(&app), Some("#general is in K already"));
     }
 
     #[test]
@@ -3801,7 +3833,7 @@ mod tests {
         );
 
         assert!(command(&mut app, "vw rm K").is_empty());
-        assert_eq!(app.notice.as_deref(), Some("#random isn't in K"));
+        assert_eq!(told(&app), Some("#random isn't in K"));
         keys(&mut app, "\\");
         keys(&mut app, "gjjj");
         app.update(key(KeyCode::Enter));
@@ -3817,13 +3849,10 @@ mod tests {
         app.update(key(KeyCode::Enter));
         assert_eq!(app.open_conversation().cloned(), Some(c("D1")));
         assert!(command(&mut app, "vw add K").is_empty());
-        assert!(app.notice.as_deref().unwrap().starts_with("DMs stay"));
+        assert!(told(&app).unwrap().starts_with("DMs stay"));
 
         assert!(command(&mut app, "vw add").is_empty());
-        assert_eq!(
-            app.notice.as_deref(),
-            Some("usage: :vw add NAME, or :vw rm NAME")
-        );
+        assert_eq!(told(&app), Some("usage: :vw add NAME, or :vw rm NAME"));
     }
 
     #[test]
@@ -4116,7 +4145,7 @@ mod tests {
         let (mut app, _) = ready_app();
         keys(&mut app, "\\");
         assert_eq!((app.sidebar_shown, app.focus), (true, Focus::Sidebar));
-        assert_eq!(app.notice.as_deref(), Some("open a conversation first"));
+        assert_eq!(told(&app), Some("open a conversation first"));
     }
 
     #[test]
@@ -4637,10 +4666,7 @@ mod tests {
         app.update(key(KeyCode::Enter));
         keys(&mut app, "k");
         assert!(app.update(key(KeyCode::Enter)).is_empty());
-        assert_eq!(
-            app.notice.as_deref(),
-            Some("that conversation isn't in your sidebar")
-        );
+        assert_eq!(told(&app), Some("that conversation isn't in your sidebar"));
         assert_eq!(app.opened, Some(Opened::Activity));
     }
 
@@ -5153,7 +5179,7 @@ mod tests {
         }));
         assert!(app.outbox.is_empty());
         assert_eq!(app.drafts[&place("C2", None)].lines(), ["second", "third"]);
-        assert!(app.notice.as_deref().unwrap().starts_with("not sent"));
+        assert!(told(&app).unwrap().starts_with("not sent"));
     }
 
     #[test]
@@ -5180,15 +5206,12 @@ mod tests {
         let (mut app, _) = ready_app();
         assert!(keys(&mut app, "q").is_empty());
         assert!(app.update(control('c')).is_empty());
-        assert_eq!(
-            app.notice.as_deref(),
-            Some("type :q and press Enter to quit")
-        );
+        assert_eq!(told(&app), Some("type :q and press Enter to quit"));
 
         keys(&mut app, ":wq");
         assert_eq!(app.mode, Mode::Command("wq".into()));
         assert!(app.update(key(KeyCode::Enter)).is_empty());
-        assert_eq!(app.notice.as_deref(), Some("not a command: :wq"));
+        assert_eq!(told(&app), Some("not a command: :wq"));
 
         assert_eq!(command(&mut app, "q"), [Command::Quit]);
     }
@@ -5270,7 +5293,7 @@ mod tests {
         keys(&mut app, "/zzz");
         assert!(hit_names(&app).is_empty());
         assert!(app.update(key(KeyCode::Enter)).is_empty());
-        assert_eq!(app.notice.as_deref(), Some("no conversation matches /zzz"));
+        assert_eq!(told(&app), Some("no conversation matches /zzz"));
     }
 
     #[test]
@@ -5278,7 +5301,7 @@ mod tests {
         let (mut app, _) = ready_app();
         keys(&mut app, "i");
         assert_eq!(app.mode, Mode::Normal);
-        assert_eq!(app.notice.as_deref(), Some("open a conversation first"));
+        assert_eq!(told(&app), Some("open a conversation first"));
     }
 
     #[test]
@@ -5544,10 +5567,7 @@ mod tests {
         keys(&mut app, "kk");
         keys(&mut app, "e");
         assert!(!app.is_editing(&place));
-        assert_eq!(
-            app.notice.as_deref(),
-            Some("only your own messages can be edited")
-        );
+        assert_eq!(told(&app), Some("only your own messages can be edited"));
     }
 
     #[test]
@@ -5575,7 +5595,7 @@ mod tests {
         assert!(app.is_editing(&place));
         assert_eq!(app.drafts[&place].text(), "fixed");
         assert_eq!(
-            app.notice.as_deref(),
+            told(&app),
             Some("not edited, back in the composer: slack refused chat.update: edit_window_closed")
         );
         let (_, kept) = app.message(&place, seconds(7)).unwrap();
@@ -5825,8 +5845,51 @@ mod tests {
         assert_eq!(app.focus, Focus::Thread);
         assert!(app.update(key(KeyCode::Char('U'))).is_empty());
         assert_eq!(
-            app.notice.as_deref(),
+            told(&app),
             Some("only a conversation's messages can be marked unread")
+        );
+    }
+
+    #[test]
+    fn a_notice_shows_for_a_while_unless_another_takes_its_place() {
+        let (mut app, _) = ready_app();
+        command(&mut app, "bogus");
+        let now = app.animation_time();
+        let notice = app.notice(now).expect("told").clone();
+        assert_eq!(notice.text, "not a command: :bogus");
+        assert!(notice.until > now + Duration::from_secs(7), "{notice:?}");
+        assert!(
+            app.notice(notice.until - Duration::from_millis(1))
+                .is_some()
+        );
+        assert_eq!(
+            app.notice(notice.until),
+            None,
+            "gone once it's had its time"
+        );
+
+        command(&mut app, "other");
+        let newer = app.notice(app.animation_time()).expect("told").clone();
+        assert_eq!(newer.text, "not a command: :other");
+        assert!(newer.until >= notice.until, "for a while of its own");
+    }
+
+    #[test]
+    fn a_virtual_workspace_listing_a_channel_the_user_isnt_in_says_so() {
+        let listed = |channel: &str| ChannelRef {
+            workspace: "test".into(),
+            channel: channel.into(),
+        };
+        let k = VirtualWorkspace {
+            name: "K".into(),
+            channels: vec![listed("random"), listed("gone"), listed("nowhere")],
+        };
+        let mut app = App::new(vec!["test".into()], vec![k], CELL);
+        app.update(slack(Update::Ready(Box::new(test_snapshot()))));
+        assert_eq!(
+            told(&app),
+            Some("K lists test#nowhere, which isn't among your channels"),
+            "the last of them: there's room for one"
         );
     }
 
@@ -5892,7 +5955,7 @@ mod tests {
             id: 0,
             result: Ok(Some(reply)),
         }));
-        assert_eq!(app.notice.as_deref(), Some("Here's your gif"));
+        assert_eq!(told(&app), Some("Here's your gif"));
     }
 
     #[test]
@@ -5901,7 +5964,7 @@ mod tests {
         keys(&mut app, "i/gif cats");
         assert!(app.update(key(KeyCode::Enter)).is_empty());
         assert_eq!(
-            app.notice.as_deref(),
+            told(&app),
             Some("no /gif command here: start with a space to post it as text")
         );
         assert_eq!(app.drafts[&place("C2", None)].text(), "/gif cats");
@@ -5938,7 +6001,7 @@ mod tests {
             }),
         }));
         assert_eq!(
-            app.notice.as_deref(),
+            told(&app),
             Some(
                 "couldn't run /remind, back in the draft: slack refused chat.command: restricted_action"
             )
@@ -6324,7 +6387,7 @@ mod tests {
             "back as it was"
         );
         assert_eq!(
-            app.notice.as_deref(),
+            told(&app),
             Some("couldn't take back :+1:: slack refused reactions.remove: ratelimited")
         );
     }
@@ -6413,7 +6476,7 @@ mod tests {
             ts: seconds(5),
             result: Err(Error::SignedOut),
         }));
-        assert!(app.notice.is_some(), "a failure is told");
+        assert!(told(&app).is_some(), "a failure is told");
     }
 
     #[test]
@@ -6611,7 +6674,7 @@ mod tests {
             }),
         }));
         assert_eq!(
-            app.notice.as_deref(),
+            told(&app),
             Some("couldn't press Shuffle: slack refused blocks.actions: invalid_service_id")
         );
     }
