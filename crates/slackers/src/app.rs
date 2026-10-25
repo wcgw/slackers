@@ -22,6 +22,9 @@
 //! commands to choose from, as `@` does people. Starting it with a space posts it as text instead. When the command
 //! posts for the user elsewhere, as `/dm @someone hi` does, slackers follows it there.
 //!
+//! On a Message in a Conversation, `U` marks it and everything after it unread, as Slack's "Mark unread" does: the
+//! Conversation stays unread while it's open, rather than being read again.
+//!
 //! On one of the user's Messages, `e` edits it in its pane's composer, as `↑` does in an empty one for their newest
 //! there: `Enter` saves the edit and `Esc` gives it up, bringing back what was being written before.
 //!
@@ -626,6 +629,8 @@ pub(crate) struct App {
     commands_sent: Vec<(u64, Place, Written)>,
     /// The slash command run last, while it may yet post for the user elsewhere: slackers follows it there.
     following: Option<Following>,
+    /// The open Conversation, when the user marked it unread: it stays so until they open another.
+    kept_unread: Option<ConversationRef>,
     /// Edits being written, by where: in that Place's Draft, set aside meanwhile.
     editing: HashMap<Place, Editing>,
     /// Edits saved but not yet confirmed, to put back should Slack refuse them.
@@ -687,6 +692,7 @@ impl App {
             outbox: Vec::new(),
             commands_sent: Vec::new(),
             following: None,
+            kept_unread: None,
             editing: HashMap::new(),
             edits_sent: Vec::new(),
             next_post: 0,
@@ -934,6 +940,7 @@ impl App {
             },
             Focus::Timeline => match key.code {
                 KeyCode::Enter => self.open_selected_thread(commands),
+                KeyCode::Char('U') => self.mark_unread_selected(commands),
                 KeyCode::Char('+') => self.start_reacting(),
                 KeyCode::Char('e') => self.edit_selected(),
                 KeyCode::Char('K') => self.show_details(commands),
@@ -953,6 +960,10 @@ impl App {
                 }
             },
             Focus::Thread => match key.code {
+                KeyCode::Char('U') => {
+                    self.notice =
+                        Some("only a conversation's messages can be marked unread".to_owned());
+                }
                 KeyCode::Char('+') => self.start_reacting(),
                 KeyCode::Char('e') => self.edit_selected(),
                 KeyCode::Char('K') => self.show_details(commands),
@@ -1802,6 +1813,9 @@ impl App {
         let Some(open) = self.opened.as_ref().and_then(Opened::conversation) else {
             return;
         };
+        if self.kept_unread.as_ref() == Some(open) {
+            return;
+        }
         let Some(workspace) = self.workspaces.get_mut(open.workspace) else {
             return;
         };
@@ -1817,6 +1831,31 @@ impl App {
             };
             commands.push(Command::Slack(open.workspace, request));
         }
+    }
+
+    /// Marks the Conversation pane's selected Message unread, and everything after it, keeping the Conversation
+    /// unread while it's open.
+    fn mark_unread_selected(&mut self, commands: &mut Vec<Command>) {
+        let Some((place, ts)) = self.selected_message() else {
+            return;
+        };
+        let conversation = place.conversation;
+        let Some(unread) = self
+            .workspaces
+            .get_mut(conversation.workspace)
+            .and_then(|workspace| workspace.unread.get_mut(&conversation.id))
+        else {
+            return;
+        };
+        unread.mark_unread_from(ts);
+        let request = Request::Mark {
+            conversation: conversation.id.clone(),
+            up_to: unread.read_up_to(),
+        };
+        commands.push(Command::Slack(conversation.workspace, request));
+        self.kept_unread = Some(conversation);
+        self.notice =
+            Some("marked unread: it stays so until you open another conversation".to_owned());
     }
 
     /// Moves the open Thread's Read Marker to its newest Reply, if the user follows it and that's on screen: the
@@ -1990,6 +2029,7 @@ impl App {
     }
 
     fn open(&mut self, conversation: ConversationRef, commands: &mut Vec<Command>) {
+        self.kept_unread = None;
         self.conversation_pane = Pane::default();
         self.conversation_shown = false;
         self.open_thread = None;
@@ -5728,6 +5768,65 @@ mod tests {
         assert_eq!(
             (of(&app, "U9"), of(&app, "U2")),
             (Some(Presence::Away), Some(Presence::Active))
+        );
+    }
+
+    #[test]
+    fn shift_u_marks_messages_unread_and_the_conversation_stays_so_while_open() {
+        let mut app = reading_random();
+        app.focus = Focus::Timeline;
+        let unread = |app: &App| workspace(app, W0).unread[&id("C2")].clone();
+        assert!(!unread(&app).has_unread(), "read once shown");
+        app.update(key(KeyCode::Char('k')));
+        assert_eq!(app.conversation_pane.cursor(), Some(seconds(2)));
+        let marker = Ts::from_micros(seconds(2).as_micros() - 1);
+        assert_eq!(
+            app.update(key(KeyCode::Char('U'))),
+            [ask(Request::Mark {
+                conversation: id("C2"),
+                up_to: marker
+            })]
+        );
+        assert!(unread(&app).has_unread());
+
+        app.update(key(KeyCode::Char('j')));
+        assert!(
+            drawn(&mut app, 10).is_empty(),
+            "the newest on screen doesn't read it"
+        );
+        app.update(slack(Update::Live(LiveEvent::Marked {
+            conversation: id("C2"),
+            up_to: marker,
+        })));
+        assert_eq!(unread(&app).read_up_to(), marker, "Slack's echo");
+
+        app.open(c("C1"), &mut Vec::new());
+        app.open(c("C2"), &mut Vec::new());
+        assert_eq!(
+            drawn(&mut app, 10),
+            [ask(Request::Mark {
+                conversation: id("C2"),
+                up_to: seconds(5)
+            })],
+            "opened again, it's read"
+        );
+    }
+
+    #[test]
+    fn a_threads_replies_cant_be_marked_unread() {
+        let mut app = reading_random();
+        app.focus = Focus::Timeline;
+        app.update(key(KeyCode::Enter));
+        app.update(slack(Update::Replies {
+            conversation: id("C2"),
+            parent: seconds(5),
+            result: Ok(vec![message(5, "U2", RichText::plain("hi")), reply(6, 5)]),
+        }));
+        assert_eq!(app.focus, Focus::Thread);
+        assert!(app.update(key(KeyCode::Char('U'))).is_empty());
+        assert_eq!(
+            app.notice.as_deref(),
+            Some("only a conversation's messages can be marked unread")
         );
     }
 

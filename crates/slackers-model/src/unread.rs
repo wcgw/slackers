@@ -76,6 +76,16 @@ impl Unread {
         }
     }
 
+    /// Moves the Read Marker to just before the Message at `first`, as the user asked: it and everything after it
+    /// are unread, and everything before it read. Mentions already read don't come back unread: Slack doesn't say
+    /// which Messages they're in.
+    pub fn mark_unread_from(&mut self, first: Ts) {
+        self.read_up_to = Ts::from_micros(first.as_micros().saturating_sub(1));
+        self.latest = self.latest.max(first);
+        let read_up_to = self.read_up_to;
+        self.new_mentions.retain(|&m| m > read_up_to);
+    }
+
     /// Moves the Read Marker to `ts`. It never moves back: Slack reports only forward moves, and a stale report
     /// mustn't resurrect read Messages.
     pub fn mark_read(&mut self, ts: Ts) {
@@ -122,6 +132,31 @@ mod tests {
         unread.record(ts(9), true);
         assert!(!unread.has_unread());
         assert_eq!(unread.mentions(), 0);
+    }
+
+    #[test]
+    fn marking_unread_from_a_message_moves_the_marker_either_way() {
+        let mut unread = Unread::counted(ts(30), ts(30), false, 0);
+        unread.record(ts(31), true);
+        unread.mark_read(ts(31));
+
+        unread.mark_unread_from(ts(20));
+        assert!(unread.has_unread());
+        assert_eq!(unread.read_up_to(), Ts::from_micros(ts(20).as_micros() - 1));
+        assert_eq!(unread.mentions(), 0, "read mentions stay read");
+        unread.mark_read(ts(25));
+        assert_eq!(unread.read_up_to(), ts(25));
+
+        unread.record(ts(40), true);
+        unread.mark_unread_from(ts(41));
+        assert_eq!(unread.read_up_to(), Ts::from_micros(ts(41).as_micros() - 1));
+        assert_eq!(unread.mentions(), 0, "forward, it reads what it passes");
+        assert_eq!(
+            unread.latest(),
+            ts(41),
+            "it's unread, so there's something to read"
+        );
+        assert!(unread.has_unread());
     }
 
     #[test]

@@ -1787,7 +1787,7 @@ fn draw_status(frame: &mut Frame<'_>, area: Rect, app: &App) {
             "j/k select · ⏎ open · za fold · / search · \\ hide · i write · :q quit"
         }
         (_, Focus::Timeline) => {
-            "j/k message · ⏎ thread · + react · e edit · K details · o open · ^e/^y line · ^d/^u page · g/G · i write · \\ sidebar · :q quit"
+            "j/k message · ⏎ thread · + react · e edit · K details · o open · U unread · ^e/^y line · ^d/^u page · g/G · i write · \\ sidebar · :q quit"
         }
         (_, Focus::Activity) => "j/k choose · ⏎ open · g/G newest/oldest · \\ sidebar · :q quit",
         (_, Focus::Thread) => {
