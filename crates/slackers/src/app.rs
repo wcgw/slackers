@@ -15,7 +15,8 @@
 //! While the terminal window doesn't have focus, a DM, a Message that mentions the user, or a Reply in one of their
 //! Followed Threads shows a desktop notification.
 //!
-//! Whoever is typing in a pane's Conversation or Thread shows on its title row.
+//! Whoever is typing in a pane's Conversation or Thread shows on its title row, and a DM's icon in the sidebar
+//! says whether the other person is using Slack right now.
 //!
 //! A Draft starting with `/` and a word runs that slash command rather than posting: `/` brings up the Workspace's
 //! commands to choose from, as `@` does people. Starting it with a space posts it as text instead. When the command
@@ -39,8 +40,8 @@ use crossterm::event::{Event as TerminalEvent, KeyCode, KeyEvent, KeyEventKind, 
 use slackers_gfx::{CellSize, Fit, Picture};
 use slackers_model::{
     Author, Block, BotId, Broadcast, Button, Conversation, ConversationId, ConversationKind, Emoji,
-    Happened, Inline, Message, MessageRef, ReactionChange, RichText, Style, Timeline, Ts, Unread,
-    UserId,
+    Happened, Inline, Message, MessageRef, Presence, ReactionChange, RichText, Style, Timeline, Ts,
+    Unread, UserId,
 };
 use slackers_slack::{
     Bot, Connection, EmojiList, Error, LiveEvent, Permalinks, Person, Request, SlashCommand,
@@ -538,6 +539,10 @@ pub(crate) struct Workspace {
     /// Its bots that posted without saying their names, as far as they've been looked up.
     bots: HashMap<BotId, Bot>,
     requested_bots: HashSet<BotId>,
+    /// Whether people are using Slack, as far as Slack said.
+    presence: HashMap<UserId, Presence>,
+    /// Whose presence it was last asked to follow, in sidebar order.
+    presence_followed: Vec<UserId>,
     pub(crate) emojis: Emojis,
     permalinks: Permalinks,
     /// Channels by name, then DMs, most recently active first.
@@ -2409,15 +2414,9 @@ impl App {
 
     fn ready(&mut self, key: WorkspaceKey, snapshot: Snapshot, commands: &mut Vec<Command>) {
         let mut workspace = Workspace::new(snapshot);
-        let partners: Vec<UserId> = workspace
-            .conversations
-            .iter()
-            .filter_map(|c| match &c.kind {
-                ConversationKind::Dm { with } => Some(with.clone()),
-                ConversationKind::Channel { .. } | ConversationKind::GroupDm => None,
-            })
-            .collect();
+        let partners: Vec<UserId> = workspace.dm_partners().cloned().collect();
         workspace.want_users(key, partners, commands);
+        workspace.follow_presence(key, commands);
         self.workspaces
             .set_phase(key, Phase::Ready(Box::new(workspace)));
 
@@ -2482,6 +2481,7 @@ impl App {
                 joined = workspace.join(conversation, unread);
                 if joined {
                     workspace.want_users(key, partner, commands);
+                    workspace.follow_presence(key, commands);
                 }
                 // Someone added the user to a Channel, or wrote to them.
                 touches_activity = joined;
@@ -2567,6 +2567,11 @@ impl App {
                     && author.as_ref() == Some(&workspace.me);
                 for timeline in workspace.timelines_of(&conversation) {
                     timeline.react(ts, &emoji, &user, change);
+                }
+            }
+            LiveEvent::Presence { people, presence } => {
+                for person in people {
+                    workspace.presence.insert(person, presence);
                 }
             }
             LiveEvent::Typing {
@@ -2706,6 +2711,8 @@ impl Workspace {
             requested_users: HashSet::new(),
             bots: HashMap::new(),
             requested_bots: HashSet::new(),
+            presence: HashMap::new(),
+            presence_followed: Vec::new(),
             emojis: Emojis::default(),
             permalinks: snapshot.permalinks,
             conversations: conversations.into_iter().map(|(c, _)| c).collect(),
@@ -3177,6 +3184,30 @@ impl Workspace {
                 .all(|person| self.users.contains_key(person))
     }
 
+    /// The people the user has DMs with, in sidebar order.
+    fn dm_partners(&self) -> impl Iterator<Item = &UserId> {
+        self.conversations.iter().filter_map(|c| match &c.kind {
+            ConversationKind::Dm { with } => Some(with),
+            ConversationKind::Channel { .. } | ConversationKind::GroupDm => None,
+        })
+    }
+
+    /// Asks this Workspace, at `key`, to follow whether the people the user has DMs with are using Slack, unless
+    /// it follows just them already.
+    fn follow_presence(&mut self, key: WorkspaceKey, commands: &mut Vec<Command>) {
+        let partners: Vec<UserId> = self.dm_partners().cloned().collect();
+        if partners != self.presence_followed {
+            self.presence_followed.clone_from(&partners);
+            commands.push(Command::Slack(key, Request::FollowPresence(partners)));
+        }
+    }
+
+    /// Whether `person` is using Slack right now; `None` when Slack hasn't said, as it only does of the people the
+    /// user has DMs with.
+    pub(crate) fn presence(&self, person: &UserId) -> Option<Presence> {
+        self.presence.get(person).copied()
+    }
+
     /// Asks this Workspace, at `key`, for the names of `people` not known or asked for yet.
     fn want_users(
         &mut self,
@@ -3588,6 +3619,7 @@ mod tests {
             commands,
             [
                 ask(Request::User(UserId::new("U9"))),
+                ask(Request::FollowPresence(vec![UserId::new("U9")])),
                 ask(Request::Activity { cursor: None })
             ]
         );
@@ -4198,7 +4230,16 @@ mod tests {
             with: UserId::new("U8"),
         };
         let commands = app.update(joined(conversation("D7", dm.clone(), "")));
-        assert_eq!(commands, [ask(Request::User(UserId::new("U8")))]);
+        assert_eq!(
+            commands,
+            [
+                ask(Request::User(UserId::new("U8"))),
+                ask(Request::FollowPresence(vec![
+                    UserId::new("U8"),
+                    UserId::new("U9")
+                ])),
+            ]
+        );
         assert_eq!(
             sidebar(&app),
             [
@@ -4206,7 +4247,13 @@ mod tests {
             ]
         );
 
-        app.update(joined(channel("C3", "alpha")));
+        let commands = app.update(joined(channel("C3", "alpha")));
+        assert!(
+            !commands
+                .iter()
+                .any(|command| matches!(command, Command::Slack(_, Request::FollowPresence(_)))),
+            "the same people: {commands:?}"
+        );
         app.update(joined(channel("C4", "later")));
         assert_eq!(
             sidebar(&app),
@@ -5659,6 +5706,29 @@ mod tests {
         assert_eq!(who(&app, None), [UserId::new("U3")]);
         app.update(posted_at("C2", seconds(9), "U3"));
         assert!(who(&app, None).is_empty());
+    }
+
+    #[test]
+    fn presence_is_kept_as_slack_says() {
+        let (mut app, _) = ready_app();
+        let presence = |people: &[&str], presence| {
+            slack(Update::Live(LiveEvent::Presence {
+                people: people.iter().map(|&id| UserId::new(id)).collect(),
+                presence,
+            }))
+        };
+        let of = |app: &App, id: &str| workspace(app, W0).presence(&UserId::new(id));
+        assert_eq!(of(&app, "U9"), None);
+        app.update(presence(&["U9", "U2"], Presence::Active));
+        assert_eq!(
+            (of(&app, "U9"), of(&app, "U2")),
+            (Some(Presence::Active), Some(Presence::Active))
+        );
+        app.update(presence(&["U9"], Presence::Away));
+        assert_eq!(
+            (of(&app, "U9"), of(&app, "U2")),
+            (Some(Presence::Away), Some(Presence::Active))
+        );
     }
 
     #[test]

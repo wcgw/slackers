@@ -78,6 +78,11 @@ _Avoid_: new, unseen
 A Message that @-mentions the user. Mentions are counted separately, on top of what's Unread.
 _Avoid_: ping, highlight
 
+**Presence**:
+Whether someone is using Slack right now (active) or not (away), as the dot by their name shows in Slack. slackers
+follows it for the people the user has DMs with.
+_Avoid_: status (that's the emoji and text people set), online
+
 **Activity**:
 What happens in the user's Workspaces that concerns them, as Slack's Activity lists it: Mentions, Reactions to their
 Messages, Replies in their Followed Threads, DM Messages, and being added to Channels. Each item is about one Message.

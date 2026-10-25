@@ -3,9 +3,9 @@ use std::sync::Arc;
 
 use slackers_model::{
     ActivityItem, BotId, Broadcast, Button, Conversation, ConversationId, CustomEmojiSet, Emoji,
-    Message, Reaction, ReactionChange, RichText, Ts, Unread, UserId, WorkspaceId,
+    Message, Presence, Reaction, ReactionChange, RichText, Ts, Unread, UserId, WorkspaceId,
 };
-use tokio::sync::mpsc;
+use tokio::sync::{mpsc, watch};
 use tokio::task::JoinSet;
 
 use crate::api::Api;
@@ -35,6 +35,9 @@ pub enum Request {
     User(UserId),
     /// A bot's name; answered by [`Update::Bot`], or not at all if Slack doesn't know it.
     Bot(BotId),
+    /// Follows whether these people are using Slack, instead of whoever was followed before; answered by
+    /// [`LiveEvent::Presence`], soon for each of them and again whenever that changes.
+    FollowPresence(Vec<UserId>),
     /// A file, image, avatar or Custom Emoji; answered by [`Update::Downloaded`].
     Download {
         /// Where it is. Requests to Slack's own hosts carry the session's credentials, so private files work;
@@ -468,6 +471,13 @@ pub enum LiveEvent {
         /// Who.
         user: UserId,
     },
+    /// Whether some of the people followed with [`Request::FollowPresence`] are using Slack.
+    Presence {
+        /// Who.
+        people: Vec<UserId>,
+        /// Whether they are.
+        presence: Presence,
+    },
     /// The user's Read Marker moved, in this or another client.
     Marked {
         /// Where.
@@ -592,10 +602,12 @@ async fn run(
         });
     }
     let (heard, hearing) = mpsc::unbounded_channel();
+    let (presence, followed) = watch::channel(Vec::new());
     tasks.spawn(socket::follow(
         credentials,
         workspace.clone(),
         heard,
+        followed,
         Arc::clone(&notify),
     ));
     let look_up = {
@@ -608,6 +620,11 @@ async fn run(
     tasks.spawn(relay(known, look_up, hearing, Arc::clone(&notify)));
 
     while let Some(request) = requests.recv().await {
+        if let Request::FollowPresence(people) = request {
+            // The socket subscribes to them, and again whenever it reconnects.
+            presence.send_replace(people);
+            continue;
+        }
         let (api, notify) = (Arc::clone(&api), Arc::clone(&notify));
         let workspace = workspace.clone();
         tasks.spawn(async move { serve(&api, request, &workspace, &notify).await });
@@ -686,6 +703,7 @@ async fn serve(api: &Api, request: Request, workspace: &WorkspaceId, notify: &No
             Ok(user) => notify(Update::User(user)),
             Err(error) => tracing::warn!(%error, user = %id, "couldn't look up a user"),
         },
+        Request::FollowPresence(_) => unreachable!("run hands it to the socket"),
         Request::Bot(id) => match api.bot(&id).await {
             Ok(bot) => notify(Update::Bot(bot)),
             Err(error) => tracing::warn!(%error, bot = %id, "couldn't look up a bot"),

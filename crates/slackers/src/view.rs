@@ -13,7 +13,7 @@ use ratatui::widgets::{Block, Borders, Clear, Paragraph, Wrap};
 use slackers_gfx::{CellBox, Fit};
 use slackers_model::{
     Author, Block as TextBlock, Broadcast, Button, Conversation, ConversationId, ConversationKind,
-    Emoji, File, Happened, Image, Inline, MentionOf, Message, Reaction, RichText,
+    Emoji, File, Happened, Image, Inline, MentionOf, Message, Presence, Reaction, RichText,
     Style as TextStyle, Timeline, Ts, Unread, UserId,
 };
 use slackers_slack::Connection;
@@ -552,8 +552,23 @@ fn conversation_row(
     } else {
         (DIM, READ)
     };
-    let lead = vec![marker, Span::styled(icon, icon_style)];
-    entry(lead, name, name_style, matched, badge.span(), width)
+    let active = match &found.kind {
+        ConversationKind::Dm { with } => workspace.presence(with) == Some(Presence::Active),
+        ConversationKind::Channel { .. } | ConversationKind::GroupDm => false,
+    };
+    let icon = if active {
+        Span::styled(icons::DM_ACTIVE, theme::ACTIVE)
+    } else {
+        Span::styled(icon, icon_style)
+    };
+    entry(
+        vec![marker, icon],
+        name,
+        name_style,
+        matched,
+        badge.span(),
+        width,
+    )
 }
 
 /// A Followed Thread's row: its Workspace's icon; a Thread icon; its Conversation's name and the gist of its parent
@@ -992,6 +1007,11 @@ fn draw_details(
         let theirs = user.time_zone.as_deref();
         if let Some(time) = theirs.and_then(|theirs| their_time(theirs, zone, Timestamp::now())) {
             header.push(Span::styled(format!(" · {time} for them"), DIM));
+        }
+        match workspace.presence(id) {
+            Some(Presence::Active) => header.push(Span::styled(" · active", theme::ACTIVE)),
+            Some(Presence::Away) => header.push(Span::styled(" · away", DIM)),
+            None => {}
         }
     }
     let mut posted = zoned(message.ts, zone)
@@ -3090,6 +3110,55 @@ mod tests {
     }
 
     #[test]
+    fn a_dms_icon_says_whether_the_other_person_is_using_slack() {
+        let mut app = App::new(vec!["test".into()], Vec::new(), CELL);
+        let dm = Conversation {
+            id: ConversationId::new("D1"),
+            kind: ConversationKind::Dm {
+                with: UserId::new("U2"),
+            },
+            name: String::new(),
+        };
+        let conversations = vec![channel("C1", "general"), (dm, Unread::default())];
+        app.update(Event::Slack(w(0), ready("Test", None, conversations)));
+        let ana = slackers_slack::User {
+            id: UserId::new("U2"),
+            name: "Ana".into(),
+            full_name: String::new(),
+            title: String::new(),
+            time_zone: None,
+            avatar: None,
+        };
+        app.update(Event::Slack(w(0), Update::User(ana)));
+        let presence = |presence| {
+            let live = slackers_slack::LiveEvent::Presence {
+                people: vec![UserId::new("U2")],
+                presence,
+            };
+            Event::Slack(w(0), Update::Live(live))
+        };
+        let icon = |app: &App| {
+            let (rows, _, buffer) = render_sized(app, WIDTH);
+            let y = rows.iter().position(|row| row.contains("Ana")).unwrap();
+            let cell = &buffer[(2, u16::try_from(y).unwrap())];
+            (cell.symbol().to_owned(), cell.fg)
+        };
+        let dm = icons::DM.trim_end().to_owned();
+        assert_eq!(icon(&app).0, dm, "not known yet");
+
+        app.update(presence(Presence::Active));
+        assert_eq!(
+            icon(&app),
+            (
+                icons::DM_ACTIVE.trim_end().to_owned(),
+                theme::ACTIVE.fg.unwrap()
+            )
+        );
+        app.update(presence(Presence::Away));
+        assert_eq!(icon(&app).0, dm);
+    }
+
+    #[test]
     fn whoever_is_typing_shows_right_of_the_panes_title_while_there_is_room() {
         let mut app = reading_general();
         for (id, name) in [("U2", "Ana"), ("U3", "Bob")] {
@@ -3237,6 +3306,12 @@ mod tests {
         };
         app.update(Event::Slack(w(0), Update::Live(edited)));
 
+        let away = slackers_slack::LiveEvent::Presence {
+            people: vec![UserId::new("U2")],
+            presence: Presence::Away,
+        };
+        app.update(Event::Slack(w(0), Update::Live(away)));
+
         type_text(&mut app, "K");
         let (rows, _, buffer) = render_sized(&app, WIDTH);
         let row_of = |text: &str| {
@@ -3244,7 +3319,7 @@ mod tests {
                 .position(|row| row.contains(text))
                 .unwrap_or_else(|| panic!("no {text:?} in {rows:#?}"))
         };
-        let author = row_of("Ana · Ana Lima · Engineer");
+        let author = row_of("Ana · Ana Lima · Engineer · away");
         assert!(rows[author + 1].contains("· edited"), "{rows:#?}");
         let reactors = row_of("2  Bob, you");
         let docs = row_of("1 ");
@@ -3264,6 +3339,17 @@ mod tests {
             "the first link is selected"
         );
         assert!(rows.last().unwrap().contains("esc close"), "{rows:#?}");
+
+        let active = slackers_slack::LiveEvent::Presence {
+            people: vec![UserId::new("U2")],
+            presence: Presence::Active,
+        };
+        app.update(Event::Slack(w(0), Update::Live(active)));
+        assert!(
+            screen(&app)
+                .iter()
+                .any(|row| row.contains("Ana · Ana Lima · Engineer · active"))
+        );
 
         type_text(&mut app, "q");
         assert!(

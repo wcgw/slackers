@@ -9,6 +9,8 @@ pub(crate) const CHANNEL: &str = "\u{f4df} ";
 pub(crate) const PRIVATE_CHANNEL: &str = "\u{f456} ";
 /// `oct-person`: a DM.
 pub(crate) const DM: &str = "\u{f415} ";
+/// `oct-person_fill`: a DM with someone using Slack right now.
+pub(crate) const DM_ACTIVE: &str = "\u{f4ff} ";
 /// `oct-people`: a group DM.
 pub(crate) const GROUP_DM: &str = "\u{f4fd} ";
 /// `oct-bell`: Activity.

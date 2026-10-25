@@ -4,15 +4,15 @@
 use std::time::Duration;
 
 use futures_util::{SinkExt as _, StreamExt as _};
-use slackers_model::WorkspaceId;
-use tokio::sync::mpsc;
+use slackers_model::{UserId, WorkspaceId};
+use tokio::sync::{mpsc, watch};
 use tokio_tungstenite::tungstenite::client::IntoClientRequest as _;
 use tokio_tungstenite::tungstenite::http::HeaderValue;
 use tokio_tungstenite::tungstenite::{self, Message};
 
 use crate::Credentials;
 use crate::session::{Connection, Heard, Notify, Update};
-use crate::wire::{SocketMessage, socket_message};
+use crate::wire::{SocketMessage, presence_sub, socket_message};
 
 /// How often to ping Slack, so that it, and anything in between, keeps the connection open.
 const PING_EVERY: Duration = Duration::from_secs(30);
@@ -20,12 +20,14 @@ const PING_EVERY: Duration = Duration::from_secs(30);
 /// The longest wait between reconnection attempts.
 const MAX_BACKOFF: Duration = Duration::from_secs(60);
 
-/// Follows the Workspace's live events forever, reconnecting with backoff whenever the connection drops. What it
-/// hears goes to `heard`; how the connection stands, to `notify`. Runs until its task is aborted.
+/// Follows the Workspace's live events forever, reconnecting with backoff whenever the connection drops, and the
+/// presence of the people `followed` holds at the time. What it hears goes to `heard`; how the connection stands, to
+/// `notify`. Runs until its task is aborted.
 pub(crate) async fn follow(
     credentials: Credentials,
     gateway: WorkspaceId,
     heard: mpsc::UnboundedSender<Heard>,
+    mut followed: watch::Receiver<Vec<UserId>>,
     notify: Notify,
 ) {
     let Ok(cookies) = HeaderValue::from_str(credentials.cookies()) else {
@@ -47,6 +49,7 @@ pub(crate) async fn follow(
             &url,
             &cookies,
             &heard,
+            &mut followed,
             &notify,
             &mut reconnect_url,
             &mut attempt,
@@ -64,12 +67,14 @@ pub(crate) async fn follow(
     }
 }
 
-/// Connects to `url` and forwards events until the connection ends. Saves where to reconnect in `reconnect_url`,
-/// and resets `attempt` once Slack says hello.
+/// Connects to `url` and forwards events until the connection ends, subscribing to the presence of the people
+/// `followed` holds once Slack says hello, and again whenever they change. Saves where to reconnect in
+/// `reconnect_url`, and resets `attempt` once Slack says hello.
 async fn connect_and_read(
     url: &str,
     cookies: &HeaderValue,
     heard: &mpsc::UnboundedSender<Heard>,
+    followed: &mut watch::Receiver<Vec<UserId>>,
     notify: &Notify,
     reconnect_url: &mut Option<String>,
     attempt: &mut u32,
@@ -81,6 +86,10 @@ async fn connect_and_read(
     let mut ping = tokio::time::interval(PING_EVERY);
     ping.tick().await; // The first tick is immediate.
     let mut ping_id: u64 = 0;
+    // Slack takes subscriptions once it has said hello.
+    let mut greeted = false;
+    // Whether the Session may still change who's followed; it can't once it's stopping.
+    let mut following = true;
     loop {
         tokio::select! {
             frame = socket.next() => match frame {
@@ -89,7 +98,12 @@ async fn connect_and_read(
                 Some(Ok(Message::Text(text))) => match socket_message(&text) {
                     SocketMessage::Hello => {
                         *attempt = 0;
+                        greeted = true;
                         notify(Update::Connection(Connection::Live));
+                        let people = followed.borrow_and_update().clone();
+                        if !people.is_empty() {
+                            socket.send(Message::text(presence_sub(&people))).await?;
+                        }
                     }
                     SocketMessage::ReconnectUrl(url) => *reconnect_url = Some(url),
                     // Sending fails only once the Session is stopping.
@@ -102,6 +116,13 @@ async fn connect_and_read(
                     SocketMessage::Ignored => {}
                 },
                 Some(Ok(_)) => {}
+            },
+            changed = followed.changed(), if greeted && following => match changed {
+                Ok(()) => {
+                    let people = followed.borrow_and_update().clone();
+                    socket.send(Message::text(presence_sub(&people))).await?;
+                }
+                Err(_) => following = false,
             },
             _ = ping.tick() => {
                 ping_id += 1;

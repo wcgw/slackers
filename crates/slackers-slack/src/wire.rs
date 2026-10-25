@@ -7,8 +7,8 @@ use serde_json::{Value, json};
 use slackers_model::{
     ActivityItem, Author, Block, BotId, Broadcast, Button, Conversation, ConversationId,
     ConversationKind, CustomEmojiSet, Emoji, File, Happened, Image, Inline, MentionOf, Message,
-    MessageRef, Press, Reaction, ReactionChange, RichText, Style, ThreadSummary, Ts, Unread,
-    UserId, WorkspaceId,
+    MessageRef, Presence, Press, Reaction, ReactionChange, RichText, Style, ThreadSummary, Ts,
+    Unread, UserId, WorkspaceId,
 };
 
 use crate::mrkdwn;
@@ -1374,6 +1374,12 @@ pub(crate) enum SocketMessage {
 }
 
 /// Interprets one frame from the live socket.
+/// The socket frame that subscribes to `people`'s presence, instead of whoever's before.
+pub(crate) fn presence_sub(people: &[UserId]) -> String {
+    let ids: Vec<&str> = people.iter().map(UserId::as_str).collect();
+    json!({"type": "presence_sub", "ids": ids}).to_string()
+}
+
 pub(crate) fn socket_message(frame: &str) -> SocketMessage {
     let Ok(event) = serde_json::from_str::<Value>(frame) else {
         return SocketMessage::Ignored;
@@ -1408,6 +1414,30 @@ pub(crate) fn socket_message(frame: &str) -> SocketMessage {
                 }
             }
         },
+        "presence_change" => {
+            // Batched, as the socket asks for, or one person's.
+            let people: Vec<UserId> = match event["users"].as_array() {
+                Some(users) => users
+                    .iter()
+                    .filter_map(Value::as_str)
+                    .map(UserId::new)
+                    .collect(),
+                None => event["user"]
+                    .as_str()
+                    .map(UserId::new)
+                    .into_iter()
+                    .collect(),
+            };
+            let presence = match text("presence") {
+                "active" => Presence::Active,
+                "away" => Presence::Away,
+                _ => return SocketMessage::Ignored,
+            };
+            if people.is_empty() {
+                return SocketMessage::Ignored;
+            }
+            LiveEvent::Presence { people, presence }
+        }
         "user_typing" if !text("user").is_empty() => LiveEvent::Typing {
             conversation: conversation(),
             thread: event["thread_ts"].as_str().map(ts),
@@ -1723,6 +1753,35 @@ mod tests {
         )
         .unwrap();
         assert_eq!(broadcast.reply_to, None);
+    }
+
+    #[test]
+    fn presence_is_followed_by_subscribing_and_heard_batched_or_not() {
+        let people = [UserId::new("U1"), UserId::new("U2")];
+        assert_eq!(
+            serde_json::from_str::<Value>(&presence_sub(&people)).unwrap(),
+            json!({"type": "presence_sub", "ids": ["U1", "U2"]})
+        );
+        assert_eq!(
+            socket_message(r#"{"type":"presence_change","presence":"active","users":["U1","U2"]}"#),
+            SocketMessage::Live(LiveEvent::Presence {
+                people: people.to_vec(),
+                presence: Presence::Active,
+            })
+        );
+        assert_eq!(
+            socket_message(r#"{"type":"presence_change","presence":"away","user":"U1"}"#),
+            SocketMessage::Live(LiveEvent::Presence {
+                people: vec![UserId::new("U1")],
+                presence: Presence::Away,
+            })
+        );
+        for unknown in [
+            r#"{"type":"presence_change","presence":"busy","users":["U1"]}"#,
+            r#"{"type":"presence_change","presence":"active","users":[]}"#,
+        ] {
+            assert_eq!(socket_message(unknown), SocketMessage::Ignored, "{unknown}");
+        }
     }
 
     #[test]
