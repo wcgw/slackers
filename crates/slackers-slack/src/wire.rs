@@ -799,6 +799,35 @@ pub(crate) fn reaction_name(emoji: &Emoji) -> String {
     }
 }
 
+/// `chat.update`'s reply.
+#[derive(Deserialize)]
+pub(crate) struct Updated {
+    /// The new text, as `mrkdwn`.
+    #[serde(default)]
+    text: String,
+    /// The Message, as far as Slack says.
+    #[serde(default)]
+    message: Option<UpdatedMessage>,
+}
+
+#[derive(Deserialize)]
+struct UpdatedMessage {
+    #[serde(default)]
+    blocks: Vec<Value>,
+    #[serde(default)]
+    text: String,
+}
+
+impl Updated {
+    /// The Message's new content, as Slack stored it.
+    pub(crate) fn into_content(self) -> RichText {
+        match self.message {
+            Some(message) => content(message.blocks, &message.text, Vec::new()),
+            None => content(Vec::new(), &self.text, Vec::new()),
+        }
+    }
+}
+
 /// `chat.postMessage`'s reply.
 #[derive(Deserialize)]
 pub(crate) struct Posted {
@@ -1872,6 +1901,20 @@ mod tests {
         );
         assert_eq!(page.items[0].at, seconds(9));
         assert_eq!(page.next, Some(ActivityCursor("older".into())));
+    }
+
+    #[test]
+    fn an_edit_reads_back_as_slack_stored_it() {
+        let rich: Updated = serde_json::from_value(json!({
+            "text": "fixed *now*",
+            "message": {"text": "fixed *now*", "blocks": [{"type": "rich_text", "elements": [
+                {"type": "rich_text_section", "elements": [{"type": "text", "text": "fixed, from blocks"}]}
+            ]}]}
+        }))
+        .unwrap();
+        assert_eq!(rich.into_content(), RichText::plain("fixed, from blocks"));
+        let plain: Updated = serde_json::from_value(json!({"text": "fixed"})).unwrap();
+        assert_eq!(plain.into_content(), RichText::plain("fixed"));
     }
 
     #[test]

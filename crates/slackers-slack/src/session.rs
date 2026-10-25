@@ -3,7 +3,7 @@ use std::sync::Arc;
 
 use slackers_model::{
     ActivityItem, Broadcast, Conversation, ConversationId, CustomEmojiSet, Emoji, Message,
-    Reaction, ReactionChange, Ts, Unread, UserId, WorkspaceId,
+    Reaction, ReactionChange, RichText, Ts, Unread, UserId, WorkspaceId,
 };
 use tokio::sync::mpsc;
 use tokio::task::JoinSet;
@@ -74,6 +74,15 @@ pub enum Request {
         conversation: ConversationId,
         /// Which Message.
         ts: Ts,
+    },
+    /// Replaces the text of one of the user's Messages; answered by [`Update::Edited`].
+    Edit {
+        /// Where.
+        conversation: ConversationId,
+        /// Which.
+        ts: Ts,
+        /// Its new text, in order.
+        text: Vec<Part>,
     },
     /// A page of the user's Activity, newest first; answered by [`Update::Activity`].
     Activity {
@@ -158,6 +167,15 @@ pub enum Update {
         query: String,
         /// Who, best first, or why no one.
         result: Result<Vec<Person>, Error>,
+    },
+    /// The answer to [`Request::Edit`].
+    Edited {
+        /// Where.
+        conversation: ConversationId,
+        /// Which.
+        ts: Ts,
+        /// The Message's new content, as Slack stored it, or why it wasn't edited.
+        result: Result<RichText, Error>,
     },
     /// The answer to [`Request::Activity`].
     Activity {
@@ -311,6 +329,17 @@ pub enum Part {
     User(UserId),
     /// An `@here`, `@channel` or `@everyone`.
     Broadcast(Broadcast),
+    /// An @-mention of a user group, by its id.
+    UserGroup(String),
+    /// A link to a Channel.
+    Channel(ConversationId),
+    /// A link that shows as `label`.
+    Link {
+        /// Where it goes.
+        url: String,
+        /// What shows instead of `url`.
+        label: String,
+    },
 }
 
 /// Something that just happened in a Workspace.
@@ -588,6 +617,18 @@ async fn serve(api: &Api, request: Request, workspace: &WorkspaceId, notify: &No
             notify(Update::Posted {
                 id,
                 conversation,
+                result,
+            });
+        }
+        Request::Edit {
+            conversation,
+            ts,
+            text,
+        } => {
+            let result = api.edit(&conversation, ts, &text).await;
+            notify(Update::Edited {
+                conversation,
+                ts,
                 result,
             });
         }

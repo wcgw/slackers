@@ -1,7 +1,7 @@
 use std::collections::BTreeMap;
 use std::collections::btree_map::Entry;
 
-use crate::{Emoji, Message, Reaction, ThreadSummary, Ts, UserId};
+use crate::{Emoji, Message, Reaction, RichText, ThreadSummary, Ts, UserId};
 
 /// The Messages slackers holds for one Conversation, or for one Thread in it: oldest first, at most one per
 /// [`Ts`].
@@ -99,6 +99,14 @@ impl Timeline {
             let thread = held.thread;
             *held = message;
             held.thread = held.thread.or(thread);
+        }
+    }
+
+    /// Gives the Message at `ts`, if held, `content` instead of what it said, as an edit does; the rest of it stays.
+    pub fn revise(&mut self, ts: Ts, content: RichText) {
+        if let Some(held) = self.messages.get_mut(&ts) {
+            held.content = content;
+            held.edited = true;
         }
     }
 
@@ -207,7 +215,7 @@ impl Timeline {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::{Author, RichText, UserId};
+    use crate::{Author, UserId};
 
     fn ts(seconds: u64) -> Ts {
         Ts::from_micros(seconds * 1_000_000)
@@ -235,6 +243,25 @@ mod tests {
 
     fn held(timeline: &Timeline) -> Vec<Ts> {
         timeline.messages().map(|m| m.ts).collect()
+    }
+
+    #[test]
+    fn a_revised_message_says_something_else_and_keeps_the_rest() {
+        let mut timeline = Timeline::default();
+        let mut reacted = message(10, "typo");
+        reacted.reactions.push(Reaction {
+            emoji: Emoji::named("eyes"),
+            users: vec![UserId::new("U2")],
+            count: 1,
+        });
+        timeline.insert(reacted);
+        timeline.revise(ts(10), RichText::plain("fixed"));
+        timeline.revise(ts(99), RichText::plain("not held"));
+        let revised = timeline.get(ts(10)).unwrap();
+        assert_eq!(revised.content, RichText::plain("fixed"));
+        assert!(revised.edited);
+        assert_eq!(revised.reactions.len(), 1);
+        assert_eq!(held(&timeline), [ts(10)]);
     }
 
     #[test]

@@ -1,4 +1,5 @@
-//! Drafts: what the user writes before posting it, whom it @-mentions, and the word being completed.
+//! Drafts: what the user writes before posting it, whom it @-mentions and what else it refers to, and the word being
+//! completed.
 
 use crossterm::event::KeyEvent;
 use ratatui::buffer::Buffer;
@@ -6,16 +7,16 @@ use ratatui::layout::Rect;
 use ratatui::style::Style;
 use ratatui::widgets::Widget;
 use ratatui_textarea::{CursorMove, TextArea};
-use slackers_model::{Broadcast, UserId};
+use slackers_model::{Broadcast, ConversationId, UserId};
 use slackers_slack::Part;
 
 use crate::app::Place;
 
-/// The text written for one Place, and the @-mentions picked while writing it.
+/// The text written for one Place, and the references picked while writing it, or held by the Message it edits.
 ///
-/// A picked @-mention is written as its label, such as `@Ada Lovelace`, and is posted as a real one for as long as
-/// that label stays whole in the text. Anything else that looks like one, such as an `@ada` typed without picking
-/// anyone, is posted as typed.
+/// A reference is written as its label, such as `@Ada Lovelace` for an @-mention or `#general` for a Channel, and is
+/// posted as the real thing for as long as that label stays whole in the text. Anything else that looks like one,
+/// such as an `@ada` typed without picking anyone, is posted as typed.
 #[derive(Debug)]
 pub(crate) struct Draft {
     area: TextArea<'static>,
@@ -38,14 +39,26 @@ pub(crate) enum Completing {
 pub(crate) enum Mentioned {
     Person(UserId),
     Broadcast(Broadcast),
+    /// A user group's members, by its id.
+    UserGroup(String),
 }
 
-/// An @-mention picked for a Draft.
+/// What a label in a Draft stands for, and posts as.
+#[derive(Clone, Debug, PartialEq, Eq, Hash)]
+pub(crate) enum Reference {
+    Mention(Mentioned),
+    /// A link to a Channel.
+    Channel(ConversationId),
+    /// A link to this URL, shown as the label.
+    Link(String),
+}
+
+/// A reference picked for a Draft.
 #[derive(Clone, Debug, PartialEq, Eq)]
 struct Picked {
-    /// How it's written, `@` included.
+    /// How it's written: `@` and a name for an @-mention, `#` and a name for a Channel, a link's label.
     label: String,
-    mentioned: Mentioned,
+    reference: Reference,
 }
 
 /// What a Draft held when it was sent.
@@ -150,19 +163,48 @@ impl Draft {
     /// Writes an @-mention of `mentioned`, called `name`, and a space, in place of the word being completed. A name
     /// already picked for someone else is told apart by a number.
     pub(crate) fn pick(&mut self, mentioned: Mentioned, name: &str) {
-        let label = (1..)
+        let reference = Reference::Mention(mentioned);
+        let label = self.label_for(&format!("@{name}"), &reference);
+        if self.complete(&label) {
+            self.hold(label, reference);
+        }
+    }
+
+    /// Writes `text` at the end.
+    pub(crate) fn push_text(&mut self, text: &str) {
+        self.area.move_cursor(CursorMove::Bottom);
+        self.area.move_cursor(CursorMove::End);
+        self.area.insert_str(text);
+    }
+
+    /// Writes `reference` at the end, as `label`; a label already standing for something else is told apart by a
+    /// number.
+    pub(crate) fn push_reference(&mut self, label: &str, reference: Reference) {
+        let label = self.label_for(label, &reference);
+        self.push_text(&label);
+        self.hold(label, reference);
+    }
+
+    /// `label`, or if it stands for something other than `reference` already, the first of `label (2)`,
+    /// `label (3)`, … that doesn't.
+    fn label_for(&self, label: &str, reference: &Reference) -> String {
+        (1..)
             .map(|n| match n {
-                1 => format!("@{name}"),
-                n => format!("@{name} ({n})"),
+                1 => label.to_owned(),
+                n => format!("{label} ({n})"),
             })
             .find(|label| {
                 self.picked
                     .iter()
-                    .all(|picked| picked.label != *label || picked.mentioned == mentioned)
+                    .all(|picked| picked.label != *label || picked.reference == *reference)
             })
-            .expect("only as many labels are taken as there are picks");
-        if self.complete(&label) && !self.picked.iter().any(|picked| picked.label == label) {
-            self.picked.push(Picked { label, mentioned });
+            .expect("only as many labels are taken as there are picks")
+    }
+
+    /// Notes that `label` stands for `reference`, unless it does already.
+    fn hold(&mut self, label: String, reference: Reference) {
+        if !self.picked.iter().any(|picked| picked.label == label) {
+            self.picked.push(Picked { label, reference });
         }
     }
 
@@ -184,7 +226,7 @@ impl Draft {
         self.picked
             .iter()
             .zip(held)
-            .filter(|(_, held)| *held)
+            .filter(|(picked, held)| *held && matches!(picked.reference, Reference::Mention(_)))
             .map(|(picked, _)| picked.label.as_str())
     }
 
@@ -226,16 +268,27 @@ impl Widget for &Draft {
 }
 
 impl Written {
-    /// Its text, with each picked @-mention in place of its label.
+    /// Its text, with what each picked label stands for in its place.
     pub(crate) fn parts(&self) -> Vec<Part> {
         split(&self.text, &self.picked)
             .into_iter()
             .map(|part| match part {
                 Split::Text(text) => Part::Text(text.to_owned()),
-                Split::Picked(index) => match &self.picked[index].mentioned {
-                    Mentioned::Person(id) => Part::User(id.clone()),
-                    Mentioned::Broadcast(broadcast) => Part::Broadcast(*broadcast),
-                },
+                Split::Picked(index) => {
+                    let picked = &self.picked[index];
+                    match &picked.reference {
+                        Reference::Mention(Mentioned::Person(id)) => Part::User(id.clone()),
+                        Reference::Mention(Mentioned::Broadcast(broadcast)) => {
+                            Part::Broadcast(*broadcast)
+                        }
+                        Reference::Mention(Mentioned::UserGroup(id)) => Part::UserGroup(id.clone()),
+                        Reference::Channel(id) => Part::Channel(id.clone()),
+                        Reference::Link(url) => Part::Link {
+                            url: url.clone(),
+                            label: picked.label.clone(),
+                        },
+                    }
+                }
             })
             .collect()
     }
@@ -247,8 +300,8 @@ enum Split<'a> {
     Picked(usize),
 }
 
-/// `text` in pieces, each label of `picked` found where it starts a word and ends one. Where several labels could
-/// start, the longest wins.
+/// `text` in pieces, each label of `picked` found where no letter, digit or `_` runs into it on either side, as in
+/// `(@Ada)`, but not in `x@Ada` or `@Adam`. Where several labels could start, the longest wins.
 fn split<'a>(text: &'a str, picked: &[Picked]) -> Vec<Split<'a>> {
     let mut by_length: Vec<(usize, &Picked)> = picked.iter().enumerate().collect();
     by_length.sort_by_key(|(_, picked)| std::cmp::Reverse(picked.label.len()));
@@ -258,7 +311,7 @@ fn split<'a>(text: &'a str, picked: &[Picked]) -> Vec<Split<'a>> {
         let starts_word = text[..at]
             .chars()
             .next_back()
-            .is_none_or(char::is_whitespace);
+            .is_none_or(|c| !c.is_alphanumeric() && c != '_');
         let found = by_length.iter().find(|(_, picked)| {
             let rest = &text[at..];
             rest.starts_with(&picked.label)
@@ -442,6 +495,53 @@ mod tests {
         assert_eq!(
             sent(&mut draft),
             [Part::User(UserId::new("U1")), text(", @her")]
+        );
+    }
+
+    #[test]
+    fn channels_groups_and_labelled_links_post_as_what_their_labels_stand_for() {
+        let mut draft = draft("");
+        draft.push_text("see ");
+        draft.push_reference("#general", Reference::Channel(ConversationId::new("C1")));
+        draft.push_text(" (");
+        let docs = Reference::Link("https://example.com/docs".into());
+        draft.push_reference("the docs", docs.clone());
+        draft.push_text("), ");
+        let group = Reference::Mention(Mentioned::UserGroup("S1".into()));
+        draft.push_reference("@group", group);
+        draft.push_text(" and ");
+        draft.push_reference(
+            "the docs",
+            Reference::Link("https://example.com/other".into()),
+        );
+        assert_eq!(
+            draft.text(),
+            "see #general (the docs), @group and the docs (2)",
+            "another link by the same label is told apart"
+        );
+        assert_eq!(
+            draft.mentions().collect::<Vec<_>>(),
+            ["@group"],
+            "only those notified"
+        );
+        assert_eq!(
+            sent(&mut draft),
+            [
+                text("see "),
+                Part::Channel(ConversationId::new("C1")),
+                text(" ("),
+                Part::Link {
+                    url: "https://example.com/docs".into(),
+                    label: "the docs".into()
+                },
+                text("), "),
+                Part::UserGroup("S1".into()),
+                text(" and "),
+                Part::Link {
+                    url: "https://example.com/other".into(),
+                    label: "the docs (2)".into()
+                },
+            ]
         );
     }
 

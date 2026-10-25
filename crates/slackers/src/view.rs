@@ -838,7 +838,8 @@ fn draw_pane(
         vertical: 0,
     });
     let inserting = app.mode == Mode::Insert && app.writing_place().as_ref() == Some(&view.place);
-    let body = draw_composer(frame, body, app.drafts.get(&view.place), inserting);
+    let editing = app.is_editing(&view.place);
+    let body = draw_composer(frame, body, app.drafts.get(&view.place), inserting, editing);
     // What to complete the Draft with, or what to react to one of the pane's Messages with.
     let reacting = match &app.mode {
         Mode::React(reacting) if reacting.place == view.place => reacting.choices.as_ref(),
@@ -1156,6 +1157,9 @@ fn draw_suggestions(
                 Suggested::Mention(Mentioned::Broadcast(_)) => {
                     vec![Span::styled(icons::BROADCAST, ACCENT)]
                 }
+                Suggested::Mention(Mentioned::UserGroup(_)) => {
+                    vec![Span::styled(icons::GROUP_DM, ACCENT)]
+                }
                 Suggested::Emoji => match renderer.emoji(&Emoji::named(suggestion.name.clone())) {
                     // Followed by a space, in three cells, those of a wide character and a space.
                     Piece::Atom(glyph, cells) => {
@@ -1269,15 +1273,16 @@ fn lay_out(
 }
 
 /// Draws `draft` at the bottom of `area`: editable when `inserting`, dimmed otherwise, and not at all when there's
-/// none, or it's empty and not being written. Its top rule names whom it @-mentions. Returns what's left of `area`
-/// above it.
+/// none, or it's empty and neither being written nor `editing` a Message. Its top rule says when it's an edit, and
+/// names whom it @-mentions. Returns what's left of `area` above it.
 fn draw_composer(
     frame: &mut Frame<'_>,
     area: Rect,
     draft: Option<&Draft>,
     inserting: bool,
+    editing: bool,
 ) -> Rect {
-    let Some(draft) = draft.filter(|draft| inserting || !draft.is_empty()) else {
+    let Some(draft) = draft.filter(|draft| inserting || editing || !draft.is_empty()) else {
         return area;
     };
     let lines = u16::try_from(draft.lines().len()).unwrap_or(u16::MAX);
@@ -1288,6 +1293,9 @@ fn draw_composer(
     let mut block = Block::new()
         .borders(Borders::TOP)
         .border_style(if inserting { ACCENT } else { DIM });
+    if editing {
+        block = block.title(Line::styled(format!(" {}editing ", icons::EDITED), ACCENT));
+    }
     if !mentions.is_empty() {
         block = block.title(Line::styled(format!(" {} ", mentions.join(" · ")), MENTION));
     }
@@ -1721,16 +1729,23 @@ fn draw_status(frame: &mut Frame<'_>, area: Rect, app: &App) {
                 Suggested::Emoji => "↑/↓ choose · ⇥/⏎ insert · esc normal",
             }
         }
+        (Mode::Insert, _)
+            if app
+                .writing_place()
+                .is_some_and(|place| app.is_editing(&place)) =>
+        {
+            "⏎ save · ⇧⏎ new line · ^x^e $EDITOR · esc give up"
+        }
         (Mode::Insert, _) => "⏎ send · ⇧⏎ new line · ^x^e $EDITOR · esc normal",
         (_, Focus::Sidebar) => {
             "j/k select · ⏎ open · za fold · / search · \\ hide · i write · :q quit"
         }
         (_, Focus::Timeline) => {
-            "j/k message · ⏎ thread · + react · K details · o open · ^e/^y line · ^d/^u page · g/G · i write · \\ sidebar · :q quit"
+            "j/k message · ⏎ thread · + react · e edit · K details · o open · ^e/^y line · ^d/^u page · g/G · i write · \\ sidebar · :q quit"
         }
         (_, Focus::Activity) => "j/k choose · ⏎ open · g/G newest/oldest · \\ sidebar · :q quit",
         (_, Focus::Thread) => {
-            "j/k message · + react · K details · o open · ^e/^y line · i reply · esc close · \\ sidebar · :q quit"
+            "j/k message · + react · e edit · K details · o open · ^e/^y line · i reply · esc close · \\ sidebar · :q quit"
         }
     };
     let left = Line::from(left);
@@ -2767,6 +2782,35 @@ mod tests {
             shown.len() == 1 && shown[0] > 30 + 170 * 55 / 100,
             "{shown:?}: {rows:#?}"
         );
+    }
+
+    #[test]
+    fn an_edit_says_so_over_the_composer_and_on_the_status_line() {
+        let mut app = reading_general();
+        let mine = Message {
+            ts: Ts::from_micros(reading_general_message().ts.as_micros() + 60_000_000),
+            author: Author::User(UserId::new("UME")),
+            content: RichText::plain("my typo"),
+            ..reading_general_message()
+        };
+        let posted = slackers_slack::LiveEvent::Posted {
+            conversation: ConversationId::new("C1"),
+            message: mine,
+        };
+        app.update(Event::Slack(w(0), Update::Live(posted)));
+        let wide = |app: &App| render_sized(app, 200).0;
+        assert!(wide(&app).last().unwrap().contains("e edit"));
+        type_text(&mut app, "e");
+        let rows = wide(&app);
+        let rule = rows
+            .iter()
+            .position(|row| row.contains(&format!("{}editing", icons::EDITED)));
+        assert!(
+            rule.is_some_and(|rule| rows[rule + 1].contains("my typo")),
+            "{rows:#?}"
+        );
+        assert!(rows.last().unwrap().contains("⏎ save"), "{rows:#?}");
+        assert!(rows.last().unwrap().contains("esc give up"), "{rows:#?}");
     }
 
     #[test]

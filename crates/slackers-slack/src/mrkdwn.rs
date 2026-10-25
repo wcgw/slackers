@@ -200,6 +200,11 @@ pub(crate) fn write(parts: &[Part]) -> String {
                 Broadcast::Channel => "<!channel>",
                 Broadcast::Everyone => "<!everyone>",
             }),
+            Part::UserGroup(id) => written.push_str(&format!("<!subteam^{id}>")),
+            Part::Channel(id) => written.push_str(&format!("<#{id}>")),
+            Part::Link { url, label } => {
+                written.push_str(&format!("<{url}|{}>", escape(label)));
+            }
         }
     }
     written
@@ -322,6 +327,34 @@ mod tests {
                 Inline::User(UserId::new("U1")),
                 text(", "),
                 Inline::Broadcast(Broadcast::Here),
+            ]
+        );
+    }
+
+    #[test]
+    fn written_links_channels_and_groups_read_back_as_such() {
+        let link = Inline::Link {
+            url: "https://example.com/?a=1".into(),
+            label: Some("the <docs>".into()),
+        };
+        let parts = [
+            Part::Channel(ConversationId::new("C2")),
+            Part::Text(" ".into()),
+            Part::UserGroup("S1".into()),
+            Part::Text(" ".into()),
+            Part::Link {
+                url: "https://example.com/?a=1".into(),
+                label: "the <docs>".into(),
+            },
+        ];
+        assert_eq!(
+            paragraph(&write(&parts)),
+            [
+                Inline::Channel(ConversationId::new("C2")),
+                text(" "),
+                Inline::UserGroup("S1".into()),
+                text(" "),
+                link,
             ]
         );
     }

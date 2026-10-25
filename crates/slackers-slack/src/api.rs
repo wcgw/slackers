@@ -9,8 +9,8 @@ use reqwest::{RequestBuilder, StatusCode};
 use serde::de::DeserializeOwned;
 use serde_json::{Value, json};
 use slackers_model::{
-    Conversation, ConversationId, Emoji, Message, Reaction, ReactionChange, Ts, Unread, UserId,
-    WorkspaceId,
+    Conversation, ConversationId, Emoji, Message, Reaction, ReactionChange, RichText, Ts, Unread,
+    UserId, WorkspaceId,
 };
 use tokio::sync::Semaphore;
 
@@ -19,7 +19,8 @@ use crate::session::{
 };
 use crate::wire::{
     ACTIVITY_KINDS, ActivityFeed, AuthTest, ConversationInfo, Counts, History, ListedEmoji,
-    PeopleSearch, Posted, Prefs, ReactedTo, Replies, ThreadView, UserBoot, UserInfo, reaction_name,
+    PeopleSearch, Posted, Prefs, ReactedTo, Replies, ThreadView, Updated, UserBoot, UserInfo,
+    reaction_name,
 };
 use crate::{Credentials, Error};
 
@@ -185,6 +186,23 @@ impl Api {
     pub(crate) async fn user(&self, id: &UserId) -> Result<User, Error> {
         let info: UserInfo = self.call("users.info", &[("user", id.as_str())]).await?;
         Ok(info.into_user())
+    }
+
+    /// Replaces the text of the user's Message at `ts` with `text`, and returns its new content as Slack stored it.
+    pub(crate) async fn edit(
+        &self,
+        conversation: &ConversationId,
+        ts: Ts,
+        text: &[Part],
+    ) -> Result<RichText, Error> {
+        let (ts, text) = (ts.to_string(), crate::mrkdwn::write(text));
+        let params = [
+            ("channel", conversation.as_str()),
+            ("ts", ts.as_str()),
+            ("text", text.as_str()),
+        ];
+        let updated: Updated = self.call("chat.update", &params).await?;
+        Ok(updated.into_content())
     }
 
     /// Posts `text` to `conversation`, and returns the Message as Slack stored it.

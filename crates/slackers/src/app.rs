@@ -15,6 +15,9 @@
 //! While the terminal window doesn't have focus, a DM, a Message that mentions the user, or a Reply in one of their
 //! Followed Threads shows a desktop notification.
 //!
+//! On one of the user's Messages, `e` edits it in its pane's composer, as `↑` does in an empty one for their newest
+//! there: `Enter` saves the edit and `Esc` gives it up, bringing back what was being written before.
+//!
 //! On a Message, `+` reacts: it lists the emoji the user uses most, which typing narrows down, for `↑`/`↓` to
 //! choose and `Enter` or `Tab` to react with, or to take back one of the user's reactions. `K` shows its details: who wrote it, who reacted, and where it leads (its links, its files and the
 //! Message itself on Slack's web client), for `j`/`k` to choose, `Enter` or `1`-`9` to open and `y` to copy. `o`
@@ -27,8 +30,8 @@ use std::time::{Duration, Instant};
 use crossterm::event::{Event as TerminalEvent, KeyCode, KeyEvent, KeyEventKind, KeyModifiers};
 use slackers_gfx::{CellSize, Fit, Picture};
 use slackers_model::{
-    Author, Broadcast, Conversation, ConversationId, ConversationKind, Emoji, Happened, Inline,
-    Message, MessageRef, ReactionChange, RichText, Timeline, Ts, Unread, UserId,
+    Author, Block, Broadcast, Conversation, ConversationId, ConversationKind, Emoji, Happened,
+    Inline, Message, MessageRef, ReactionChange, RichText, Style, Timeline, Ts, Unread, UserId,
 };
 use slackers_slack::{
     Connection, EmojiList, Error, LiveEvent, Permalinks, Person, Request, Snapshot, Update, User,
@@ -36,7 +39,7 @@ use slackers_slack::{
 
 use crate::activity::{Activity, Fetched};
 use crate::config::{ChannelRef, VirtualWorkspace};
-use crate::draft::{Completing, Draft, Mentioned, Written};
+use crate::draft::{Completing, Draft, Mentioned, Reference, Written};
 use crate::emoji::Emojis;
 use crate::pane::{Pane, Settled};
 use crate::pictures::Pictures;
@@ -296,6 +299,15 @@ impl Suggestion {
             (Suggested::Mention(_) | Suggested::Emoji, _) => false,
         }
     }
+}
+
+/// An edit of one of the user's Messages, written in its Place's Draft.
+#[derive(Debug)]
+struct Editing {
+    /// The Message.
+    ts: Ts,
+    /// What was being written there before, set aside until the edit is saved or given up; `None` if nothing was.
+    set_aside: Option<Draft>,
 }
 
 /// Which pane Normal mode's keys move around.
@@ -567,6 +579,10 @@ pub(crate) struct App {
     pub(crate) suggestions: Option<Suggestions>,
     /// Messages posted but not yet confirmed, oldest first.
     pub(crate) outbox: Vec<Outgoing>,
+    /// Edits being written, by where: in that Place's Draft, set aside meanwhile.
+    editing: HashMap<Place, Editing>,
+    /// Edits saved but not yet confirmed, to put back should Slack refuse them.
+    edits_sent: Vec<(Place, Ts, Written)>,
     next_post: u64,
     /// The start of a two-key command, if the last key was one.
     pending: Option<Prefix>,
@@ -621,6 +637,8 @@ impl App {
             drafts: HashMap::new(),
             suggestions: None,
             outbox: Vec::new(),
+            editing: HashMap::new(),
+            edits_sent: Vec::new(),
             next_post: 0,
             pending: None,
             focused: true,
@@ -867,6 +885,7 @@ impl App {
             Focus::Timeline => match key.code {
                 KeyCode::Enter => self.open_selected_thread(commands),
                 KeyCode::Char('+') => self.start_reacting(),
+                KeyCode::Char('e') => self.edit_selected(),
                 KeyCode::Char('K') => self.show_details(commands),
                 KeyCode::Char('o') => self.open_selected_link(commands),
                 KeyCode::Char('h') | KeyCode::Left | KeyCode::Esc => self.focus_sidebar(),
@@ -885,6 +904,7 @@ impl App {
             },
             Focus::Thread => match key.code {
                 KeyCode::Char('+') => self.start_reacting(),
+                KeyCode::Char('e') => self.edit_selected(),
                 KeyCode::Char('K') => self.show_details(commands),
                 KeyCode::Char('o') => self.open_selected_link(commands),
                 KeyCode::Char('h') | KeyCode::Left | KeyCode::Esc => {
@@ -972,15 +992,28 @@ impl App {
                 _ => {}
             }
         }
+        let editing = self.editing.contains_key(&place);
         match (key.code, control) {
-            (KeyCode::Esc, _) | (KeyCode::Char('c'), true) => self.mode = Mode::Normal,
+            (KeyCode::Esc, _) | (KeyCode::Char('c'), true) => {
+                if editing {
+                    self.give_up_editing(&place);
+                }
+                self.mode = Mode::Normal;
+            }
             (KeyCode::Char('x'), true) => self.pending = Some(Prefix::CtrlX),
             (KeyCode::Char('e'), true) if pending == Some(Prefix::CtrlX) => {
                 let text = self.draft(&place).text();
                 commands.push(Command::Edit { place, text });
             }
             (KeyCode::Enter, _) if new_line => self.draft(&place).insert_newline(),
+            (KeyCode::Enter, _) if editing => self.save_edit(place, commands),
             (KeyCode::Enter, _) => self.send(place, commands),
+            // As in Slack: in an empty composer, Up edits the user's newest Message there.
+            (KeyCode::Up, false) if !editing && self.draft(&place).is_empty() => {
+                if let Some(ts) = self.newest_of_mine(&place) {
+                    self.start_editing(place, ts);
+                }
+            }
             _ => self.draft(&place).input(key),
         }
     }
@@ -1380,6 +1413,95 @@ impl App {
         if let Some(workspace) = self.workspaces.get_mut(key) {
             workspace.want_users(key, reactors, commands);
         }
+    }
+
+    /// Edits the focused pane's selected Message, if it's the user's.
+    fn edit_selected(&mut self) {
+        let Some((place, ts)) = self.selected_message() else {
+            return;
+        };
+        self.start_editing(place, ts);
+    }
+
+    /// The user's newest Message at `place`, if there's one.
+    fn newest_of_mine(&self, place: &Place) -> Option<Ts> {
+        let workspace = self.workspaces.get(place.conversation.workspace)?;
+        let id = &place.conversation.id;
+        let timeline = match place.thread {
+            Some(parent) => workspace.threads.get(&(id.clone(), parent)),
+            None => workspace.timelines.get(id),
+        }?;
+        timeline
+            .messages()
+            .rev()
+            .find(|message| message.is_by(&workspace.me))
+            .map(|message| message.ts)
+    }
+
+    /// Starts editing the Message at `ts`, held at `place`, in that Place's Draft, in Insert mode; what's being
+    /// written there is set aside meanwhile. Says why not when the Message isn't the user's.
+    fn start_editing(&mut self, place: Place, ts: Ts) {
+        let Some((workspace, message)) = self.message(&place, ts) else {
+            return;
+        };
+        if !message.is_by(&workspace.me) {
+            self.notice = Some("only your own messages can be edited".to_owned());
+            return;
+        }
+        let draft = workspace.draft_of(&place, &message.content);
+        self.write_edit(place, ts, draft);
+        self.mode = Mode::Insert;
+    }
+
+    /// Puts `draft`, an edit of the Message at `ts`, in `place`'s composer, setting aside what's being written there.
+    fn write_edit(&mut self, place: Place, ts: Ts, draft: Draft) {
+        let before = self.drafts.insert(place.clone(), draft);
+        // Editing another Message there drops that edit, but keeps what was set aside for it.
+        let set_aside = match self.editing.remove(&place) {
+            Some(earlier) => earlier.set_aside,
+            None => before.filter(|draft| !draft.is_empty()),
+        };
+        self.editing.insert(place, Editing { ts, set_aside });
+    }
+
+    /// Gives up the edit at `place`, bringing back what was set aside for it.
+    fn give_up_editing(&mut self, place: &Place) {
+        let Some(editing) = self.editing.remove(place) else {
+            return;
+        };
+        match editing.set_aside {
+            Some(draft) => {
+                self.drafts.insert(place.clone(), draft);
+            }
+            None => {
+                self.drafts.remove(place);
+            }
+        }
+    }
+
+    /// Saves the edit at `place`, unless it's blank, and brings back what was set aside for it.
+    fn save_edit(&mut self, place: Place, commands: &mut Vec<Command>) {
+        let Some(written) = self.drafts.get_mut(&place).and_then(Draft::take) else {
+            self.notice = Some("an edit can't be empty: esc gives it up".to_owned());
+            return;
+        };
+        let Some(editing) = self.editing.get(&place) else {
+            return;
+        };
+        let ts = editing.ts;
+        self.give_up_editing(&place);
+        let request = Request::Edit {
+            conversation: place.conversation.id.clone(),
+            ts,
+            text: written.parts(),
+        };
+        commands.push(Command::Slack(place.conversation.workspace, request));
+        self.edits_sent.push((place, ts, written));
+    }
+
+    /// Whether a Message is being edited at `place`, in its Draft.
+    pub(crate) fn is_editing(&self, place: &Place) -> bool {
+        self.editing.contains_key(place)
     }
 
     /// Starts choosing an emoji to react to the focused pane's selected Message with.
@@ -1882,6 +2004,39 @@ impl App {
             Update::SignInFailed(error) => {
                 self.workspaces
                     .set_phase(key, Phase::Failed(error.to_string()));
+            }
+            Update::Edited {
+                conversation,
+                ts,
+                result,
+            } => {
+                let sent = self.edits_sent.iter().position(|(place, sent, _)| {
+                    place.conversation.workspace == key
+                        && place.conversation.id == conversation
+                        && *sent == ts
+                });
+                let Some(sent) = sent.map(|at| self.edits_sent.remove(at)) else {
+                    return;
+                };
+                match result {
+                    Ok(content) => {
+                        if let Some(workspace) = self.workspaces.get_mut(key) {
+                            for timeline in workspace.timelines_of(&conversation) {
+                                timeline.revise(ts, content.clone());
+                            }
+                        }
+                    }
+                    Err(error) => {
+                        let (place, ts, written) = sent;
+                        self.notice = Some(format!(
+                            "not edited, back in the composer: {}",
+                            describe(&error)
+                        ));
+                        let mut draft = Draft::new(&place);
+                        draft.put_back(written);
+                        self.write_edit(place, ts, draft);
+                    }
+                }
             }
             Update::Reacted {
                 conversation,
@@ -2451,6 +2606,92 @@ impl Workspace {
         }
     }
 
+    /// A Draft at `place` holding `content` as one would write it: styles as `mrkdwn` markers, emoji by name, and
+    /// people, broadcasts, user groups, Channels and labelled links as labels standing for them. Images go: they
+    /// aren't text.
+    fn draft_of(&self, place: &Place, content: &RichText) -> Draft {
+        let mut draft = Draft::new(place);
+        for (index, block) in content.blocks.iter().enumerate() {
+            if index > 0 {
+                draft.push_text("\n");
+            }
+            match block {
+                Block::Paragraph(inlines) => self.write_inlines(&mut draft, inlines, ""),
+                Block::Quote(inlines) => {
+                    draft.push_text("> ");
+                    self.write_inlines(&mut draft, inlines, "> ");
+                }
+                Block::Preformatted(text) => draft.push_text(&format!("```\n{text}\n```")),
+                Block::List { ordered, items } => {
+                    for (number, item) in items.iter().enumerate() {
+                        if number > 0 {
+                            draft.push_text("\n");
+                        }
+                        let marker = if *ordered {
+                            format!("{}. ", number + 1)
+                        } else {
+                            "• ".to_owned()
+                        };
+                        draft.push_text(&marker);
+                        self.write_inlines(&mut draft, item, "");
+                    }
+                }
+                Block::Image { .. } => {}
+            }
+        }
+        draft
+    }
+
+    /// Writes `inlines` at the end of `draft`, starting each line after the first with `line_start`.
+    fn write_inlines(&self, draft: &mut Draft, inlines: &[Inline], line_start: &str) {
+        for inline in inlines {
+            match inline {
+                Inline::Text { text, style } => {
+                    let styled = styled(text, *style);
+                    draft.push_text(&styled.replace('\n', &format!("\n{line_start}")));
+                }
+                Inline::Emoji(emoji) => {
+                    let tone = emoji
+                        .skin_tone
+                        .map(|tone| format!(":skin-tone-{tone}:"))
+                        .unwrap_or_default();
+                    draft.push_text(&format!(":{}:{tone}", emoji.name));
+                }
+                Inline::User(id) => {
+                    let label = format!("@{}", self.user_name(id));
+                    draft.push_reference(&label, Reference::Mention(Mentioned::Person(id.clone())));
+                }
+                Inline::Broadcast(broadcast) => {
+                    let label = match broadcast {
+                        Broadcast::Here => "@here",
+                        Broadcast::Channel => "@channel",
+                        Broadcast::Everyone => "@everyone",
+                    };
+                    draft.push_reference(
+                        label,
+                        Reference::Mention(Mentioned::Broadcast(*broadcast)),
+                    );
+                }
+                Inline::UserGroup(id) => {
+                    let group = Reference::Mention(Mentioned::UserGroup(id.clone()));
+                    draft.push_reference("@group", group);
+                }
+                Inline::Channel(id) => {
+                    let name = self
+                        .conversation(id)
+                        .map_or(id.as_str(), |found| found.name.as_str());
+                    draft.push_reference(&format!("#{name}"), Reference::Channel(id.clone()));
+                }
+                Inline::Link { url, label } => match label {
+                    Some(label) if !label.is_empty() && label != url => {
+                        draft.push_reference(label, Reference::Link(url.clone()));
+                    }
+                    _ => draft.push_text(url),
+                },
+            }
+        }
+    }
+
     /// `text` as one line of plain words: people, Channels and emoji by name, links by their label.
     pub(crate) fn gist(&self, text: &RichText) -> String {
         let mut gist = String::new();
@@ -2709,6 +2950,32 @@ fn people_in(message: &Message) -> Vec<UserId> {
         _ => None,
     });
     author.into_iter().chain(mentioned).collect()
+}
+
+/// `text` in `style`, as `mrkdwn` writes it: between `*` for bold, `_` for italic, `~` for strikethrough and `` ` ``
+/// for code. Spaces at either end stay outside the markers, which only count against words.
+fn styled(text: &str, style: Style) -> String {
+    let markers: String = [
+        (Style::BOLD, '*'),
+        (Style::ITALIC, '_'),
+        (Style::STRIKE, '~'),
+        (Style::CODE, '`'),
+    ]
+    .into_iter()
+    .filter(|(marker, _)| style.contains(*marker))
+    .map(|(_, mark)| mark)
+    .collect();
+    let words = text.trim();
+    if markers.is_empty() || words.is_empty() {
+        return text.to_owned();
+    }
+    let (start, end) = (text.len() - text.trim_start().len(), text.trim_end().len());
+    let closing: String = markers.chars().rev().collect();
+    format!(
+        "{}{markers}{words}{closing}{}",
+        &text[..start],
+        &text[end..]
+    )
 }
 
 /// A Slack error, as the status bar puts it.
@@ -4717,6 +4984,190 @@ mod tests {
         })));
         app.focus = Focus::Timeline;
         app
+    }
+
+    /// `reading_random` with the user's own Message at 7 seconds saying `content`, `Ana` named, and the pane focused
+    /// on it.
+    fn reading_my_message(content: RichText) -> App {
+        let mut app = reading_random();
+        app.update(named("U2", "Ana"));
+        app.update(slack(Update::Live(LiveEvent::Posted {
+            conversation: id("C2"),
+            message: message(7, "UME", content),
+        })));
+        app.focus = Focus::Timeline;
+        app
+    }
+
+    fn text(text: &str, style: Style) -> Inline {
+        Inline::Text {
+            text: text.into(),
+            style,
+        }
+    }
+
+    #[test]
+    fn e_edits_ones_own_message_as_one_would_write_it_and_enter_saves_it() {
+        let mut thumbs = Emoji::named("+1");
+        thumbs.skin_tone = Some(2);
+        let content = RichText {
+            blocks: vec![
+                Block::Paragraph(vec![
+                    text("fix ", Style::PLAIN),
+                    text("this ", Style::BOLD),
+                    Inline::Emoji(thumbs),
+                    text(" ", Style::PLAIN),
+                    Inline::User(UserId::new("U2")),
+                    text(" in ", Style::PLAIN),
+                    Inline::Channel(id("C1")),
+                    text(" see ", Style::PLAIN),
+                    Inline::Link {
+                        url: "https://x.org/docs".into(),
+                        label: Some("the docs".into()),
+                    },
+                    text(" or ", Style::PLAIN),
+                    Inline::Link {
+                        url: "https://x.org".into(),
+                        label: None,
+                    },
+                ]),
+                Block::Quote(vec![text("quoted\nmore", Style::PLAIN)]),
+                Block::Preformatted("let x = 1;".into()),
+                Block::List {
+                    ordered: false,
+                    items: vec![vec![text("a", Style::PLAIN)], vec![text("b", Style::PLAIN)]],
+                },
+            ],
+        };
+        let mut app = reading_my_message(content);
+        keys(&mut app, "ihalf written");
+        app.update(key(KeyCode::Esc));
+        assert!(keys(&mut app, "e").is_empty());
+        assert_eq!(app.mode, Mode::Insert);
+        let place = place("C2", None);
+        assert!(app.is_editing(&place));
+        assert_eq!(
+            app.drafts[&place].text(),
+            "fix *this* :+1::skin-tone-2: @Ana in #general see the docs or https://x.org\n\
+             > quoted\n> more\n```\nlet x = 1;\n```\n• a\n• b"
+        );
+
+        keys(&mut app, "!");
+        let commands = app.update(key(KeyCode::Enter));
+        let edit = Request::Edit {
+            conversation: id("C2"),
+            ts: seconds(7),
+            text: vec![
+                Part::Text("fix *this* :+1::skin-tone-2: ".into()),
+                Part::User(UserId::new("U2")),
+                Part::Text(" in ".into()),
+                Part::Channel(id("C1")),
+                Part::Text(" see ".into()),
+                Part::Link {
+                    url: "https://x.org/docs".into(),
+                    label: "the docs".into(),
+                },
+                Part::Text(
+                    " or https://x.org\n> quoted\n> more\n```\nlet x = 1;\n```\n• a\n• b!".into(),
+                ),
+            ],
+        };
+        assert_eq!(commands, [ask(edit)]);
+        assert!(!app.is_editing(&place));
+        assert_eq!(
+            app.drafts[&place].text(),
+            "half written",
+            "what was set aside is back"
+        );
+
+        app.update(slack(Update::Edited {
+            conversation: id("C2"),
+            ts: seconds(7),
+            result: Ok(RichText::plain("fixed")),
+        }));
+        let (_, edited) = app.message(&place, seconds(7)).unwrap();
+        assert_eq!(
+            (&edited.content, edited.edited),
+            (&RichText::plain("fixed"), true)
+        );
+    }
+
+    #[test]
+    fn styles_write_as_markers_around_the_words_only() {
+        assert_eq!(styled("plain ", Style::PLAIN), "plain ");
+        assert_eq!(styled(" bold ", Style::BOLD), " *bold* ");
+        assert_eq!(
+            styled(
+                "all of it",
+                Style::BOLD | Style::ITALIC | Style::STRIKE | Style::CODE
+            ),
+            "*_~`all of it`~_*"
+        );
+        assert_eq!(styled("  ", Style::BOLD), "  ", "no words, no markers");
+    }
+
+    #[test]
+    fn up_in_an_empty_composer_edits_the_newest_of_ones_own_and_esc_gives_it_up() {
+        let mut app = reading_my_message(RichText::plain("first"));
+        app.update(slack(Update::Live(LiveEvent::Posted {
+            conversation: id("C2"),
+            message: message(8, "U2", RichText::plain("someone else's, newer")),
+        })));
+        let place = place("C2", None);
+        keys(&mut app, "ix");
+        app.update(key(KeyCode::Up));
+        assert!(!app.is_editing(&place), "not with something written");
+        app.update(key(KeyCode::Backspace));
+        app.update(key(KeyCode::Up));
+        assert!(app.is_editing(&place));
+        assert_eq!(app.drafts[&place].text(), "first", "the user's own");
+        app.update(key(KeyCode::Esc));
+        assert!(!app.is_editing(&place));
+        assert_eq!(app.mode, Mode::Normal);
+        assert!(
+            app.drafts.get(&place).is_none_or(Draft::is_empty),
+            "nothing was set aside"
+        );
+
+        keys(&mut app, "kk");
+        keys(&mut app, "e");
+        assert!(!app.is_editing(&place));
+        assert_eq!(
+            app.notice.as_deref(),
+            Some("only your own messages can be edited")
+        );
+    }
+
+    #[test]
+    fn a_blank_edit_isnt_saved_and_a_refused_one_comes_back() {
+        let mut app = reading_my_message(RichText::plain("typo"));
+        let place = place("C2", None);
+        keys(&mut app, "e");
+        for _ in 0.."typo".len() {
+            app.update(key(KeyCode::Backspace));
+        }
+        assert!(app.update(key(KeyCode::Enter)).is_empty());
+        assert!(app.is_editing(&place), "still editing");
+        keys(&mut app, "fixed");
+        app.update(key(KeyCode::Enter));
+        app.update(key(KeyCode::Esc));
+
+        app.update(slack(Update::Edited {
+            conversation: id("C2"),
+            ts: seconds(7),
+            result: Err(Error::Refused {
+                method: "chat.update",
+                code: "edit_window_closed".into(),
+            }),
+        }));
+        assert!(app.is_editing(&place));
+        assert_eq!(app.drafts[&place].text(), "fixed");
+        assert_eq!(
+            app.notice.as_deref(),
+            Some("not edited, back in the composer: slack refused chat.update: edit_window_closed")
+        );
+        let (_, kept) = app.message(&place, seconds(7)).unwrap();
+        assert_eq!(kept.content, RichText::plain("typo"));
     }
 
     fn named(id: &str, name: &str) -> Event {

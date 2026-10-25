@@ -42,7 +42,8 @@ A Message posted in a Thread rather than directly in the Conversation.
 
 **Draft**:
 What the user is writing in a Conversation or a Thread, not posted yet. Each Conversation and each Thread has its
-own.
+own. Editing one of the user's Messages writes the edit as the Draft where the Message is, setting aside what was
+there until the edit is saved or given up.
 _Avoid_: composer (that's the box a Draft is written in)
 
 **Reaction**:
