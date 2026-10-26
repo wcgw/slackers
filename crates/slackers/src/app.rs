@@ -351,6 +351,16 @@ struct Editing {
     ts: Ts,
     /// What was being written there before, set aside until the edit is saved or given up; `None` if nothing was.
     set_aside: Option<Draft>,
+    started: Started,
+}
+
+/// Where an edit was started, which saving or giving it up goes back to.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Started {
+    /// In the composer, with Up: back to writing there.
+    InComposer,
+    /// On its Message, with `e`: back to Normal mode.
+    OnMessage,
 }
 
 /// Which pane Normal mode's keys move around.
@@ -1079,9 +1089,10 @@ impl App {
         match (key.code, control) {
             (KeyCode::Esc, _) | (KeyCode::Char('c'), true) => {
                 if editing {
-                    self.give_up_editing(&place);
+                    self.stop_editing(&place);
+                } else {
+                    self.mode = Mode::Normal;
                 }
-                self.mode = Mode::Normal;
             }
             (KeyCode::Char('x'), true) => self.pending = Some(Prefix::CtrlX),
             (KeyCode::Char('e'), true) if pending == Some(Prefix::CtrlX) => {
@@ -1094,7 +1105,7 @@ impl App {
             // As in Slack: in an empty composer, Up edits the user's newest Message there.
             (KeyCode::Up, false) if !editing && self.draft(&place).is_empty() => {
                 if let Some(ts) = self.newest_of_mine(&place) {
-                    self.start_editing(place, ts);
+                    self.start_editing(place, ts, Started::InComposer);
                 }
             }
             _ => self.draft(&place).input(key),
@@ -1527,7 +1538,7 @@ impl App {
         let Some((place, ts)) = self.selected_message() else {
             return;
         };
-        self.start_editing(place, ts);
+        self.start_editing(place, ts, Started::OnMessage);
     }
 
     /// The user's newest Message at `place`, if there's one.
@@ -1547,7 +1558,7 @@ impl App {
 
     /// Starts editing the Message at `ts`, held at `place`, in that Place's Draft, in Insert mode; what's being
     /// written there is set aside meanwhile. Says why not when the Message isn't the user's.
-    fn start_editing(&mut self, place: Place, ts: Ts) {
+    fn start_editing(&mut self, place: Place, ts: Ts, started: Started) {
         let Some((workspace, message)) = self.message(&place, ts) else {
             return;
         };
@@ -1556,37 +1567,44 @@ impl App {
             return;
         }
         let draft = workspace.draft_of(&place, &message.content);
-        self.write_edit(place, ts, draft);
+        self.write_edit(place, ts, draft, started);
         self.mode = Mode::Insert;
     }
 
     /// Puts `draft`, an edit of the Message at `ts`, in `place`'s composer, setting aside what's being written there.
-    fn write_edit(&mut self, place: Place, ts: Ts, draft: Draft) {
+    fn write_edit(&mut self, place: Place, ts: Ts, draft: Draft, started: Started) {
         let before = self.drafts.insert(place.clone(), draft);
         // Editing another Message there drops that edit, but keeps what was set aside for it.
         let set_aside = match self.editing.remove(&place) {
             Some(earlier) => earlier.set_aside,
             None => before.filter(|draft| !draft.is_empty()),
         };
-        self.editing.insert(place, Editing { ts, set_aside });
+        self.editing.insert(
+            place,
+            Editing {
+                ts,
+                set_aside,
+                started,
+            },
+        );
     }
 
-    /// Gives up the edit at `place`, bringing back what was set aside for it.
-    fn give_up_editing(&mut self, place: &Place) {
+    /// Ends the edit at `place`, bringing back what was set aside for it, and goes back to where the edit was
+    /// started: writing in the composer, or Normal mode.
+    fn stop_editing(&mut self, place: &Place) {
         let Some(editing) = self.editing.remove(place) else {
             return;
         };
-        match editing.set_aside {
-            Some(draft) => {
-                self.drafts.insert(place.clone(), draft);
-            }
-            None => {
-                self.drafts.remove(place);
-            }
-        }
+        // An empty Draft rather than none, so that the composer stays to write in.
+        let draft = editing.set_aside.unwrap_or_else(|| Draft::new(place));
+        self.drafts.insert(place.clone(), draft);
+        self.mode = match editing.started {
+            Started::InComposer => Mode::Insert,
+            Started::OnMessage => Mode::Normal,
+        };
     }
 
-    /// Saves the edit at `place`, unless it's blank, and brings back what was set aside for it.
+    /// Saves the edit at `place`, unless it's blank, and goes back as [`App::stop_editing`] does.
     fn save_edit(&mut self, place: Place, commands: &mut Vec<Command>) {
         let Some(written) = self.drafts.get_mut(&place).and_then(Draft::take) else {
             self.tell("an edit can't be empty: esc gives it up".to_owned());
@@ -1596,7 +1614,7 @@ impl App {
             return;
         };
         let ts = editing.ts;
-        self.give_up_editing(&place);
+        self.stop_editing(&place);
         let request = Request::Edit {
             conversation: place.conversation.id.clone(),
             ts,
@@ -2275,7 +2293,8 @@ impl App {
                         ));
                         let mut draft = Draft::new(&place);
                         draft.put_back(written);
-                        self.write_edit(place, ts, draft);
+                        // To fix it, the user goes to the composer.
+                        self.write_edit(place, ts, draft, Started::InComposer);
                     }
                 }
             }
@@ -5530,6 +5549,11 @@ mod tests {
         assert_eq!(commands, [ask(edit)]);
         assert!(!app.is_editing(&place));
         assert_eq!(
+            app.mode,
+            Mode::Normal,
+            "back from the Message it started on"
+        );
+        assert_eq!(
             app.drafts[&place].text(),
             "half written",
             "what was set aside is back"
@@ -5548,7 +5572,7 @@ mod tests {
     }
 
     #[test]
-    fn up_in_an_empty_composer_edits_the_newest_of_ones_own_and_esc_gives_it_up() {
+    fn up_in_an_empty_composer_edits_the_newest_of_ones_own_and_goes_back_to_writing() {
         let mut app = reading_my_message(RichText::plain("first"));
         app.update(slack(Update::Live(LiveEvent::Posted {
             conversation: id("C2"),
@@ -5563,12 +5587,20 @@ mod tests {
         assert!(app.is_editing(&place));
         assert_eq!(app.drafts[&place].text(), "first", "the user's own");
         app.update(key(KeyCode::Esc));
+        assert!(!app.is_editing(&place), "given up");
+        assert_eq!(app.mode, Mode::Insert, "back to writing");
+        assert!(app.drafts[&place].is_empty(), "nothing was set aside");
+        app.update(key(KeyCode::Up));
+        keys(&mut app, "!");
+        assert_eq!(app.update(key(KeyCode::Enter)).len(), 1, "saved");
         assert!(!app.is_editing(&place));
-        assert_eq!(app.mode, Mode::Normal);
+        assert_eq!(app.mode, Mode::Insert, "back to writing");
         assert!(
-            app.drafts.get(&place).is_none_or(Draft::is_empty),
-            "nothing was set aside"
+            app.drafts[&place].is_empty(),
+            "the composer stays to write in"
         );
+        app.update(key(KeyCode::Esc));
+        assert_eq!(app.mode, Mode::Normal);
 
         keys(&mut app, "kk");
         keys(&mut app, "e");
@@ -5588,7 +5620,7 @@ mod tests {
         assert!(app.is_editing(&place), "still editing");
         keys(&mut app, "fixed");
         app.update(key(KeyCode::Enter));
-        app.update(key(KeyCode::Esc));
+        assert_eq!(app.mode, Mode::Normal);
 
         app.update(slack(Update::Edited {
             conversation: id("C2"),
@@ -5606,6 +5638,11 @@ mod tests {
         );
         let (_, kept) = app.message(&place, seconds(7)).unwrap();
         assert_eq!(kept.content, RichText::plain("typo"));
+
+        // Fixed in the composer, it goes back to writing there.
+        keys(&mut app, "i!");
+        assert_eq!(app.update(key(KeyCode::Enter)).len(), 1, "saved");
+        assert_eq!(app.mode, Mode::Insert);
     }
 
     /// `reading_random` with `/giphy` and `/remind` on offer.
