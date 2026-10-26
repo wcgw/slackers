@@ -201,6 +201,16 @@ impl Sidebar {
         self.moved = true;
     }
 
+    /// Moves the cursor to `row`, if it's showing. Returns whether it is.
+    pub(crate) fn select_row(&mut self, row: &Row) -> bool {
+        let Some(at) = self.rows.iter().position(|showing| showing == row) else {
+            return false;
+        };
+        self.cursor = at;
+        self.moved = true;
+        true
+    }
+
     /// Moves the cursor to the first row `wanted` accepts, if there is one, unless the user has moved it.
     pub(crate) fn suggest(&mut self, wanted: impl Fn(&Row) -> bool) {
         if self.moved {

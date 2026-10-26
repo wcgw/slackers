@@ -100,6 +100,16 @@ impl Pane {
         self.anchor = Anchor::Cursor;
     }
 
+    /// Selects the Message at `ts`, which `timeline` holds, and scrolls only as far as it takes to show it. The
+    /// newest is selected as [`Pane::newest`] selects it, so that the pane follows what comes after it.
+    pub(crate) fn select_held(&mut self, ts: Ts, timeline: &Timeline) {
+        if Some(ts) == timeline.newest() {
+            self.newest();
+        } else {
+            self.select(ts);
+        }
+    }
+
     /// The selected Message: the one under the cursor, else the newest in `timeline`.
     pub(crate) fn selected(&self, timeline: &Timeline) -> Option<Ts> {
         self.cursor.or_else(|| timeline.newest())

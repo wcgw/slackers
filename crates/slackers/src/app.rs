@@ -37,12 +37,22 @@
 //! itself on Slack's web client), for `j`/`k` to choose, `Enter` or `1`-`9` to press or open and `y` to copy; with
 //! more than one to choose from, they stay up for the next. `o` opens a Message's link or file when it has just one,
 //! and shows its details to choose from otherwise.
+//!
+//! The mouse works too. Clicking a row of the sidebar, a search's hit, an Activity item, a suggestion, an emoji to
+//! react with or a choice in a Message's details selects it and does what `Enter` does there. Clicking a Message
+//! selects it, and clicking the selected one opens its Thread. Clicking one of those while a mode is choosing
+//! something else leaves the mode first, as `Esc` does, except that a Draft being written, or an edit, stays in
+//! place for `i` to go back to. The wheel scrolls a pane of Messages, and moves through a list as `↑`/`↓` do.
 
 use std::cmp::Reverse;
 use std::collections::{HashMap, HashSet};
 use std::time::{Duration, Instant, SystemTime};
 
-use crossterm::event::{Event as TerminalEvent, KeyCode, KeyEvent, KeyEventKind, KeyModifiers};
+use crossterm::event::{
+    Event as TerminalEvent, KeyCode, KeyEvent, KeyEventKind, KeyModifiers, MouseButton, MouseEvent,
+    MouseEventKind,
+};
+use ratatui::layout::{Position, Rect};
 use slackers_gfx::{CellSize, Fit, Picture};
 use slackers_model::{
     Author, Block, BotId, Broadcast, Button, Conversation, ConversationId, ConversationKind, Emoji,
@@ -88,6 +98,9 @@ const COMMAND_POSTS_WITHIN: u64 = 15 * 1_000_000;
 
 /// How far Slack's clock, which times Messages, may be behind this one, in microseconds.
 const CLOCK_SKEW: u64 = 5 * 1_000_000;
+
+/// How many lines a turn of the mouse wheel scrolls a pane of Messages.
+const WHEEL_LINES: isize = 3;
 
 /// Something that happened, for [`App::update`] to react to.
 #[derive(Debug)]
@@ -141,6 +154,9 @@ pub(crate) struct Drawn {
     pub(crate) conversation: Option<Settled>,
     /// Where the open Thread's pane settled; `None` when it wasn't on screen.
     pub(crate) thread: Option<Settled>,
+    /// What the mouse can act on, and where it was drawn, in drawing order: where two overlap, the later one is on
+    /// top.
+    pub(crate) targets: Vec<(Rect, Target)>,
 }
 
 /// A picture to have in the terminal, the Workspace to fetch it through (Slack serves a Workspace's files to its
@@ -150,6 +166,25 @@ pub(crate) struct WantedPicture {
     pub(crate) workspace: WorkspaceKey,
     pub(crate) url: String,
     pub(crate) fit: Fit,
+}
+
+/// Something drawn that a click or the mouse wheel acts on.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) enum Target {
+    /// A row of the sidebar.
+    Row(Row),
+    /// A Conversation the sidebar's search found.
+    Hit(ConversationRef),
+    /// An Activity item, by its Workspace and key.
+    ActivityItem(WorkspaceKey, String),
+    /// A Message, where it's held: its Conversation, or the Thread whose pane shows it.
+    Message(Place, Ts),
+    /// One of the suggestions to complete a word with, or of the emoji to react with, by its place among them.
+    Suggestion(usize),
+    /// One of the choices a Message's details offer, by its place among them.
+    Choice(usize),
+    /// A popup, which keeps clicks from what's under it, even where it shows nothing to click.
+    Popup,
 }
 
 /// Something for the runtime to do.
@@ -669,6 +704,8 @@ pub(crate) struct App {
     conversation_shown: bool,
     /// Whether the open Thread's pane was on screen at the last draw.
     thread_shown: bool,
+    /// What the last draw put where, for the mouse to find.
+    targets: Vec<(Rect, Target)>,
     finder: Finder,
     /// When a picture drawn next changes frame, as animation time.
     next_frame: Option<Duration>,
@@ -724,6 +761,7 @@ impl App {
             held_notifications: Vec::new(),
             conversation_shown: false,
             thread_shown: false,
+            targets: Vec::new(),
             finder: Finder::new(),
             next_frame: None,
             next_change: None,
@@ -790,6 +828,7 @@ impl App {
                 self.held_notifications.clear();
             }
             Event::Terminal(TerminalEvent::FocusLost) => self.focused = false,
+            Event::Terminal(TerminalEvent::Mouse(mouse)) => self.mouse(mouse, &mut commands),
             Event::Terminal(_) => {}
             Event::Slack(workspace, update) => self.slack(workspace, update, &mut commands),
             Event::CantSignIn { workspace, reason } => {
@@ -835,6 +874,7 @@ impl App {
                 self.next_change = drawn.next_change;
                 self.conversation_shown = drawn.conversation.is_some();
                 self.thread_shown = drawn.thread.is_some();
+                self.targets = drawn.targets;
                 if let Some(settled) = drawn.conversation {
                     self.conversation_pane.adopt(settled);
                     if settled.scroll == settled.max_scroll {
@@ -870,6 +910,162 @@ impl App {
             Mode::Search(_) => self.search_key(key, commands),
             Mode::Details(_) => self.details_key(key, commands),
             Mode::React(_) => self.react_key(key, commands),
+        }
+    }
+
+    /// Acts on what a click or a turn of the wheel lands on, as the last draw put it there; see [`App::click`] and
+    /// [`App::wheel`]. Landing on nothing does nothing.
+    fn mouse(&mut self, mouse: MouseEvent, commands: &mut Vec<Command>) {
+        let arrow = match mouse.kind {
+            MouseEventKind::Down(MouseButton::Left) => None,
+            MouseEventKind::ScrollUp => Some(KeyCode::Up),
+            MouseEventKind::ScrollDown => Some(KeyCode::Down),
+            _ => return,
+        };
+        let at = Position::new(mouse.column, mouse.row);
+        let Some(target) = self
+            .targets
+            .iter()
+            .rev()
+            .find(|(area, _)| area.contains(at))
+            .map(|(_, target)| target.clone())
+        else {
+            return;
+        };
+        // A two-key command started with the keyboard is over.
+        self.pending = None;
+        match arrow {
+            None => self.click(target, commands),
+            Some(arrow) => self.wheel(target, arrow, commands),
+        }
+    }
+
+    /// Selects what's clicked and does what `Enter` does on it, as in the mode it's chosen in: opens a row of the
+    /// sidebar, a search's hit or an Activity item; picks a suggestion, or an emoji to react with; takes a choice in
+    /// a Message's details. A Message is only selected, unless it already was, in the focused pane: then `Enter`
+    /// opens its Thread. Clicking something other than what a mode chooses from leaves the mode first, as `Esc` does,
+    /// but keeps a Draft being written, or an edit, in place.
+    fn click(&mut self, target: Target, commands: &mut Vec<Command>) {
+        let enter = KeyEvent::from(KeyCode::Enter);
+        match target {
+            Target::Hit(conversation) => {
+                let Mode::Search(search) = &mut self.mode else {
+                    return;
+                };
+                let found = search
+                    .hits
+                    .iter()
+                    .position(|hit| hit.conversation == conversation);
+                if let Some(at) = found {
+                    search.selected = at;
+                    self.key(enter, commands);
+                }
+            }
+            Target::Suggestion(index) => {
+                let suggestions = match &mut self.mode {
+                    Mode::Insert => self.suggestions.as_mut(),
+                    Mode::React(reacting) => reacting.choices.as_mut(),
+                    Mode::Normal | Mode::Command(_) | Mode::Search(_) | Mode::Details(_) => None,
+                };
+                if let Some(suggestions) = suggestions.filter(|s| index < s.items.len()) {
+                    suggestions.selected = index;
+                    // Tab picks it as Enter does, but can't send the Draft.
+                    self.key(KeyEvent::from(KeyCode::Tab), commands);
+                }
+            }
+            Target::Choice(index) => {
+                if let Mode::Details(_) = self.mode {
+                    self.select_choice(index);
+                    self.key(enter, commands);
+                }
+            }
+            Target::Popup => {}
+            Target::Row(row) => {
+                if self.sidebar.select_row(&row) {
+                    self.mode = Mode::Normal;
+                    self.focus_sidebar();
+                    self.key(enter, commands);
+                }
+            }
+            Target::ActivityItem(workspace, key) => {
+                if self.activity.select(workspace, &key) {
+                    self.mode = Mode::Normal;
+                    self.focus = Focus::Activity;
+                    self.key(enter, commands);
+                }
+            }
+            Target::Message(place, ts) => {
+                let focus = match place.thread {
+                    Some(_) => Focus::Thread,
+                    None => Focus::Timeline,
+                };
+                let again = self.mode == Mode::Normal
+                    && self.focus == focus
+                    && self.selected_message() == Some((place.clone(), ts));
+                let Some((pane, timeline)) = self.open_pane(&place) else {
+                    return;
+                };
+                pane.select_held(ts, timeline);
+                self.mode = Mode::Normal;
+                self.focus = focus;
+                if again {
+                    self.key(enter, commands);
+                }
+            }
+        }
+    }
+
+    /// Scrolls a pane of Messages by [`WHEEL_LINES`], as `Ctrl-y` and `Ctrl-e` do, or presses `arrow` (`↑` or `↓`)
+    /// in a list: a popup's, a search's hits, or in Normal mode the sidebar or Activity, which it focuses.
+    fn wheel(&mut self, target: Target, arrow: KeyCode, commands: &mut Vec<Command>) {
+        let press = match target {
+            Target::Message(place, _) => {
+                if let Some((pane, _)) = self.open_pane(&place) {
+                    pane.scroll_by(if arrow == KeyCode::Up {
+                        WHEEL_LINES
+                    } else {
+                        -WHEEL_LINES
+                    });
+                }
+                false
+            }
+            Target::Suggestion(_) | Target::Choice(_) | Target::Popup => match self.mode {
+                // Only while there are suggestions: in an empty composer, `↑` edits the user's newest Message.
+                Mode::Insert => self.suggestions.is_some(),
+                Mode::React(_) | Mode::Details(_) => true,
+                Mode::Normal | Mode::Command(_) | Mode::Search(_) => false,
+            },
+            Target::Hit(_) => matches!(self.mode, Mode::Search(_)),
+            Target::Row(_) if self.mode == Mode::Normal => {
+                self.focus_sidebar();
+                true
+            }
+            Target::ActivityItem(..) if self.mode == Mode::Normal => {
+                self.focus = Focus::Activity;
+                true
+            }
+            Target::Row(_) | Target::ActivityItem(..) => false,
+        };
+        if press {
+            self.key(KeyEvent::from(arrow), commands);
+        }
+    }
+
+    /// The pane showing Messages at `place`, and its Messages, while it's open: the open Conversation's, or its
+    /// open Thread's.
+    fn open_pane(&mut self, place: &Place) -> Option<(&mut Pane, &Timeline)> {
+        if self.open_conversation() != Some(&place.conversation) {
+            return None;
+        }
+        let workspace = self.workspaces.get(place.conversation.workspace)?;
+        let id = &place.conversation.id;
+        match place.thread {
+            None => Some((&mut self.conversation_pane, workspace.timelines.get(id)?)),
+            Some(parent) if self.open_thread == Some(parent) => Some((
+                &mut self.thread_pane,
+                workspace.threads.get(&(id.clone(), parent))?,
+            )),
+            Some(_) => None,
         }
     }
 
@@ -4908,6 +5104,63 @@ mod tests {
         assert!(!keys(&mut app, "k").contains(&older));
         assert_eq!(keys(&mut app, "j"), [older], "as the first page said");
         assert!(keys(&mut app, "j").is_empty(), "on its way");
+    }
+
+    /// The mouse doing `kind` on the cell at `column` and `row`.
+    fn mouse(kind: MouseEventKind, column: u16, row: u16) -> Event {
+        Event::Terminal(TerminalEvent::Mouse(MouseEvent {
+            kind,
+            column,
+            row,
+            modifiers: KeyModifiers::NONE,
+        }))
+    }
+
+    #[test]
+    fn the_wheel_moves_through_activity_and_a_click_opens_an_item() {
+        let (mut app, _) = ready_app();
+        let items = vec![
+            activity_item("a", 9, "C1", 9, None, Happened::Dm),
+            activity_item("b", 8, "C2", 8, None, Happened::Dm),
+        ];
+        app.update(activity_page(items, Some("older")));
+        keys(&mut app, "g");
+        app.update(key(KeyCode::Enter));
+        app.update(activity_page(Vec::new(), Some("newer than the first")));
+        keys(&mut app, "\\");
+        let item = |key: &str| Target::ActivityItem(WorkspaceKey::nth(0), key.into());
+        app.update(Event::Drawn(Drawn {
+            targets: vec![
+                (Rect::new(30, 1, 50, 2), item("a")),
+                (Rect::new(30, 3, 50, 2), item("b")),
+            ],
+            ..Drawn::default()
+        }));
+        assert!(
+            app.update(mouse(MouseEventKind::Up(MouseButton::Left), 40, 1))
+                .is_empty()
+        );
+        assert_eq!(
+            app.focus,
+            Focus::Sidebar,
+            "only a press or the wheel counts"
+        );
+
+        let older = ask(Request::Activity {
+            cursor: Some(ActivityCursor("older".into())),
+        });
+        let commands = app.update(mouse(MouseEventKind::ScrollDown, 40, 1));
+        assert_eq!(commands, [older], "as `j` does");
+        assert_eq!((app.activity.selected(), app.focus), (1, Focus::Activity));
+        app.update(mouse(MouseEventKind::ScrollUp, 40, 4));
+        assert_eq!(app.activity.selected(), 0);
+
+        app.update(mouse(MouseEventKind::Down(MouseButton::Left), 79, 4));
+        assert_eq!(
+            (app.open_conversation(), app.focus),
+            (Some(&c("C2")), Focus::Timeline)
+        );
+        assert_eq!(app.conversation_pane.cursor(), Some(seconds(8)));
     }
 
     #[test]

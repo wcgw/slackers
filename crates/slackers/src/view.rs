@@ -23,7 +23,7 @@ use unicode_width::UnicodeWidthStr as _;
 use crate::activity::{Entry, Fetched};
 use crate::app::{
     App, Choice, ConversationRef, Details, Drawn, Focus, LinkKind, Mode, Opened, Phase, Place,
-    Suggested, Suggestions, WantedPicture, Workspace, WorkspaceKey,
+    Suggested, Suggestions, Target, WantedPicture, Workspace, WorkspaceKey,
 };
 use crate::draft::{Draft, Mentioned};
 use crate::emoji::Drawable;
@@ -128,18 +128,24 @@ fn draw_activity(frame: &mut Frame<'_>, area: Rect, app: &App, drawn: &mut Drawn
     let fit = (usize::from(body.height) / ACTIVITY_LINES).max(1);
     let first = (selected + 1).saturating_sub(fit);
     let mut lines = Vec::with_capacity(fit * ACTIVITY_LINES);
-    for entry in entries.iter().skip(first).take(fit) {
+    // The rows of the item shown `shown`-th, across the whole pane.
+    let rows_of = |shown: usize| {
+        let row = u16::try_from(shown * ACTIVITY_LINES).unwrap_or(u16::MAX);
+        Rect {
+            y: body.y.saturating_add(row),
+            height: u16::try_from(ACTIVITY_LINES).unwrap_or(1),
+            ..area
+        }
+        .intersection(area)
+    };
+    for (shown, entry) in entries.iter().skip(first).take(fit).enumerate() {
         lines.extend(activity_item(app, entry, body.width, &zone, now, drawn));
+        let target = Target::ActivityItem(entry.workspace, entry.item.key.clone());
+        drawn.targets.push((rows_of(shown), target));
     }
     frame.render_widget(Paragraph::new(lines), body);
     // Tint the selected item across the whole pane.
-    let row = u16::try_from((selected - first) * ACTIVITY_LINES).unwrap_or(u16::MAX);
-    let rows = Rect {
-        y: body.y.saturating_add(row),
-        height: u16::try_from(ACTIVITY_LINES).unwrap_or(1),
-        ..area
-    }
-    .intersection(area);
+    let rows = rows_of(selected - first);
     let tint = if app.focus == Focus::Activity {
         SELECTED
     } else {
@@ -338,6 +344,12 @@ fn draw_sidebar(frame: &mut Frame<'_>, area: Rect, app: &App, drawn: &mut Drawn)
     let height = usize::from(list.height);
     // Keep the cursor in view.
     let first_shown = |cursor: usize| (cursor + 1).saturating_sub(height);
+    // The `shown`-th row from the top.
+    let row_at = |shown: usize| Rect {
+        y: list.y + u16::try_from(shown).unwrap_or(u16::MAX),
+        height: 1,
+        ..list
+    };
     let lines: Vec<Line<'static>> = match &app.mode {
         Mode::Search(search) => search
             .hits
@@ -345,7 +357,10 @@ fn draw_sidebar(frame: &mut Frame<'_>, area: Rect, app: &App, drawn: &mut Drawn)
             .enumerate()
             .skip(first_shown(search.selected))
             .take(height)
-            .map(|(index, hit)| {
+            .enumerate()
+            .map(|(shown, (index, hit))| {
+                let target = Target::Hit(hit.conversation.clone());
+                drawn.targets.push((row_at(shown), target));
                 let line = conversation_row(
                     app,
                     &hit.conversation,
@@ -369,7 +384,11 @@ fn draw_sidebar(frame: &mut Frame<'_>, area: Rect, app: &App, drawn: &mut Drawn)
                 .enumerate()
                 .skip(first_shown(cursor))
                 .take(height)
-                .map(|(index, row)| {
+                .enumerate()
+                .map(|(shown, (index, row))| {
+                    drawn
+                        .targets
+                        .push((row_at(shown), Target::Row(row.clone())));
                     let (line, is_open) = match row {
                         Row::Activity => (
                             activity_row(app, list.width),
@@ -910,6 +929,8 @@ fn draw_pane(
     let mut visible = Vec::with_capacity(height);
     // The selected Message's rows, within `visible`.
     let mut selected_rows = 0..0;
+    // Each Message's rows, within `visible`.
+    let mut messages = Vec::new();
     let mut offset = 0;
     for block in rendered {
         let range = offset..offset + block.lines.len();
@@ -919,9 +940,13 @@ fn draw_pane(
         }
         drawn.wanted_pictures.extend(block.wanted);
         drawn.next_frame = earliest(drawn.next_frame, block.next_frame);
-        if block.ts.is_some() && block.ts == selected {
+        if let Some(ts) = block.ts {
             let message = (range.start + block.leading).max(start)..range.end.min(end);
-            selected_rows = message.start - start..message.end - start;
+            let rows = message.start - start..message.end - start;
+            if block.ts == selected {
+                selected_rows = rows.clone();
+            }
+            messages.push((ts, rows));
         }
         let skip = start.saturating_sub(range.start);
         let take = end.min(range.end) - range.start.max(start);
@@ -941,6 +966,21 @@ fn draw_pane(
         },
     );
     let row = |index: usize| top + u16::try_from(index).unwrap_or(u16::MAX);
+    // A Message is clicked across the whole pane, as it's tinted, but not on what comes before it, such as a day's
+    // rule.
+    for (ts, rows) in messages {
+        let rows = row(rows.start)..row(rows.end);
+        if !rows.is_empty() {
+            let area = Rect {
+                y: rows.start,
+                height: rows.end - rows.start,
+                ..area
+            };
+            drawn
+                .targets
+                .push((area, Target::Message(view.place.clone(), ts)));
+        }
+    }
     let selected_rows = row(selected_rows.start)..row(selected_rows.end);
     // Tint the selected Message as a block, across the whole pane, not just where its lines have text.
     if !selected_rows.is_empty() {
@@ -1097,6 +1137,13 @@ fn draw_details(
     let skip = (first_choice + details.selected + 1).saturating_sub(usize::from(inner.height));
     let shown: Vec<Line<'static>> = lines.into_iter().skip(skip).collect();
     frame.render_widget(Paragraph::new(shown), inner);
+    drawn.targets.push((popup, Target::Popup));
+    for (line, row) in (skip..).zip(inner.rows()) {
+        let choice = line.checked_sub(first_choice);
+        if let Some(index) = choice.filter(|&index| index < choices.len()) {
+            drawn.targets.push((row, Target::Choice(index)));
+        }
+    }
 }
 
 /// The row a popup `height` rows high, at most `area`'s, starts at in `area`: right above the rows of what it's
@@ -1231,6 +1278,11 @@ fn draw_suggestions(
         })
         .collect();
     frame.render_widget(Paragraph::new(lines), inner);
+    drawn.targets.push((list, Target::Popup));
+    let shown = (skip..suggestions.items.len()).zip(inner.rows());
+    drawn
+        .targets
+        .extend(shown.map(|(index, row)| (row, Target::Suggestion(index))));
     drawn.wanted_pictures.extend(renderer.wanted);
     drawn.next_frame = earliest(drawn.next_frame, renderer.next_frame);
 }
@@ -1989,14 +2041,17 @@ fn earliest(a: Option<Duration>, b: Option<Duration>) -> Option<Duration> {
 
 #[cfg(test)]
 mod tests {
-    use crossterm::event::{Event as TerminalEvent, KeyCode, KeyEvent, KeyModifiers};
+    use crossterm::event::{
+        Event as TerminalEvent, KeyCode, KeyEvent, KeyModifiers, MouseButton, MouseEvent,
+        MouseEventKind,
+    };
     use ratatui::Terminal;
     use ratatui::backend::TestBackend;
     use slackers_model::{ConversationId, Message, RichText, Ts, Unread, UserId, WorkspaceId};
-    use slackers_slack::{HistoryPage, Permalinks, Snapshot, Update};
+    use slackers_slack::{HistoryPage, Permalinks, Request, Snapshot, Update};
 
     use super::*;
-    use crate::app::Event;
+    use crate::app::{Command, Event};
     use crate::config::{ChannelRef, VirtualWorkspace};
 
     fn w(index: usize) -> WorkspaceKey {
@@ -2053,6 +2108,38 @@ mod tests {
             .map(|y| (0..width).map(|x| buffer[(x, y)].symbol()).collect())
             .collect();
         (rows, drawn, buffer)
+    }
+
+    /// Where `text` first shows on the screen, `rows`: its first cell's column and row.
+    fn cell_of(rows: &[String], text: &str) -> (u16, u16) {
+        let (column, row) = rows
+            .iter()
+            .enumerate()
+            .find_map(|(y, row)| row.find(text).map(|byte| (row[..byte].chars().count(), y)))
+            .unwrap_or_else(|| panic!("no {text:?} in {rows:#?}"));
+        (u16::try_from(column).unwrap(), u16::try_from(row).unwrap())
+    }
+
+    /// Draws `app` and tells it what the draw found, as the runtime does, then does `kind` with the mouse on the cell
+    /// at `(column, row)`. Returns what the app asks for.
+    fn mouse_at(app: &mut App, (column, row): (u16, u16), kind: MouseEventKind) -> Vec<Command> {
+        app.update(Event::Drawn(render(app).1));
+        app.update(Event::Terminal(TerminalEvent::Mouse(MouseEvent {
+            kind,
+            column,
+            row,
+            modifiers: KeyModifiers::NONE,
+        })))
+    }
+
+    /// Does `kind` with the mouse where `text` first shows, as [`mouse_at`] does.
+    fn mouse_on(app: &mut App, text: &str, kind: MouseEventKind) -> Vec<Command> {
+        let at = cell_of(&screen(app), text);
+        mouse_at(app, at, kind)
+    }
+
+    fn click_on(app: &mut App, text: &str) -> Vec<Command> {
+        mouse_on(app, text, MouseEventKind::Down(MouseButton::Left))
     }
 
     /// The one Message `reading_general` holds, by `U2`.
@@ -3566,5 +3653,177 @@ mod tests {
                 .iter()
                 .any(|row| row.contains("this message in Slack"))
         );
+    }
+
+    /// `reading_general`, with Messages saying `texts` after its own, a second apart.
+    fn reading_general_and(texts: &[&str]) -> App {
+        let mut app = reading_general();
+        let first = reading_general_message();
+        for (seconds, text) in (1..).zip(texts) {
+            let message = Message {
+                ts: Ts::from_micros(first.ts.as_micros() + seconds * 1_000_000),
+                content: RichText::plain(*text),
+                ..first.clone()
+            };
+            let posted = slackers_slack::LiveEvent::Posted {
+                conversation: ConversationId::new("C1"),
+                message,
+            };
+            app.update(Event::Slack(w(0), Update::Live(posted)));
+        }
+        app
+    }
+
+    #[test]
+    fn a_click_opens_a_row_of_the_sidebar_or_folds_its_section() {
+        let mut app = App::new(vec!["test".into()], Vec::new(), CELL);
+        let conversations = vec![channel("C1", "general"), channel("C2", "random")];
+        app.update(Event::Slack(w(0), ready("Test", None, conversations)));
+        assert!(click_on(&mut app, "random").contains(&Command::Slack(
+            w(0),
+            Request::History {
+                conversation: ConversationId::new("C2"),
+                before: None
+            }
+        )));
+        assert_eq!(
+            app.open_conversation().map(|open| open.id.as_str()),
+            Some("C2")
+        );
+        assert_eq!(app.focus, Focus::Timeline);
+
+        click_on(&mut app, "Activity");
+        assert_eq!(
+            (&app.opened, app.focus),
+            (&Some(Opened::Activity), Focus::Activity)
+        );
+        click_on(&mut app, "Test");
+        assert_eq!(app.focus, Focus::Sidebar);
+        assert!(
+            !screen(&app).iter().any(|row| row.contains("general")),
+            "folded"
+        );
+    }
+
+    #[test]
+    fn a_click_selects_a_message_and_another_on_it_opens_its_thread() {
+        let mut app = reading_general_and(&["a second later"]);
+        let first = reading_general_message().ts;
+        click_on(&mut app, "the only message");
+        assert_eq!(app.conversation_pane.cursor(), Some(first));
+        assert_eq!(app.open_thread, None, "only selected");
+
+        click_on(&mut app, "a second later");
+        assert_eq!(
+            app.conversation_pane.cursor(),
+            None,
+            "the newest, which keeps following what's new"
+        );
+        let newest = Ts::from_micros(first.as_micros() + 1_000_000);
+        assert!(
+            click_on(&mut app, "a second later").contains(&Command::Slack(
+                w(0),
+                Request::Replies {
+                    conversation: ConversationId::new("C1"),
+                    parent: newest
+                }
+            ))
+        );
+        assert_eq!((app.open_thread, app.focus), (Some(newest), Focus::Thread));
+    }
+
+    #[test]
+    fn the_wheel_scrolls_the_messages_under_it_whatever_has_focus() {
+        let texts: Vec<String> = (1..=20).map(|n| format!("number {n}")).collect();
+        let texts: Vec<&str> = texts.iter().map(String::as_str).collect();
+        let mut app = reading_general_and(&texts);
+        press(&mut app, KeyCode::Char('\\'), KeyModifiers::NONE);
+        assert!(screen(&app).iter().any(|row| row.contains("number 20")));
+
+        mouse_on(&mut app, "number 20", MouseEventKind::ScrollUp);
+        let rows = screen(&app);
+        assert!(
+            !rows.iter().any(|row| row.contains("number 20"))
+                && rows.iter().any(|row| row.contains("number 17")),
+            "three lines up: {rows:#?}"
+        );
+        assert_eq!(app.focus, Focus::Sidebar, "it scrolled without focus");
+        mouse_on(&mut app, "number 17", MouseEventKind::ScrollDown);
+        assert!(screen(&app).iter().any(|row| row.contains("number 20")));
+    }
+
+    #[test]
+    fn a_click_picks_a_suggestion_and_one_elsewhere_stops_writing_but_keeps_the_draft() {
+        let mut app = reading_general();
+        type_text(&mut app, "i@");
+        mouse_on(&mut app, "here", MouseEventKind::ScrollDown);
+        assert_eq!(app.suggestions.as_ref().map(|s| s.selected), Some(1));
+        click_on(&mut app, "channel");
+        let place = app.writing_place().unwrap();
+        assert_eq!(app.drafts[&place].text(), "@channel ");
+        assert_eq!(
+            (&app.mode, &app.suggestions),
+            (&Mode::Insert, &None),
+            "still writing"
+        );
+
+        click_on(&mut app, "the only message");
+        assert_eq!(app.mode, Mode::Normal);
+        assert_eq!(app.drafts[&place].text(), "@channel ");
+    }
+
+    #[test]
+    fn a_click_takes_a_choice_in_a_messages_details_and_one_outside_them_closes_them() {
+        let mut app = reading_general();
+        let message = Message {
+            content: RichText {
+                blocks: vec![TextBlock::Paragraph(vec![Inline::Link {
+                    url: "https://docs.rs/ratatui/latest".into(),
+                    label: Some("the docs".into()),
+                }])],
+            },
+            ..reading_general_message()
+        };
+        let edited = slackers_slack::LiveEvent::Edited {
+            conversation: ConversationId::new("C1"),
+            message,
+        };
+        app.update(Event::Slack(w(0), Update::Live(edited)));
+        type_text(&mut app, "K");
+
+        assert!(mouse_on(&mut app, "the docs", MouseEventKind::ScrollDown).is_empty());
+        let Mode::Details(details) = &app.mode else {
+            panic!("{:?}", app.mode);
+        };
+        assert_eq!(details.selected, 1, "the wheel moves through them");
+        let commands = click_on(&mut app, "the docs");
+        assert_eq!(
+            commands,
+            [Command::Open("https://docs.rs/ratatui/latest".into())]
+        );
+        let Mode::Details(details) = &app.mode else {
+            panic!("there's another choice left: {:?}", app.mode);
+        };
+        assert_eq!(details.selected, 0);
+
+        // The border is the popup's too.
+        let rows = screen(&app);
+        let border = rows.iter().position(|row| row.contains('┌')).unwrap();
+        mouse_at(
+            &mut app,
+            (40, u16::try_from(border).unwrap()),
+            MouseEventKind::Down(MouseButton::Left),
+        );
+        assert!(matches!(app.mode, Mode::Details(_)));
+        let message = rows
+            .iter()
+            .rposition(|row| row.contains("the docs"))
+            .unwrap();
+        mouse_at(
+            &mut app,
+            (40, u16::try_from(message).unwrap()),
+            MouseEventKind::Down(MouseButton::Left),
+        );
+        assert_eq!(app.mode, Mode::Normal);
     }
 }

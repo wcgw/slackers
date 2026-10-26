@@ -39,8 +39,8 @@ use base64::Engine as _;
 use base64::engine::general_purpose::STANDARD as BASE64;
 use crossterm::cursor::{Hide, Show};
 use crossterm::event::{
-    DisableFocusChange, EnableFocusChange, EventStream, KeyboardEnhancementFlags,
-    PopKeyboardEnhancementFlags, PushKeyboardEnhancementFlags,
+    DisableFocusChange, DisableMouseCapture, EnableFocusChange, EventStream,
+    KeyboardEnhancementFlags, PopKeyboardEnhancementFlags, PushKeyboardEnhancementFlags,
 };
 use crossterm::execute;
 use crossterm::terminal::{
@@ -98,20 +98,34 @@ fn main() -> Result<()> {
 }
 
 /// Turns on (or off) what slackers needs beyond ratatui's defaults: focus reports, so that Messages count as read
-/// only while the window has focus, and the kitty keyboard protocol, so that Shift+Enter differs from Enter.
+/// only while the window has focus; the kitty keyboard protocol, so that Shift+Enter differs from Enter; and mouse
+/// reports, so that clicks and the wheel act on what they're over.
 fn terminal_extras(on: bool) -> io::Result<()> {
     if on {
         execute!(
             io::stdout(),
             EnableFocusChange,
-            PushKeyboardEnhancementFlags(KeyboardEnhancementFlags::DISAMBIGUATE_ESCAPE_CODES)
+            PushKeyboardEnhancementFlags(KeyboardEnhancementFlags::DISAMBIGUATE_ESCAPE_CODES),
+            EnableMouseButtons
         )
     } else {
         execute!(
             io::stdout(),
+            DisableMouseCapture,
             PopKeyboardEnhancementFlags,
             DisableFocusChange
         )
+    }
+}
+
+/// Asks the terminal to report mouse buttons and the wheel, in SGR's encoding. Unlike crossterm's
+/// `EnableMouseCapture`, it doesn't ask for the mouse's every move: each report wakes the loop, which then draws
+/// again. crossterm's `DisableMouseCapture` turns it off.
+struct EnableMouseButtons;
+
+impl crossterm::Command for EnableMouseButtons {
+    fn write_ansi(&self, f: &mut impl std::fmt::Write) -> std::fmt::Result {
+        f.write_str("\x1b[?1000h\x1b[?1006h")
     }
 }
 
@@ -321,6 +335,7 @@ impl Effects {
         let path = std::env::temp_dir().join(format!("slackers-draft-{}.md", std::process::id()));
         execute!(
             io::stdout(),
+            DisableMouseCapture,
             PopKeyboardEnhancementFlags,
             DisableFocusChange,
             LeaveAlternateScreen,

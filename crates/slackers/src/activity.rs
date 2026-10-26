@@ -206,6 +206,19 @@ impl Activity {
             .map(|entry| (entry.workspace, entry.item.key.clone()));
     }
 
+    /// Selects the item with `key` from the Workspace at `workspace`, if it's among the
+    /// [entries](Activity::entries). Returns whether it is.
+    pub(crate) fn select(&mut self, workspace: WorkspaceKey, key: &str) -> bool {
+        let listed = self
+            .entries()
+            .iter()
+            .any(|entry| entry.workspace == workspace && entry.item.key == key);
+        if listed {
+            self.selected = Some((workspace, key.to_owned()));
+        }
+        listed
+    }
+
     /// Selects the newest item.
     pub(crate) fn select_newest(&mut self) {
         self.selected = None;
