@@ -235,6 +235,9 @@ impl Api {
             ("channel", conversation.as_str()),
             ("ts", ts.as_str()),
             ("text", text.as_str()),
+            // Unlike chat.postMessage, chat.update otherwise reads the text as typed, showing `<…>` as is: no links,
+            // no mentions.
+            ("parse", "none"),
         ];
         let updated: Updated = self.call("chat.update", &params).await?;
         Ok(updated.into_content())

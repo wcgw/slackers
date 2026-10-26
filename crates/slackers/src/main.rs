@@ -17,6 +17,7 @@ mod draft;
 mod emoji;
 mod icons;
 mod layout;
+mod markdown;
 mod pane;
 mod pictures;
 mod search;

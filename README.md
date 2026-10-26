@@ -110,6 +110,10 @@ They work as in vim. The status line shows the ones that apply where you are.
 | Writing | `Enter` send · `Alt-Enter` new line · `@`, `:` and `/` complete people, emoji and commands · `↑` edit your last · `Ctrl-x Ctrl-e` `$EDITOR` · `Esc` stop |
 | Details (`K`) | `j`/`k` choose · `Enter` or `1`-`9` press or open · `y` copy · `Esc` close |
 
+Drafts are written in Markdown: `**bold**`, `_italic_`, `~~strike~~`, `` `code` ``, code blocks, `> quotes`,
+headings and `[links](https://…)` post as Slack shows them, and editing a Message brings it back in Markdown. `*bold*`
+stays bold, as in Slack. Headings post as bold lines, and code blocks lose their language: Slack has neither.
+
 A Draft starting with `/` runs that slash command, as in Slack: start it with a space to post it as text. When a
 command posts for you elsewhere, as `/dm @someone hi` does, slackers follows it there.
 

@@ -46,7 +46,7 @@ use crossterm::event::{Event as TerminalEvent, KeyCode, KeyEvent, KeyEventKind, 
 use slackers_gfx::{CellSize, Fit, Picture};
 use slackers_model::{
     Author, Block, BotId, Broadcast, Button, Conversation, ConversationId, ConversationKind, Emoji,
-    Happened, Inline, Message, MessageRef, Presence, ReactionChange, RichText, Style, Timeline, Ts,
+    Happened, Inline, Message, MessageRef, Presence, ReactionChange, RichText, Timeline, Ts,
     Unread, UserId,
 };
 use slackers_slack::{
@@ -58,6 +58,7 @@ use crate::activity::{Activity, Fetched};
 use crate::config::{ChannelRef, VirtualWorkspace};
 use crate::draft::{Completing, Draft, Mentioned, Reference, Written};
 use crate::emoji::Emojis;
+use crate::markdown;
 use crate::pane::{Pane, Settled};
 use crate::pictures::Pictures;
 use crate::search::{self, Finder};
@@ -2987,9 +2988,8 @@ impl Workspace {
         }
     }
 
-    /// A Draft at `place` holding `content` as one would write it: styles as `mrkdwn` markers, emoji by name, and
-    /// people, broadcasts, user groups, Channels and labelled links as labels standing for them. Images and buttons
-    /// go: they aren't text.
+    /// A Draft at `place` holding `content` as one would write it: in Markdown, emoji by name, and people,
+    /// broadcasts, user groups and Channels as labels standing for them. Images and buttons go: they aren't text.
     fn draft_of(&self, place: &Place, content: &RichText) -> Draft {
         let mut draft = Draft::new(place);
         for (index, block) in content.blocks.iter().enumerate() {
@@ -3028,7 +3028,7 @@ impl Workspace {
         for inline in inlines {
             match inline {
                 Inline::Text { text, style } => {
-                    let styled = styled(text, *style);
+                    let styled = markdown::styled(text, *style);
                     draft.push_text(&styled.replace('\n', &format!("\n{line_start}")));
                 }
                 Inline::Emoji(emoji) => {
@@ -3063,12 +3063,9 @@ impl Workspace {
                         .map_or(id.as_str(), |found| found.name.as_str());
                     draft.push_reference(&format!("#{name}"), Reference::Channel(id.clone()));
                 }
-                Inline::Link { url, label } => match label {
-                    Some(label) if !label.is_empty() && label != url => {
-                        draft.push_reference(label, Reference::Link(url.clone()));
-                    }
-                    _ => draft.push_text(url),
-                },
+                Inline::Link { url, label } => {
+                    draft.push_text(&markdown::link(url, label.as_deref()));
+                }
             }
         }
     }
@@ -3414,32 +3411,6 @@ fn people_in(message: &Message) -> Vec<UserId> {
     author.into_iter().chain(mentioned).collect()
 }
 
-/// `text` in `style`, as `mrkdwn` writes it: between `*` for bold, `_` for italic, `~` for strikethrough and `` ` ``
-/// for code. Spaces at either end stay outside the markers, which only count against words.
-fn styled(text: &str, style: Style) -> String {
-    let markers: String = [
-        (Style::BOLD, '*'),
-        (Style::ITALIC, '_'),
-        (Style::STRIKE, '~'),
-        (Style::CODE, '`'),
-    ]
-    .into_iter()
-    .filter(|(marker, _)| style.contains(*marker))
-    .map(|(_, mark)| mark)
-    .collect();
-    let words = text.trim();
-    if markers.is_empty() || words.is_empty() {
-        return text.to_owned();
-    }
-    let (start, end) = (text.len() - text.trim_start().len(), text.trim_end().len());
-    let closing: String = markers.chars().rev().collect();
-    format!(
-        "{}{markers}{words}{closing}{}",
-        &text[..start],
-        &text[end..]
-    )
-}
-
 /// A Slack error, as the status bar puts it.
 fn describe(error: &Error) -> String {
     match error {
@@ -3452,7 +3423,7 @@ fn describe(error: &Error) -> String {
 
 #[cfg(test)]
 mod tests {
-    use slackers_model::{ActivityItem, Emoji, MentionOf, RichText, WorkspaceId};
+    use slackers_model::{ActivityItem, Emoji, MentionOf, RichText, Style, WorkspaceId};
     use slackers_slack::{ActivityCursor, ActivityPage, HistoryPage, Part};
 
     use super::*;
@@ -5529,8 +5500,8 @@ mod tests {
         assert!(app.is_editing(&place));
         assert_eq!(
             app.drafts[&place].text(),
-            "fix *this* :+1::skin-tone-2: @Ana in #general see the docs or https://x.org\n\
-             > quoted\n> more\n```\nlet x = 1;\n```\n• a\n• b"
+            "fix **this** :+1::skin-tone-2: @Ana in #general see [the docs](https://x.org/docs) or \
+             https://x.org\n> quoted\n> more\n```\nlet x = 1;\n```\n• a\n• b"
         );
 
         keys(&mut app, "!");
@@ -5548,9 +5519,12 @@ mod tests {
                     url: "https://x.org/docs".into(),
                     label: "the docs".into(),
                 },
-                Part::Text(
-                    " or https://x.org\n> quoted\n> more\n```\nlet x = 1;\n```\n• a\n• b!".into(),
-                ),
+                Part::Text(" or ".into()),
+                Part::Link {
+                    url: "https://x.org".into(),
+                    label: "https://x.org".into(),
+                },
+                Part::Text("\n> quoted\n> more\n```\nlet x = 1;\n```\n• a\n• b!".into()),
             ],
         };
         assert_eq!(commands, [ask(edit)]);
@@ -5571,20 +5545,6 @@ mod tests {
             (&edited.content, edited.edited),
             (&RichText::plain("fixed"), true)
         );
-    }
-
-    #[test]
-    fn styles_write_as_markers_around_the_words_only() {
-        assert_eq!(styled("plain ", Style::PLAIN), "plain ");
-        assert_eq!(styled(" bold ", Style::BOLD), " *bold* ");
-        assert_eq!(
-            styled(
-                "all of it",
-                Style::BOLD | Style::ITALIC | Style::STRIKE | Style::CODE
-            ),
-            "*_~`all of it`~_*"
-        );
-        assert_eq!(styled("  ", Style::BOLD), "  ", "no words, no markers");
     }
 
     #[test]

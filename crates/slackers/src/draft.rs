@@ -11,8 +11,10 @@ use slackers_model::{Broadcast, ConversationId, UserId};
 use slackers_slack::Part;
 
 use crate::app::Place;
+use crate::markdown;
 
-/// The text written for one Place, and the references picked while writing it, or held by the Message it edits.
+/// The text written for one Place, in Markdown, and the references picked while writing it, or held by the Message
+/// it edits.
 ///
 /// A reference is written as its label, such as `@Ada Lovelace` for an @-mention or `#general` for a Channel, and is
 /// posted as the real thing for as long as that label stays whole in the text. Anything else that looks like one,
@@ -51,14 +53,12 @@ pub(crate) enum Reference {
     Mention(Mentioned),
     /// A link to a Channel.
     Channel(ConversationId),
-    /// A link to this URL, shown as the label.
-    Link(String),
 }
 
 /// A reference picked for a Draft.
 #[derive(Clone, Debug, PartialEq, Eq)]
 struct Picked {
-    /// How it's written: `@` and a name for an @-mention, `#` and a name for a Channel, a link's label.
+    /// How it's written: `@` and a name for an @-mention, `#` and a name for a Channel.
     label: String,
     reference: Reference,
 }
@@ -310,27 +310,32 @@ impl Written {
         Some((command, parts))
     }
 
-    /// Its text, with what each picked label stands for in its place.
+    /// What it posts as: its Markdown in Slack's markup, as [`markdown::to_slack`] has it, with what each picked label
+    /// stands for in its place.
     pub(crate) fn parts(&self) -> Vec<Part> {
-        split(&self.text, &self.picked)
+        markdown::to_slack(&self.text)
             .into_iter()
-            .map(|part| match part {
+            .flat_map(|part| match part {
+                Part::Text(text) => self.referenced(&text),
+                other => vec![other],
+            })
+            .collect()
+    }
+
+    /// `text`, a piece of its text, with what each picked label in it stands for in its place.
+    fn referenced(&self, text: &str) -> Vec<Part> {
+        split(text, &self.picked)
+            .into_iter()
+            .map(|piece| match piece {
                 Split::Text(text) => Part::Text(text.to_owned()),
-                Split::Picked(index) => {
-                    let picked = &self.picked[index];
-                    match &picked.reference {
-                        Reference::Mention(Mentioned::Person(id)) => Part::User(id.clone()),
-                        Reference::Mention(Mentioned::Broadcast(broadcast)) => {
-                            Part::Broadcast(*broadcast)
-                        }
-                        Reference::Mention(Mentioned::UserGroup(id)) => Part::UserGroup(id.clone()),
-                        Reference::Channel(id) => Part::Channel(id.clone()),
-                        Reference::Link(url) => Part::Link {
-                            url: url.clone(),
-                            label: picked.label.clone(),
-                        },
+                Split::Picked(index) => match &self.picked[index].reference {
+                    Reference::Mention(Mentioned::Person(id)) => Part::User(id.clone()),
+                    Reference::Mention(Mentioned::Broadcast(broadcast)) => {
+                        Part::Broadcast(*broadcast)
                     }
-                }
+                    Reference::Mention(Mentioned::UserGroup(id)) => Part::UserGroup(id.clone()),
+                    Reference::Channel(id) => Part::Channel(id.clone()),
+                },
             })
             .collect()
     }
@@ -569,25 +574,19 @@ mod tests {
     }
 
     #[test]
-    fn channels_groups_and_labelled_links_post_as_what_their_labels_stand_for() {
+    fn channels_and_groups_post_as_what_their_labels_stand_for() {
         let mut draft = draft("");
         draft.push_text("see ");
         draft.push_reference("#general", Reference::Channel(ConversationId::new("C1")));
-        draft.push_text(" (");
-        let docs = Reference::Link("https://example.com/docs".into());
-        draft.push_reference("the docs", docs.clone());
-        draft.push_text("), ");
+        draft.push_text(", ");
         let group = Reference::Mention(Mentioned::UserGroup("S1".into()));
         draft.push_reference("@group", group);
         draft.push_text(" and ");
-        draft.push_reference(
-            "the docs",
-            Reference::Link("https://example.com/other".into()),
-        );
+        draft.push_reference("#general", Reference::Channel(ConversationId::new("C2")));
         assert_eq!(
             draft.text(),
-            "see #general (the docs), @group and the docs (2)",
-            "another link by the same label is told apart"
+            "see #general, @group and #general (2)",
+            "another Channel by the same name is told apart"
         );
         assert_eq!(
             draft.mentions().collect::<Vec<_>>(),
@@ -599,18 +598,32 @@ mod tests {
             [
                 text("see "),
                 Part::Channel(ConversationId::new("C1")),
-                text(" ("),
-                Part::Link {
-                    url: "https://example.com/docs".into(),
-                    label: "the docs".into()
-                },
-                text("), "),
+                text(", "),
                 Part::UserGroup("S1".into()),
                 text(" and "),
+                Part::Channel(ConversationId::new("C2")),
+            ]
+        );
+    }
+
+    #[test]
+    fn its_markdown_posts_as_slacks_markup_around_the_labels() {
+        let mut draft = draft("# For @");
+        draft.pick(person("U1"), "Ada");
+        draft.push_text("\n**see [the docs](https://a.com), @Ada**");
+        assert_eq!(
+            sent(&mut draft),
+            [
+                text("*For "),
+                Part::User(UserId::new("U1")),
+                text("*\n*see "),
                 Part::Link {
-                    url: "https://example.com/other".into(),
-                    label: "the docs (2)".into()
+                    url: "https://a.com".into(),
+                    label: "the docs".into()
                 },
+                text(", "),
+                Part::User(UserId::new("U1")),
+                text("*"),
             ]
         );
     }

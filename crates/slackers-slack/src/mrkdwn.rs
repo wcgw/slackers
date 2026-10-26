@@ -203,6 +203,11 @@ pub(crate) fn write(parts: &[Part]) -> String {
             Part::UserGroup(id) => written.push_str(&format!("<!subteam^{id}>")),
             Part::Channel(id) => written.push_str(&format!("<#{id}>")),
             Part::Link { url, label } => {
+                // Encoded as in any URL, `|`, `<` and `>` can't end the link early.
+                let url = url
+                    .replace('|', "%7C")
+                    .replace('<', "%3C")
+                    .replace('>', "%3E");
                 written.push_str(&format!("<{url}|{}>", escape(label)));
             }
         }
@@ -356,6 +361,21 @@ mod tests {
                 text(" "),
                 link,
             ]
+        );
+    }
+
+    #[test]
+    fn a_written_links_url_cant_end_it_early() {
+        let parts = [Part::Link {
+            url: "https://example.com/a|b>c<d".into(),
+            label: "x".into(),
+        }];
+        assert_eq!(
+            paragraph(&write(&parts)),
+            [Inline::Link {
+                url: "https://example.com/a%7Cb%3Ec%3Cd".into(),
+                label: Some("x".into()),
+            }]
         );
     }
 
