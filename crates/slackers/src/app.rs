@@ -130,7 +130,10 @@ pub(crate) struct Drawn {
     /// The pictures it showed, and those it would have shown had they been loaded: all of them should be in the
     /// terminal.
     pub(crate) wanted_pictures: Vec<WantedPicture>,
-    /// When something drawn next changes frame, as animation time; `None` when nothing animates.
+    /// When a picture drawn next changes frame, as animation time; `None` when none animates.
+    pub(crate) next_frame: Option<Duration>,
+    /// When something else drawn next changes, such as a notice running out, as animation time; `None` when nothing
+    /// will.
     pub(crate) next_change: Option<Duration>,
     /// The Messages it would have shown for Activity items, had they been loaded, by Workspace and where they are.
     pub(crate) wanted_messages: Vec<(WorkspaceKey, MessageRef)>,
@@ -656,8 +659,8 @@ pub(crate) struct App {
     next_post: u64,
     /// The start of a two-key command, if the last key was one.
     pending: Option<Prefix>,
-    /// Whether the terminal window has focus. Messages count as read only while it does, and notifications show only
-    /// while it doesn't.
+    /// Whether the terminal window has focus. Messages count as read only while it does, pictures animate only while
+    /// it does, and notifications show only while it doesn't.
     focused: bool,
     /// Messages to notify of once the names of everyone in them are known, by Workspace and Conversation, oldest
     /// first; at most [`HELD_NOTIFICATIONS`].
@@ -667,7 +670,9 @@ pub(crate) struct App {
     /// Whether the open Thread's pane was on screen at the last draw.
     thread_shown: bool,
     finder: Finder,
-    /// When something drawn next changes frame, as animation time.
+    /// When a picture drawn next changes frame, as animation time.
+    next_frame: Option<Duration>,
+    /// When something else drawn next changes, as animation time.
     next_change: Option<Duration>,
     /// When animations started; every picture is drawn against it, so copies of one emoji animate in step.
     epoch: Instant,
@@ -720,6 +725,7 @@ impl App {
             conversation_shown: false,
             thread_shown: false,
             finder: Finder::new(),
+            next_frame: None,
             next_change: None,
             epoch: Instant::now(),
         };
@@ -750,9 +756,11 @@ impl App {
         });
     }
 
-    /// When the screen next needs redrawing for animation alone, as animation time.
+    /// When the screen next needs redrawing for time passing alone, as animation time. Pictures don't animate while
+    /// the terminal window doesn't have focus, sparing the redraws: they hold whichever frame the last draw showed.
     pub(crate) fn next_change(&self) -> Option<Duration> {
-        self.next_change
+        let next_frame = self.next_frame.filter(|_| self.focused);
+        [self.next_change, next_frame].into_iter().flatten().min()
     }
 
     /// The open Conversation, if one is.
@@ -823,6 +831,7 @@ impl App {
                 if !evicted.is_empty() {
                     commands.push(Command::Forget(evicted));
                 }
+                self.next_frame = drawn.next_frame;
                 self.next_change = drawn.next_change;
                 self.conversation_shown = drawn.conversation.is_some();
                 self.thread_shown = drawn.thread.is_some();
@@ -6307,6 +6316,33 @@ mod tests {
             .collect();
         assert_eq!(bodies.len(), HELD_NOTIFICATIONS);
         assert_eq!((bodies[0], bodies[19]), ("6", "25"), "the oldest went");
+    }
+
+    #[test]
+    fn pictures_animate_only_while_the_window_has_focus() {
+        let (mut app, _) = ready_app();
+        let (frame, notice_over) = (Duration::from_secs(1), Duration::from_secs(2));
+        let drawn = || {
+            Event::Drawn(Drawn {
+                next_frame: Some(frame),
+                next_change: Some(notice_over),
+                ..Drawn::default()
+            })
+        };
+        app.update(drawn());
+        assert_eq!(app.next_change(), Some(frame));
+
+        app.update(Event::Terminal(TerminalEvent::FocusLost));
+        app.update(drawn());
+        assert_eq!(
+            app.next_change(),
+            Some(notice_over),
+            "the notice still runs out"
+        );
+
+        app.update(Event::Terminal(TerminalEvent::FocusGained));
+        app.update(drawn());
+        assert_eq!(app.next_change(), Some(frame));
     }
 
     #[test]

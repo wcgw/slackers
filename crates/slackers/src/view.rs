@@ -249,7 +249,7 @@ fn activity_item(
     let room = usize::from(width).saturating_sub(ACTIVITY_LEAD);
     second.extend(cut(&gist.content, gist.style.patch(DIM), room));
     drawn.wanted_pictures.extend(renderer.wanted);
-    drawn.next_change = earliest(drawn.next_change, renderer.next_change);
+    drawn.next_frame = earliest(drawn.next_frame, renderer.next_frame);
     [Line::from(first), Line::from(second)]
 }
 
@@ -690,7 +690,7 @@ fn workspace_marker(
     match app.pictures.state(url) {
         PictureState::Ready(picture) => {
             let now = app.animation_time();
-            drawn.next_change = earliest(drawn.next_change, picture.next_change(now));
+            drawn.next_frame = earliest(drawn.next_frame, picture.next_change(now));
             picture.row(0, now)
         }
         PictureState::Awaiting | PictureState::Failed => fallback,
@@ -826,7 +826,7 @@ struct Rendered {
     /// Pictures it would show, had they been loaded.
     wanted: Vec<WantedPicture>,
     /// When one of its pictures next changes frame, as animation time.
-    next_change: Option<Duration>,
+    next_frame: Option<Duration>,
 }
 
 /// Draws a pane of Messages, its title and its draft, and returns where it settled; `None` while its Messages load.
@@ -918,7 +918,7 @@ fn draw_pane(
             continue;
         }
         drawn.wanted_pictures.extend(block.wanted);
-        drawn.next_change = earliest(drawn.next_change, block.next_change);
+        drawn.next_frame = earliest(drawn.next_frame, block.next_frame);
         if block.ts.is_some() && block.ts == selected {
             let message = (range.start + block.leading).max(start)..range.end.min(end);
             selected_rows = message.start - start..message.end - start;
@@ -1079,7 +1079,7 @@ fn draw_details(
         });
     }
     drawn.wanted_pictures.extend(renderer.wanted);
-    drawn.next_change = earliest(drawn.next_change, renderer.next_change);
+    drawn.next_frame = earliest(drawn.next_frame, renderer.next_frame);
 
     let rows = u16::try_from(lines.len()).unwrap_or(u16::MAX);
     let height = rows.saturating_add(2).min(area.height);
@@ -1232,7 +1232,7 @@ fn draw_suggestions(
         .collect();
     frame.render_widget(Paragraph::new(lines), inner);
     drawn.wanted_pictures.extend(renderer.wanted);
-    drawn.next_change = earliest(drawn.next_change, renderer.next_change);
+    drawn.next_frame = earliest(drawn.next_frame, renderer.next_frame);
 }
 
 /// Lays out `timeline`'s Messages for `place`, `width` cells wide, followed by those still being sent there. A
@@ -1292,7 +1292,7 @@ fn lay_out(
             lines,
             leading,
             wanted: renderer.wanted,
-            next_change: renderer.next_change,
+            next_frame: renderer.next_frame,
         });
         previous = Some(message);
     }
@@ -1303,7 +1303,7 @@ fn lay_out(
             lines: vec![hint],
             leading: 0,
             wanted: Vec::new(),
-            next_change: None,
+            next_frame: None,
         });
     }
     // Messages on their way follow, dimmed, under the user's name.
@@ -1319,7 +1319,7 @@ fn lay_out(
             lines,
             leading: 0,
             wanted: renderer.wanted,
-            next_change: renderer.next_change,
+            next_frame: renderer.next_frame,
         });
     }
     rendered
@@ -1382,7 +1382,7 @@ struct Renderer<'a> {
     /// Pictures it would show, had they been loaded.
     wanted: Vec<WantedPicture>,
     /// When one of its pictures next changes frame, as animation time.
-    next_change: Option<Duration>,
+    next_frame: Option<Duration>,
     now: Duration,
     /// Whether it lays out a Thread, whose pane counts the Replies itself.
     in_thread: bool,
@@ -1404,7 +1404,7 @@ impl<'a> Renderer<'a> {
             width: width.saturating_sub(GUTTER),
             zone,
             wanted: Vec::new(),
-            next_change: None,
+            next_frame: None,
             now: app.animation_time(),
             in_thread: false,
         }
@@ -1514,7 +1514,7 @@ impl<'a> Renderer<'a> {
         self.want(url, Fit::Emoji);
         match self.app.pictures.state(url) {
             PictureState::Ready(picture) => {
-                self.next_change = earliest(self.next_change, picture.next_change(self.now));
+                self.next_frame = earliest(self.next_frame, picture.next_change(self.now));
                 picture.row(0, self.now)
             }
             PictureState::Awaiting | PictureState::Failed => fallback,
@@ -1536,7 +1536,7 @@ impl<'a> Renderer<'a> {
         self.want(&image.url, Fit::Within(IMAGE));
         match self.app.pictures.state(&image.url) {
             PictureState::Ready(picture) => {
-                self.next_change = earliest(self.next_change, picture.next_change(self.now));
+                self.next_frame = earliest(self.next_frame, picture.next_change(self.now));
                 let rows =
                     (0..picture.cells().rows).map(|row| Line::from(picture.row(row, self.now)));
                 Some(rows.collect())
@@ -1717,8 +1717,7 @@ impl<'a> Renderer<'a> {
                 self.want(url, Fit::Emoji);
                 match loaded {
                     Some(picture) => {
-                        self.next_change =
-                            earliest(self.next_change, picture.next_change(self.now));
+                        self.next_frame = earliest(self.next_frame, picture.next_change(self.now));
                         Piece::Atom(picture.row(0, self.now), picture.cells().cols)
                     }
                     None => Piece::Text(format!(":{}:", emoji.name), DIM),
@@ -2688,6 +2687,25 @@ mod tests {
             "{rows:#?}"
         );
         assert!(drawn.wanted_pictures.contains(&icon), "to keep");
+    }
+
+    #[test]
+    fn an_animated_picture_asks_for_its_next_frame() {
+        let mut app = App::new(vec!["test".into()], Vec::new(), CELL);
+        let snapshot = ready(
+            "Test",
+            Some("https://i/test.gif"),
+            vec![channel("C1", "general")],
+        );
+        app.update(Event::Slack(w(0), snapshot));
+        let picture = slackers_gfx::Picture::for_tests(&slackers_gfx::Ids::default(), 2, 4);
+        app.update(Event::PictureReady {
+            url: "https://i/test.gif".into(),
+            picture,
+        });
+        let (_, drawn) = render(&app);
+        assert!(drawn.next_frame.is_some(), "{drawn:?}");
+        assert_eq!(drawn.next_change, None, "nothing else changes");
     }
 
     #[test]
