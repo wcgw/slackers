@@ -98,6 +98,11 @@ takes it out; slackers rewrites the file, keeping its comments and layout.
 
 Logs go to `~/.local/state/slackers/slackers.log` (or under `$XDG_STATE_HOME`).
 
+`slackers --debug` helps when signing in keeps failing: a Workspace that couldn't be signed in to shows, under the
+reason, the token and cookies that were tried, so you can tell a stale cookie from a mistyped one. It also logs the
+`d` cookie (and `d-s`, when there is one), and logs down to `debug`. Those grant full access to your Slack account:
+only run it where nobody else can see the screen, and mind what you share of the log afterwards.
+
 ## Keys
 
 They work as in vim. The status line shows the ones that apply where you are.

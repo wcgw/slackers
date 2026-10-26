@@ -100,6 +100,11 @@ pub(crate) enum Event {
         workspace: WorkspaceKey,
         reason: String,
     },
+    /// What signing in to `workspace` is using, in the clear, to show should it fail. Only `--debug` sends it.
+    SigningInWith {
+        workspace: WorkspaceKey,
+        credentials: String,
+    },
     /// A picture finished loading and is in the terminal.
     PictureReady {
         url: String,
@@ -421,6 +426,9 @@ pub(crate) struct SignIn {
     /// What the config and the keyring call it.
     pub(crate) label: String,
     pub(crate) phase: Phase,
+    /// The credentials signing in used, in the clear, to show on screen should it fail; `None` unless `--debug`
+    /// asked for them, or they couldn't be read in the first place.
+    pub(crate) credentials: Option<String>,
 }
 
 /// Where signing in to a Workspace stands.
@@ -464,6 +472,13 @@ impl Workspaces {
     fn set_phase(&mut self, key: WorkspaceKey, phase: Phase) {
         if let Some(sign_in) = self.0.get_mut(key.0) {
             sign_in.phase = phase;
+        }
+    }
+
+    /// Keeps what `key` is signing in with, for [`SignIn::credentials`] to show should it fail.
+    fn set_credentials(&mut self, key: WorkspaceKey, credentials: String) {
+        if let Some(sign_in) = self.0.get_mut(key.0) {
+            sign_in.credentials = Some(credentials);
         }
     }
 
@@ -686,6 +701,7 @@ impl App {
             .map(|label| SignIn {
                 label,
                 phase: Phase::SigningIn,
+                credentials: None,
             })
             .collect();
         let mut app = Self {
@@ -787,6 +803,10 @@ impl App {
             Event::CantSignIn { workspace, reason } => {
                 self.workspaces.set_phase(workspace, Phase::Failed(reason));
             }
+            Event::SigningInWith {
+                workspace,
+                credentials,
+            } => self.workspaces.set_credentials(workspace, credentials),
             Event::PictureReady { url, picture } => {
                 if let Some(again) = self.pictures.loaded(url, picture) {
                     commands.push(Command::Forget(vec![again]));

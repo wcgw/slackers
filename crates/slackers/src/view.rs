@@ -308,16 +308,54 @@ fn draw_sign_ins(frame: &mut Frame<'_>, area: Rect, app: &App) {
                     Span::raw(format!("couldn't sign in to {}", sign_in.label)),
                 ]));
                 lines.push(Line::styled(reason.clone(), DIM));
+                // Only with --debug: these are the user's session secrets, on their screen.
+                if let Some(credentials) = &sign_in.credentials {
+                    lines.push(Line::styled(format!("tried with {credentials}"), DIM));
+                }
             }
         }
     }
-    let height = u16::try_from(lines.len()).unwrap_or(u16::MAX);
+    // Count the rows the wrap makes, not the lines: a reason that runs over would push the rest out of the rect.
+    let rows: usize = lines
+        .iter()
+        .map(|line| wrapped_rows(line, area.width))
+        .sum();
+    let height = u16::try_from(rows).unwrap_or(u16::MAX);
     frame.render_widget(
         Paragraph::new(lines)
             .alignment(Alignment::Center)
             .wrap(Wrap { trim: true }),
         middle(area, height),
     );
+}
+
+/// How many rows `line` takes once wrapped to `width`, as [`Wrap`] with `trim` wraps it: at spaces, and within a
+/// word longer than a row.
+fn wrapped_rows(line: &Line<'_>, width: u16) -> usize {
+    let width = usize::from(width.max(1));
+    let text: String = line
+        .spans
+        .iter()
+        .map(|span| span.content.as_ref())
+        .collect();
+    let (mut rows, mut used) = (1, 0);
+    for word in text.split_whitespace() {
+        let mut word = word.width();
+        if used > 0 {
+            if used + 1 + word <= width {
+                used += 1 + word;
+                continue;
+            }
+            rows += 1;
+        }
+        // It starts a row of its own, and runs over as many more as it needs.
+        while word > width {
+            rows += 1;
+            word -= width;
+        }
+        used = word;
+    }
+    rows
 }
 
 /// `height` rows in the vertical middle of `area`, or all of it.
@@ -3044,6 +3082,63 @@ mod tests {
         );
         assert!(rows.last().unwrap().contains("⏎ save"), "{rows:#?}");
         assert!(rows.last().unwrap().contains("esc give up"), "{rows:#?}");
+    }
+
+    #[test]
+    fn a_wrapped_line_takes_a_row_per_turn_of_the_wrap() {
+        let rows = |text: &str, width| wrapped_rows(&Line::raw(text.to_owned()), width);
+        assert_eq!(rows("", 10), 1);
+        assert_eq!(rows("six six", 10), 1);
+        assert_eq!(
+            rows("six six six", 10),
+            2,
+            "the third word moves down whole"
+        );
+        assert_eq!(rows("exactly-10", 10), 1);
+        assert_eq!(
+            rows("a-word-of-25-cells-or-so!", 10),
+            3,
+            "a long word breaks"
+        );
+        assert_eq!(rows("ab", 0), 2, "a width of zero counts as one cell");
+    }
+
+    #[test]
+    fn debug_shows_the_credentials_a_failed_sign_in_tried() {
+        let credentials = "token=xoxc-1; d=xoxd-2";
+        let mut app = App::new(vec!["test".into()], Vec::new(), CELL);
+        app.update(Event::SigningInWith {
+            workspace: w(0),
+            credentials: credentials.into(),
+        });
+        // Nothing of them while signing in is still going, nor once it worked.
+        assert!(!screen(&app).concat().contains("xoxc-1"));
+
+        app.update(Event::Slack(
+            w(0),
+            Update::SignInFailed(slackers_slack::Error::SignedOut),
+        ));
+        let rows = screen(&app);
+        assert!(
+            rows.iter()
+                .any(|row| row.contains(&format!("tried with {credentials}"))),
+            "{rows:#?}"
+        );
+    }
+
+    #[test]
+    fn without_debug_a_failed_sign_in_keeps_the_credentials_off_the_screen() {
+        let mut app = App::new(vec!["test".into()], Vec::new(), CELL);
+        app.update(Event::Slack(
+            w(0),
+            Update::SignInFailed(slackers_slack::Error::SignedOut),
+        ));
+        let rows = screen(&app);
+        assert!(
+            rows.iter().any(|row| row.contains("couldn't sign in")),
+            "{rows:#?}"
+        );
+        assert!(!rows.concat().contains("tried with"), "{rows:#?}");
     }
 
     #[test]

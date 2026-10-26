@@ -1,13 +1,18 @@
 //! slackers: a terminal Slack client that groups Conversations by subject across Workspaces.
 //!
 //! ```sh
-//! slackers [WORKSPACE…]
+//! slackers [--debug] [WORKSPACE…]
 //! ```
 //!
 //! signs in to each `WORKSPACE` with the credentials stored in the keyring under that name (see [`credentials`]),
 //! or to the `workspaces` the config file lists (see [`config`]), and shows the Virtual Workspaces it defines. Keys
 //! work as in vim (see [`app`]); `:q` quits. Logs go to `$XDG_STATE_HOME/slackers/slackers.log`; `RUST_LOG` sets
 //! their level.
+//!
+//! `--debug` prints, under a Workspace that couldn't be signed in to, the token and cookies that were tried, to
+//! tell a stale cookie from a mistyped one; it also logs the `d` cookie, and the `d-s` cookie when there is one,
+//! and turns the log down to `debug`. They grant full access as the user: don't pass it where anyone else can see
+//! the screen, and mind what you share of the log afterwards.
 
 mod activity;
 mod app;
@@ -59,7 +64,7 @@ use crate::config::Config;
 fn main() -> Result<()> {
     let config_path = config::path()?;
     let config = Config::load(&config_path)?;
-    let named: Vec<String> = std::env::args().skip(1).collect();
+    let (debug, named) = arguments(std::env::args().skip(1));
     let labels = if named.is_empty() {
         config.workspaces
     } else {
@@ -67,10 +72,10 @@ fn main() -> Result<()> {
     };
     ensure!(
         !labels.is_empty(),
-        "usage: slackers WORKSPACE…, or list workspaces = [\"WORKSPACE\", …] in {}",
+        "usage: slackers [--debug] WORKSPACE…, or list workspaces = [\"WORKSPACE\", …] in {}",
         config_path.display()
     );
-    start_logging()?;
+    start_logging(debug)?;
     // Before the runtime starts: reading the keyring blocks.
     let credentials = labels
         .iter()
@@ -84,12 +89,33 @@ fn main() -> Result<()> {
     slackers_gfx::forget_all(&mut io::stdout())?;
     let cell = CellSize::query();
     let app = App::new(labels, config.virtual_workspaces, cell);
-    let outcome = runtime.block_on(run(&mut terminal, app, credentials, config_path, cell));
+    let outcome = runtime.block_on(run(
+        &mut terminal,
+        app,
+        credentials,
+        config_path,
+        cell,
+        debug,
+    ));
     // Best effort on the way out; the next run clears what's left.
     let _ = terminal_extras(false);
     let _ = slackers_gfx::forget_all(&mut io::stdout());
     ratatui::restore();
     outcome
+}
+
+/// The command line, split into whether `--debug` was passed and the Workspaces named after it.
+fn arguments(args: impl Iterator<Item = String>) -> (bool, Vec<String>) {
+    let mut debug = false;
+    let mut named = Vec::new();
+    for arg in args {
+        if arg == "--debug" {
+            debug = true;
+        } else {
+            named.push(arg);
+        }
+    }
+    (debug, named)
 }
 
 /// Turns on (or off) what slackers needs beyond ratatui's defaults: focus reports, so that Messages count as read
@@ -121,18 +147,38 @@ enum Inbox {
 }
 
 /// Runs `app` until the user quits, signing in to each of its Workspaces with the `credentials` at the same place.
+/// With `debug`, a Workspace that can't be signed in to shows the credentials that were tried.
 async fn run(
     terminal: &mut DefaultTerminal,
     mut app: App,
     credentials: Vec<Result<Credentials>>,
     config: PathBuf,
     cell: CellSize,
+    debug: bool,
 ) -> Result<()> {
     let (inbox, mut received) = mpsc::unbounded_channel();
     let mut sessions = HashMap::new();
     for (key, credentials) in app.workspace_keys().zip(credentials) {
         match credentials {
             Ok(credentials) => {
+                if debug {
+                    // The log file is the user's alone (0600), and only --debug puts these in it.
+                    match credentials.d_s() {
+                        Some(d_s) => {
+                            tracing::debug!(
+                                d = credentials.d(),
+                                d_s,
+                                "signing in with these cookies"
+                            );
+                        }
+                        None => tracing::debug!(d = credentials.d(), "signing in with this cookie"),
+                    }
+                    // The receiver is right here: sending can't fail.
+                    let _ = inbox.send(Inbox::App(Event::SigningInWith {
+                        workspace: key,
+                        credentials: credentials.reveal(),
+                    }));
+                }
                 let inbox = inbox.clone();
                 // Runs on the Session's tasks. Sending fails only once the loop below has ended.
                 let session = Session::start(credentials, move |update| {
@@ -423,8 +469,9 @@ async fn until(duration: Option<Duration>) {
     }
 }
 
-/// Sends logs to `$XDG_STATE_HOME/slackers/slackers.log`: the terminal belongs to the UI.
-fn start_logging() -> Result<()> {
+/// Sends logs to `$XDG_STATE_HOME/slackers/slackers.log`: the terminal belongs to the UI. They go down to `debug`
+/// with `debug`, which is what [`run`] logs the cookies at; `RUST_LOG` still has the last word.
+fn start_logging(debug: bool) -> Result<()> {
     let state = std::env::var_os("XDG_STATE_HOME")
         .map(PathBuf::from)
         .or_else(|| std::env::var_os("HOME").map(|home| PathBuf::from(home).join(".local/state")))
@@ -442,7 +489,8 @@ fn start_logging() -> Result<()> {
         .with_writer(Mutex::new(file))
         .with_ansi(false)
         .with_env_filter(
-            EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new("info")),
+            EnvFilter::try_from_default_env()
+                .unwrap_or_else(|_| EnvFilter::new(if debug { "debug" } else { "info" })),
         )
         .init();
     Ok(())
@@ -451,6 +499,19 @@ fn start_logging() -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn debug_is_a_flag_and_the_rest_are_workspaces() {
+        let parse = |args: &[&str]| arguments(args.iter().map(|&arg| arg.to_owned()));
+        assert_eq!(
+            parse(&["cncf", "work"]),
+            (false, vec!["cncf".to_owned(), "work".to_owned()])
+        );
+        assert_eq!(parse(&["--debug", "cncf"]), (true, vec!["cncf".to_owned()]));
+        assert_eq!(parse(&["cncf", "--debug"]), (true, vec!["cncf".to_owned()]));
+        // Without a Workspace it still holds, and the config's list applies.
+        assert_eq!(parse(&["--debug"]), (true, Vec::new()));
+    }
 
     #[test]
     fn a_notification_cannot_end_its_sequence_early_nor_run_long() {
