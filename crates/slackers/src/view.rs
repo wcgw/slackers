@@ -1,5 +1,6 @@
 //! Drawing the app: the sidebar, the open Timeline and the status bar.
 
+use std::ops::Range;
 use std::time::Duration;
 
 use jiff::Timestamp;
@@ -939,12 +940,13 @@ fn draw_pane(
             ..body
         },
     );
+    let row = |index: usize| top + u16::try_from(index).unwrap_or(u16::MAX);
+    let selected_rows = row(selected_rows.start)..row(selected_rows.end);
     // Tint the selected Message as a block, across the whole pane, not just where its lines have text.
     if !selected_rows.is_empty() {
-        let row = |index: usize| top + u16::try_from(index).unwrap_or(u16::MAX);
         let rows = Rect {
-            y: row(selected_rows.start),
-            height: row(selected_rows.end) - row(selected_rows.start),
+            y: selected_rows.start,
+            height: selected_rows.end - selected_rows.start,
             ..area
         };
         frame.buffer_mut().set_style(
@@ -959,11 +961,7 @@ fn draw_pane(
     if let Mode::Details(details) = &app.mode
         && details.place == view.place
     {
-        // Out of the way of the Message they're about: above it when it's in the bottom half, else below.
-        let middle = usize::from(top) + (selected_rows.start + selected_rows.end) / 2;
-        let at_top = !selected_rows.is_empty()
-            && middle >= usize::from(body.y) + usize::from(body.height) / 2;
-        draw_details(frame, body, at_top, app, details, zone, drawn);
+        draw_details(frame, body, selected_rows, app, details, zone, drawn);
     }
     if let Some((suggestions, renderer)) = suggestions {
         draw_suggestions(frame, body, suggestions, renderer, drawn);
@@ -971,12 +969,12 @@ fn draw_pane(
     Some(settled)
 }
 
-/// Draws the details of a Message over the top or bottom of `area`: who wrote it and when, who reacted, and where
-/// it leads, the link `Enter` opens highlighted.
+/// Draws the details of a Message over `area`, out of the way of the rows it takes, `about`, as [`popup_top`] puts
+/// them: who wrote it and when, who reacted, and where it leads, the link `Enter` opens highlighted.
 fn draw_details(
     frame: &mut Frame<'_>,
     area: Rect,
-    at_top: bool,
+    about: Range<u16>,
     app: &App,
     details: &Details,
     zone: &TimeZone,
@@ -1086,11 +1084,7 @@ fn draw_details(
     let rows = u16::try_from(lines.len()).unwrap_or(u16::MAX);
     let height = rows.saturating_add(2).min(area.height);
     let popup = Rect {
-        y: if at_top {
-            area.y
-        } else {
-            area.bottom() - height
-        },
+        y: popup_top(area, height, about),
         height,
         width,
         ..area
@@ -1103,6 +1097,27 @@ fn draw_details(
     let skip = (first_choice + details.selected + 1).saturating_sub(usize::from(inner.height));
     let shown: Vec<Line<'static>> = lines.into_iter().skip(skip).collect();
     frame.render_widget(Paragraph::new(shown), inner);
+}
+
+/// The row a popup `height` rows high, at most `area`'s, starts at in `area`: right above the rows of what it's
+/// about, `about`, if it fits there; else right below them; else at whichever end of `area` hides fewer of them. At
+/// the bottom when what it's about is out of sight.
+fn popup_top(area: Rect, height: u16, about: Range<u16>) -> u16 {
+    let at_bottom = area.bottom() - height;
+    if about.is_empty() {
+        return at_bottom;
+    }
+    let above = about.start.saturating_sub(area.y);
+    let below = area.bottom().saturating_sub(about.end);
+    if height <= above {
+        about.start - height
+    } else if height <= below {
+        about.end
+    } else if above >= below {
+        area.y
+    } else {
+        at_bottom
+    }
 }
 
 /// Where a web link goes, in short: its host.
@@ -3411,6 +3426,39 @@ mod tests {
             ),
             "the details say so too: {rows:#?}"
         );
+    }
+
+    #[test]
+    fn a_messages_details_sit_right_above_it() {
+        let mut app = reading_general();
+        type_text(&mut app, "K");
+        let (rows, _, buffer) = render_sized(&app, WIDTH);
+        let bottom = rows
+            .iter()
+            .rposition(|row| row.contains('└'))
+            .unwrap_or_else(|| panic!("no details in {rows:#?}"));
+        let column = rows[bottom].find('└').unwrap();
+        let x = u16::try_from(rows[bottom][..column].chars().count()).unwrap();
+        let tinted = (0..rows.len())
+            .find(|&y| buffer[(x, u16::try_from(y).unwrap())].bg == SELECTED.bg.unwrap());
+        assert_eq!(tinted, Some(bottom + 1), "{rows:#?}");
+    }
+
+    #[test]
+    fn a_popup_goes_right_above_what_its_about_or_else_out_of_its_way() {
+        // Rows 2 to 21.
+        let area = Rect::new(0, 2, 40, 20);
+        assert_eq!(popup_top(area, 5, 12..14), 7, "right above");
+        assert_eq!(popup_top(area, 5, 7..9), 2, "just fits above");
+        assert_eq!(popup_top(area, 5, 4..9), 9, "right below");
+        assert_eq!(popup_top(area, 5, 3..17), 17, "just fits below");
+        assert_eq!(popup_top(area, 5, 5..19), 2, "over less of it, at the top");
+        assert_eq!(
+            popup_top(area, 5, 4..19),
+            17,
+            "over less of it, at the bottom"
+        );
+        assert_eq!(popup_top(area, 5, 0..0), 17, "out of sight");
     }
 
     #[test]
