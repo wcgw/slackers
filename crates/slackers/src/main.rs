@@ -76,7 +76,12 @@ fn main() -> Result<()> {
         .iter()
         .map(|label| credentials::load(label))
         .collect();
-    let runtime = tokio::runtime::Runtime::new()?;
+    // The workers mostly wait on Slack, and the UI runs on this thread: tokio's default of one worker per core is far
+    // more than they need.
+    let runtime = tokio::runtime::Builder::new_multi_thread()
+        .worker_threads(2)
+        .enable_all()
+        .build()?;
 
     let mut terminal = ratatui::try_init()?;
     terminal_extras(true)?;
