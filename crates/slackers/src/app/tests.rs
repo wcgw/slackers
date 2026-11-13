@@ -1980,6 +1980,27 @@ fn an_activity_item_goes_to_its_message_in_a_conversation_shown_before() {
 }
 
 #[test]
+fn messages_are_laid_out_no_wider_than_textwidth_however_wide_the_window() {
+    let mut test = reading_random();
+    test.update(wcgw_kit::Msg::Resize {
+        width: 200,
+        height: 20,
+    });
+    posted(&mut test, "C2", message(7, "U2", &"words ".repeat(60)));
+    let widest = main_rows(&test)
+        .iter()
+        .filter(|row| row.contains("words"))
+        .map(|row| unicode_width::UnicodeWidthStr::width(row.trim_end()))
+        .max()
+        .unwrap_or(0);
+    assert!(
+        (101..=120).contains(&widest),
+        "as wide as 'textwidth', 120, in a window of 164: {widest}\n{}",
+        screen(&test)
+    );
+}
+
+#[test]
 fn messages_are_laid_out_again_for_a_window_split_beside() {
     let mut test = reading_random();
     let long =

@@ -551,10 +551,10 @@ impl Slackers {
         [Line::Text(first), Line::Text(second)]
     }
 
-    /// Draws `place`'s Messages in `buffer`, wrapped to its window's width, and its winbar; and lets the window
+    /// Draws `place`'s Messages in `buffer`, wrapped to its window's width up to `'textwidth'`, and its winbar; and lets the window
     /// follow the buffer's end once its cursor landed where it opened.
     pub(super) fn render_place(&mut self, kit: &mut Kit, buffer: BufferId, place: &Place) {
-        let width = kit.text_width(buffer);
+        let width = self.laid_out_width(kit, buffer);
         self.widths.insert(buffer, width);
         let blocks = self.place_blocks(kit, place, width);
         let winbar = self.winbar(kit, place);

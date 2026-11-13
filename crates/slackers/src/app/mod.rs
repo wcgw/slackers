@@ -461,13 +461,22 @@ impl Slackers {
         kit.set_cursor(window, cursor);
     }
 
+    /// How wide `buffer` is laid out: a Conversation's or a Thread's Messages are prose, up to the kit's
+    /// `'textwidth'` (120, as every app's); the sidebar and Activity, lists, fill their windows.
+    pub(super) fn laid_out_width(&self, kit: &Kit, buffer: BufferId) -> u16 {
+        match self.shows.get(&buffer) {
+            Some(Shows::Place(_)) => kit.prose_width(buffer),
+            _ => kit.text_width(buffer),
+        }
+    }
+
     /// Lays out again the buffers whose windows changed width since they were last laid out, as a `:vsplit` does.
     fn rewrap(&mut self, kit: &mut Kit) {
         let changed: Vec<BufferId> = self
             .widths
             .iter()
             .filter(|&(&buffer, &width)| {
-                !kit.windows_showing(buffer).is_empty() && kit.text_width(buffer) != width
+                !kit.windows_showing(buffer).is_empty() && self.laid_out_width(kit, buffer) != width
             })
             .map(|(&buffer, _)| buffer)
             .collect();
