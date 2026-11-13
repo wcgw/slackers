@@ -110,7 +110,7 @@ and `:qa` quits, once Slack has what you just sent (`:qa!` doesn't wait). Settin
 
 | Key | Command | Does |
 |---|---|---|
-| `<CR>`, a click | `:open` | Opens what's under the cursor: a sidebar row, a Message's Thread, a link, an Activity item's Message; folds a sidebar section by its header |
+| `<CR>`, a double click | `:open` | Opens what's under the cursor: a sidebar row, a Message's Thread, a link, an Activity item's Message; folds a sidebar section by its header |
 | `<C-t>` | `:pop` | Back from what was opened |
 | `q` | `:exit` | Closes the window, as a Thread's beside its Conversation; from the Conversation or the sidebar, quits rather than leave the sidebar alone, as `:qa` does |
 | `\` | `:sidebar` | Hides the sidebar from within it, goes to it from elsewhere, and brings it back |
@@ -130,8 +130,8 @@ and commands (`Ctrl-n`/`Ctrl-p` choose, `Enter` picks), `↑` in an empty compos
 `Ctrl-x Ctrl-e` hands the Draft to `$EDITOR`, and `Esc` leaves it, or gives up an edit. What slackers tells you, such
 as why a Message wasn't sent, shows in the command line until the next key; `:messages` lists it all.
 
-The mouse works too: a click opens what it lands on, the wheel scrolls the window under it, and a click on the
-composer writes there. Hold Shift to select text, as most terminals let you while an app uses the mouse.
+The mouse works too: a click puts the cursor where it lands, a double click opens what it lands on, as in every
+wcgw app, the wheel scrolls the window under it, and a click on the composer writes there. Hold Shift to select text, as most terminals let you while an app uses the mouse.
 
 Drafts are written in Markdown: `**bold**`, `_italic_`, `~~strike~~`, `` `code` ``, code blocks, `> quotes`,
 headings and `[links](https://…)` post as Slack shows them, and editing a Message brings it back in Markdown. `*bold*`

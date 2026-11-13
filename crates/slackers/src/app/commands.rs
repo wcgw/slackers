@@ -17,7 +17,7 @@ use crate::icons;
 const MESSAGES: Topic = Topic::new(75, "Messages");
 
 /// slackers' default bindings: keys, the ex command each runs, what which-key says of it, and its `:help` topic.
-const KEYS: [(&str, &str, &str, Topic); 13] = [
+const KEYS: [(&str, &str, &str, Topic); 12] = [
     ("i", "startinsert", "write", MESSAGES),
     ("A", "amend", "edit your message", MESSAGES),
     ("+", "react", "react", MESSAGES),
@@ -26,7 +26,6 @@ const KEYS: [(&str, &str, &str, Topic); 13] = [
     ("o", "browse", "open a link of the message", Topic::OPENING),
     ("gx", "browse", "open a link of the message", Topic::OPENING),
     ("gy", "yanklink", "yank the message's link", Topic::YANKING),
-    ("<LeftMouse>", "open", "open what's clicked", Topic::OPENING),
     (
         "<leader>f",
         "pick conversations",

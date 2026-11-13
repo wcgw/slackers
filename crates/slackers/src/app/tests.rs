@@ -192,13 +192,15 @@ fn cell_of(test: &Test, text: &str) -> (u16, u16) {
         .unwrap_or_else(|| panic!("{text:?} isn't on screen:\n{}", screen(test)))
 }
 
-fn click_on(test: &mut Test, text: &str) -> Effects {
+/// Clicks `mouse`'s button on `text`: once, `Mouse::Left`, or twice, `Mouse::DoubleLeft`.
+fn click(test: &mut Test, mouse: Mouse, text: &str) -> Effects {
     let (column, row) = cell_of(test, text);
-    test.update(wcgw_kit::Msg::Mouse {
-        mouse: Mouse::Left,
-        column,
-        row,
-    })
+    test.update(wcgw_kit::Msg::Mouse { mouse, column, row })
+}
+
+/// Double clicks on `text`, which opens what it lands on, as in every app.
+fn click_on(test: &mut Test, text: &str) -> Effects {
+    click(test, Mouse::DoubleLeft, text)
 }
 
 /// The rows of the window right of the sidebar, from its winbar down.
@@ -818,8 +820,11 @@ fn backslash_hides_the_sidebar_from_within_it_goes_to_it_and_brings_it_back() {
 }
 
 #[test]
-fn a_click_opens_what_it_lands_on() {
+fn a_double_click_opens_what_it_lands_on_and_a_click_alone_does_not() {
     let mut test = ready();
+    let effects = click(&mut test, Mouse::Left, "general");
+    assert!(effects.is_empty(), "{effects:?}");
+    assert_ne!(main_rows(&test)[0], " T * general");
     let effects = click_on(&mut test, "general");
     assert!(asks(
         &effects,
@@ -1905,7 +1910,7 @@ fn enter_on_a_sections_header_folds_it() {
     test.press("<CR>");
     assert!(shows(&test, "general"));
     click_on(&mut test, "T Test");
-    assert!(!shows(&test, "general"), "a click too");
+    assert!(!shows(&test, "general"), "a double click too");
 }
 
 #[test]
