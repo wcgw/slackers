@@ -359,9 +359,9 @@ fn signing_in_lists_the_sidebar_and_asks_for_names_presence_and_activity() {
         [
             "! Activity",
             "▾ ↳ Threads",
-            "▾ T Test                    •",
+            "▾ T Test                         •",
             "* general",
-            "# random                  •",
+            "# random                       •",
             "@ U9",
         ],
         "Channels by name, then DMs; what's unread has a dot"
@@ -446,8 +446,8 @@ fn virtual_workspaces_come_first_and_take_their_channels_out_of_their_workspaces
         [
             "! Activity",
             "▾ ↳ Threads",
-            "▾ ≡ K                       •",
-            "T # random                  •",
+            "▾ ≡ K                            •",
+            "T # random                       •",
             "O # dev",
             "▾ T Test",
             "* general",
@@ -502,7 +502,7 @@ fn a_conversation_that_appears_joins_the_sidebar_where_it_belongs() {
         [
             "* general",
             "# jobs",
-            "# random                  •",
+            "# random                       •",
             "@ Bob"
         ]
     );
@@ -565,14 +565,14 @@ fn messages_hang_off_their_authors_and_group_under_one_header() {
     assert_eq!(
         main[from..from + 9],
         [
-            "                       ─── Thu 1 Jan 1970 ───",
+            "                     ─── Thu 1 Jan 1970 ───",
             "○  Bob  00:01",
             "   a message long enough that it has to wrap to stay within the",
             "   window beside the sidebar",
             " · again",
             "○  Bob  00:06",
             "   later on",
-            "                       ─── Fri 2 Jan 1970 ───",
+            "                     ─── Fri 2 Jan 1970 ───",
             "○  Bob  01:00",
         ],
         "{main:#?}"
@@ -1906,8 +1906,8 @@ fn two_virtual_workspaces_of_one_name_are_two_sections() {
     assert_eq!(
         sidebar(&test)[2..6],
         [
-            "▾ ≡ K                       •",
-            "T # random                  •",
+            "▾ ≡ K                            •",
+            "T # random                       •",
             "▾ ≡ K",
             "T * general"
         ]
@@ -1985,7 +1985,7 @@ fn messages_are_laid_out_again_for_a_window_split_beside() {
     let long =
         "a message long enough that it wraps once the window beside the sidebar is split in two";
     posted(&mut test, "C2", message(7, "U2", long));
-    let whole = " · a message long enough that it wraps once the window beside the";
+    let whole = " · a message long enough that it wraps once the window beside";
     assert!(shows(&test, whole), "{}", screen(&test));
     test.press(":vsplit<CR>j");
     assert!(!shows(&test, whole), "{}", screen(&test));
@@ -2017,7 +2017,12 @@ fn help_opens_beside_the_sidebar_which_keeps_its_width() {
     let mut test = ready();
     test.press(":help<CR>");
     assert!(shows(&test, "NORMAL  help"));
-    assert_eq!(cell_of(&test, "│").0, 30, "{}", screen(&test));
+    assert_eq!(
+        cell_of(&test, "│").0,
+        wcgw_kit::shell::SIDEBAR_WIDTH,
+        "{}",
+        screen(&test)
+    );
 }
 
 #[test]

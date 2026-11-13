@@ -55,8 +55,8 @@ pub(crate) type Effects = wcgw_kit::Effects<Slackers>;
 /// One thing for the runtime to do.
 pub(crate) type Effect = wcgw_kit::Effect<Msg, Io>;
 
-/// The width of the sidebar's window, in cells.
-const SIDEBAR_WIDTH: u16 = 30;
+/// The sidebar's width: the kit's, as every app's (35 cells, as neo-tree's in the author's Neovim).
+use wcgw_kit::shell::SIDEBAR_WIDTH;
 
 /// The narrowest room beside the sidebar, in cells, that shows a Thread beside its Conversation rather than instead
 /// of it.
