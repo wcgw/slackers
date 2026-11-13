@@ -555,19 +555,19 @@ fn messages_hang_off_their_authors_and_group_under_one_header() {
     let main = main_rows(&test);
     let from = main
         .iter()
-        .position(|row| row.contains("Thu 01 Jan 1970"))
+        .position(|row| row.contains("Thu 1 Jan 1970"))
         .expect("a day's rule");
     assert_eq!(
         main[from..from + 9],
         [
-            "                       ─── Thu 01 Jan 1970 ───",
+            "                       ─── Thu 1 Jan 1970 ───",
             "○  Bob  00:01",
             "   a message long enough that it has to wrap to stay within the",
             "   window beside the sidebar",
             " · again",
             "○  Bob  00:06",
             "   later on",
-            "                       ─── Fri 02 Jan 1970 ───",
+            "                       ─── Fri 2 Jan 1970 ───",
             "○  Bob  01:00",
         ],
         "{main:#?}"

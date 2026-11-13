@@ -715,17 +715,11 @@ fn conversation_label(name: &str, kind: &ConversationKind) -> String {
     }
 }
 
-/// When `ts` was, from `now`: the time of day if it's today, else the day, and the year if it's another.
+/// When `ts` was, from `now`, as every app says it in a list: the time of day if it's today, else the day, else the
+/// month and year (the kit's `when::short`).
 pub(super) fn when(ts: Ts, zone: &jiff::tz::TimeZone, now: Timestamp) -> String {
     let (Some(then), today) = (super::render::zoned(ts, zone), now.to_zoned(zone.clone())) else {
         return String::new();
     };
-    let format = if then.date() == today.date() {
-        "%H:%M"
-    } else if then.year() == today.year() {
-        "%d %b"
-    } else {
-        "%d %b %Y"
-    };
-    then.strftime(format).to_string()
+    wcgw_kit::when::short(&then, &today)
 }

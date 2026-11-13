@@ -617,9 +617,12 @@ impl Slackers {
             });
             let target = Target::Message(place.clone(), message.ts);
             let mut lines = Vec::new();
-            if new_day && let Some(day) = day {
+            if new_day
+                && day.is_some()
+                && let Some(posted) = zoned(message.ts, &self.zone)
+            {
                 lines.push(rule(
-                    format!("─── {} ───", day.strftime("%a %d %b %Y")),
+                    format!("─── {} ───", wcgw_kit::when::day(&posted)),
                     DIM,
                 ));
             }
@@ -758,7 +761,7 @@ impl Slackers {
             }
         }
         let mut posted = zoned(message.ts, &self.zone)
-            .map(|z| z.strftime("%a %d %b %Y %H:%M").to_string())
+            .map(|z| wcgw_kit::when::long(&z))
             .unwrap_or_default();
         if message.edited {
             posted.push_str(" · edited");
@@ -1427,7 +1430,7 @@ fn host(url: &str) -> &str {
 fn their_time(theirs: &str, ours: &TimeZone, now: Timestamp) -> Option<String> {
     let there = now.to_zoned(TimeZone::get(theirs).ok()?);
     let here = now.to_zoned(ours.clone());
-    (there.offset() != here.offset()).then(|| there.strftime("%H:%M").to_string())
+    (there.offset() != here.offset()).then(|| wcgw_kit::when::clock(&there))
 }
 
 /// Who reacted: as many of `names` as fit in `room` cells, then how many of the `count` people who reacted that
@@ -1469,7 +1472,7 @@ pub(super) fn zoned(ts: Ts, zone: &TimeZone) -> Option<jiff::Zoned> {
 /// The local time of day `ts` was posted, as `HH:MM`.
 pub(super) fn time(ts: Ts, zone: &TimeZone) -> String {
     zoned(ts, zone)
-        .map(|z| z.strftime("%H:%M").to_string())
+        .map(|z| wcgw_kit::when::clock(&z))
         .unwrap_or_default()
 }
 
