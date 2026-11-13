@@ -446,16 +446,16 @@ impl Slackers {
         }
         let unread = self.activity.unread();
         let mut winbar = vec![
-            (" ".to_owned(), Group::NORMAL),
-            (kit.icon(icons::ACTIVITY), ACCENT),
-            ("Activity".to_owned(), HEADER),
+            Span::new(" ", Group::NORMAL),
+            Span::new(kit.icon(icons::ACTIVITY), ACCENT),
+            Span::new("Activity", HEADER),
         ];
         if unread > 0 {
-            winbar.push((format!("  {unread} unread"), DIM));
+            winbar.push(Span::new(format!("  {unread} unread"), DIM));
         }
         let shown = kit.buffer_mut(buffer);
         shown.doc_mut().set_blocks(blocks);
-        shown.set_winbar(Some(winbar));
+        shown.set_winbar_spans(Some(winbar));
         effects
     }
 
@@ -563,7 +563,7 @@ impl Slackers {
         let shown = kit.buffer_mut(buffer);
         shown.set_name(name);
         shown.doc_mut().set_blocks(blocks);
-        shown.set_winbar(Some(winbar));
+        shown.set_winbar_spans(Some(winbar));
         if let Some(key) = self.landing.get(&buffer) {
             let loaded = self
                 .workspaces
@@ -683,10 +683,10 @@ impl Slackers {
 
     /// What windows showing `place` say above it: its Conversation, a Thread's too, and with the sidebar hidden, the
     /// section it's listed in, breadcrumb-style.
-    fn winbar(&self, kit: &Kit, place: &Place) -> Vec<(String, Group)> {
+    fn winbar(&self, kit: &Kit, place: &Place) -> Vec<Span> {
         let conversation = &place.conversation;
         let Some((workspace, found)) = self.workspaces.conversation(conversation) else {
-            return vec![(conversation.id.to_string(), HEADER)];
+            return vec![Span::new(conversation.id.to_string(), HEADER)];
         };
         let (icon, name) = label(workspace, found);
         let section = self
@@ -694,32 +694,33 @@ impl Slackers {
             .section_of(conversation)
             .cloned()
             .unwrap_or(Section::Workspace(conversation.workspace));
-        let mut bar = vec![(" ".to_owned(), Group::NORMAL)];
-        if self.sidebar_window(kit).is_none() {
+        let sidebar_shown = self.sidebar_window(kit).is_some();
+        let mut bar = vec![Span::new(" ", Group::NORMAL)];
+        if !sidebar_shown {
             let (icon, title) = self.section_title(kit, &section);
-            let icon = if icon.picture.is_some() {
-                "  ".to_owned()
-            } else {
-                icon.text
-            };
             bar.extend([
-                (icon, ACCENT),
-                (title, HEADER),
-                (format!(" {}", kit.icon(icons::CRUMB)), DIM),
+                icon,
+                Span::new(title, HEADER),
+                Span::new(format!(" {}", kit.icon(icons::CRUMB)), DIM),
             ]);
         }
+        // The Workspace's icon says where the Conversation is from, unless the section leading the bar does.
+        let marker = (sidebar_shown || matches!(section, Section::VirtualWorkspace(_)))
+            .then(|| workspace_marker(conversation.workspace, workspace));
         match place.thread {
-            None => bar.extend([(kit.icon(icon), ACCENT), (name.to_owned(), HEADER)]),
-            Some(_) => bar.extend([
-                (kit.icon(icons::THREAD), ACCENT),
-                ("thread".to_owned(), HEADER),
-                (" in ".to_owned(), DIM),
-                (format!("{}{name}", kit.icon(icon)), DIM),
-            ]),
-        }
-        // Where the Conversation is from, unless its section says so.
-        if self.workspaces.len() > 1 && !matches!(section, Section::Workspace(_)) {
-            bar.push((format!("  {}", workspace.name), DIM));
+            None => {
+                bar.extend(marker);
+                bar.extend([Span::new(kit.icon(icon), ACCENT), Span::new(name, HEADER)]);
+            }
+            Some(_) => {
+                bar.extend([
+                    Span::new(kit.icon(icons::THREAD), ACCENT),
+                    Span::new("thread", HEADER),
+                    Span::new(" in ", DIM),
+                ]);
+                bar.extend(marker);
+                bar.push(Span::new(format!("{}{name}", kit.icon(icon)), DIM));
+            }
         }
         bar
     }

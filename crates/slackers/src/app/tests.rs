@@ -516,7 +516,7 @@ fn opening_a_conversation_loads_it_beside_the_sidebar_and_goes_there() {
         }
     ));
     let main = main_rows(&test);
-    assert_eq!(main[0], " * general", "the winbar");
+    assert_eq!(main[0], " T * general", "the winbar");
     assert!(main[1].contains("loading…"));
     assert!(shows(&test, "NORMAL  #general"), "{}", screen(&test));
     slack(
@@ -745,7 +745,7 @@ fn a_thread_opens_in_place_of_its_conversation_on_a_narrow_screen_and_beside_it_
     );
     let main = main_rows(&test);
     assert_eq!(
-        main[1], " ↳ thread in # random",
+        main[1], " ↳ thread in T # random",
         "below the tabline: {main:#?}"
     );
     assert!(main.iter().any(|row| row.contains("─── 1 reply ───")));
@@ -756,7 +756,7 @@ fn a_thread_opens_in_place_of_its_conversation_on_a_narrow_screen_and_beside_it_
     });
     let winbars = &rows(&test)[1];
     assert!(
-        winbars.contains("│ # random") && winbars.contains("│ ↳ thread in # random"),
+        winbars.contains("│ T # random") && winbars.contains("│ ↳ thread in T # random"),
         "side by side:\n{}",
         screen(&test)
     );
@@ -766,12 +766,16 @@ fn a_thread_opens_in_place_of_its_conversation_on_a_narrow_screen_and_beside_it_
     });
     assert_eq!(
         main_rows(&test)[1],
-        " ↳ thread in # random",
+        " ↳ thread in T # random",
         "{}",
         screen(&test)
     );
     test.press("<C-t>");
-    assert_eq!(main_rows(&test)[1], " # random", "back to the conversation");
+    assert_eq!(
+        main_rows(&test)[1],
+        " T # random",
+        "back to the conversation"
+    );
 }
 
 #[test]
@@ -783,7 +787,7 @@ fn a_thread_opened_on_a_wide_screen_goes_beside_and_q_closes_it() {
     });
     test.press("k<CR>");
     assert!(
-        rows(&test)[1].contains("│ ↳ thread in # random"),
+        rows(&test)[1].contains("│ ↳ thread in T # random"),
         "{}",
         screen(&test)
     );
@@ -824,7 +828,7 @@ fn a_click_opens_what_it_lands_on() {
             before: None
         }
     ));
-    assert_eq!(main_rows(&test)[0], " * general");
+    assert_eq!(main_rows(&test)[0], " T * general");
 }
 
 #[test]
@@ -833,14 +837,14 @@ fn leader_f_finds_a_conversation_by_name() {
     test.press("<Space>f");
     assert!(shows(&test, "Conversations"), "{}", screen(&test));
     test.press("rand<CR>");
-    assert_eq!(main_rows(&test)[0], " # random");
+    assert_eq!(main_rows(&test)[0], " T # random");
 }
 
 #[test]
 fn e_opens_a_conversation_by_its_buffer_name() {
     let mut test = ready();
     test.press(":e @Bob<CR>");
-    assert_eq!(main_rows(&test)[0], " @ Bob", "{}", screen(&test));
+    assert_eq!(main_rows(&test)[0], " T @ Bob", "{}", screen(&test));
 }
 
 // --- Writing. ---
@@ -1061,7 +1065,7 @@ fn a_command_that_posts_for_the_user_elsewhere_is_followed_there() {
             before: None
         }
     ));
-    assert_eq!(main_rows(&test)[1], " @ Bob", "{}", screen(&test));
+    assert_eq!(main_rows(&test)[1], " T @ Bob", "{}", screen(&test));
 }
 
 #[test]
@@ -1709,7 +1713,7 @@ fn activity_lists_what_happened_and_opens_an_items_message() {
             before: None
         }
     ));
-    assert_eq!(main_rows(&test)[1], " * general", "{}", screen(&test));
+    assert_eq!(main_rows(&test)[1], " T * general", "{}", screen(&test));
     slack(
         &mut test,
         history(
@@ -2053,4 +2057,69 @@ fn ctrl_y_in_the_open_picker_copies_a_link() {
     let effects = test.press("b.com<C-y>");
     assert!(effects.contains(&Effect::Copy("https://b.com".into())));
     assert_eq!(told(&test), "Yanked https://b.com");
+}
+
+#[test]
+fn k_twice_enters_the_details_and_enter_opens_where_a_row_leads() {
+    let mut test = reading_random();
+    let send = Button {
+        label: "Send".into(),
+        primary: true,
+        press: Press("send".into()),
+    };
+    edited(
+        &mut test,
+        "C2",
+        Message {
+            content: text(vec![
+                Block::Paragraph(vec![Inline::Link {
+                    url: "https://example.com/a".into(),
+                    label: Some("the docs".into()),
+                }]),
+                Block::Actions(vec![send.clone()]),
+            ]),
+            ..message(5, "U2", "")
+        },
+    );
+    test.press("kKK");
+    assert!(shows(&test, "the docs  example.com"), "{}", screen(&test));
+    let effects = test.press("Gk<CR>");
+    assert!(
+        effects.contains(&Effect::OpenUrl("https://example.com/a".into())),
+        "{effects:?}\n{}",
+        screen(&test)
+    );
+    assert!(!shows(&test, "the docs  example.com"), "the card goes");
+    let effects = test.press("KKGkk<CR>");
+    assert!(asks(
+        &effects,
+        &Request::Press {
+            conversation: id("C2"),
+            ts: seconds(5),
+            button: send,
+        }
+    ));
+    test.press("KK<Esc>");
+    assert!(!shows(&test, "the docs  example.com"), "left");
+}
+
+#[test]
+fn a_workspaces_icon_shows_in_the_winbar() {
+    let mut test = starting(&["test"], Vec::new(), 100, 20);
+    let _ = test.kit.set_graphics(Graphics::HalfBlocks);
+    let mut snapshot = test_snapshot();
+    snapshot.icon = Some("https://icons/test.png".into());
+    let effects = slack(&mut test, Update::Ready(Box::new(snapshot)));
+    assert!(
+        effects.iter().any(|effect| matches!(effect,
+            Effect::Picture { source, cols: 2, rows: 1, .. } if source == "0 https://icons/test.png")),
+        "the sidebar's, which the winbar's shares: {effects:?}"
+    );
+    test.press("ggjjj<CR>");
+    assert_eq!(
+        main_rows(&test)[0],
+        " \u{2800}\u{2800}* general",
+        "room for it: {}",
+        screen(&test)
+    );
 }
