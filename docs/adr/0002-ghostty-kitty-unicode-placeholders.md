@@ -1,5 +1,5 @@
 ---
-status: accepted
+status: superseded by [ADR 0003](0003-run-in-wcgw-kit.md)
 ---
 
 # Target Ghostty only, drawing images with kitty Unicode placeholders
