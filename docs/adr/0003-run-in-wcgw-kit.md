@@ -20,8 +20,9 @@ statusline segments.
 - **Keys are Vim's** (the kit's D12). Motions are the kit's and pure Vim; each action of slackers' is an ex command
   bound to a default key, so `:map` reaches anything a key does. `<CR>` (`:open`) opens what's under the cursor: a
   sidebar row's Conversation, a Message's Thread, a link. Windows move with `<C-w>`, and `q` closes one.
-- **Windows** (the kit's D11): the sidebar on the left, 35 cells wide, the kit's as every app's (it was 30); Conversations in the main window; a Thread
-  beside its Conversation when there are 120 cells beside the sidebar, else in its place. `\` toggles the sidebar.
+- **Windows** (the kit's D11): the sidebar on the left, 35 cells wide, the kit's as every app's (it was 30);
+  Conversations in the main window; a Thread beside its Conversation when there are 120 cells beside the sidebar, else
+  in its place. `\` toggles the sidebar.
 - **Writing** is in the kit's composer, docked under each Conversation and Thread. slackers completes the word being
   written (people, broadcasts, emoji, slash commands) and keeps what each picked label stands for.
 - **Look**: slackers' colours are highlight groups (`SlackersMention`, `SlackersNew`, `SlackersAuthor0`…) linked to
