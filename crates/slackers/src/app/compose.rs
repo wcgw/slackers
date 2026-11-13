@@ -452,15 +452,13 @@ impl Slackers {
         self.outbox.len() + self.edits_sent.len() + self.commands_sent.len()
     }
 
-    /// Quits, freeing the pictures the terminal holds, once nothing is on its way to Slack any more, if `:qa` asked
-    /// to.
-    pub(super) fn quit_when_sent(&mut self, kit: &mut Kit) -> Effects {
+    /// Quits once nothing is on its way to Slack any more, if `:qa` asked to; the kit frees the pictures the
+    /// terminal holds.
+    pub(super) fn quit_when_sent(&self) -> Effects {
         if !self.quitting || self.sending() > 0 {
             return Vec::new();
         }
-        let mut effects = kit.set_graphics(wcgw_kit::gfx::Graphics::Off);
-        effects.push(Effect::Quit);
-        effects
+        vec![Effect::Quit]
     }
 
     /// Reacts to the Message at `ts`, held at `place`, with the emoji `name`; or, when the user has reacted with it

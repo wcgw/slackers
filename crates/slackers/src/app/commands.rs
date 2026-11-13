@@ -292,6 +292,8 @@ impl Slackers {
             Picker::list("Open", picks, "Nothing to open").verb("<C-y>", "copy", |_, kit, pick| {
                 match pick {
                     Picked::Target(Target::Url(url)) => {
+                        // A verb leaves the picker open: copied, there is nothing more to pick.
+                        kit.close_picker();
                         kit.info(format!("Yanked {url}"));
                         vec![Effect::Copy(url)]
                     }

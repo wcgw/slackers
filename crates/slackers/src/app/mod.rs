@@ -502,7 +502,7 @@ impl wcgw_kit::App for Slackers {
             Msg::Refresh => Vec::new(),
         };
         effects.extend(self.changed(kit, &reading));
-        effects.extend(self.quit_when_sent(kit));
+        effects.extend(self.quit_when_sent());
         effects
     }
 
