@@ -2026,6 +2026,21 @@ fn quitting_waits_for_what_is_on_its_way_to_slack() {
 }
 
 #[test]
+fn q_quits_from_the_conversation_or_the_sidebar_rather_than_leave_the_sidebar_alone() {
+    let mut test = reading_random();
+    assert!(test.press("q").contains(&Effect::Quit), "{}", screen(&test));
+    let mut test = reading_random();
+    test.press("<Bslash>");
+    assert!(shows(&test, "NORMAL  sidebar"), "{}", screen(&test));
+    assert!(test.press("q").contains(&Effect::Quit), "{}", screen(&test));
+    // A window of its own, as :help's, closes.
+    let mut test = reading_random();
+    test.press(":help<CR>");
+    assert!(!test.press("q").contains(&Effect::Quit));
+    assert!(!shows(&test, "NORMAL  help"), "{}", screen(&test));
+}
+
+#[test]
 fn quitting_with_nothing_on_its_way_or_a_bang_is_at_once() {
     let mut test = reading_random();
     assert!(test.press(":qa<CR>").contains(&Effect::Quit));

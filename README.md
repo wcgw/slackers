@@ -103,7 +103,7 @@ Logs go to `~/.local/state/slackers/slackers.log` (or under `$XDG_STATE_HOME`).
 ## Keys
 
 slackers runs in [wcgw-kit](https://github.com/wcgw/wcgw-kit), which works as Neovim does: motions, counts, `/`
-search, folds, windows (`<C-w>h`, `<C-w>l`, `q` to close one), the jumplist (`<C-o>`, `<C-i>`), `:` commands with
+search, folds, windows (`<C-w>h`, `<C-w>l`), the jumplist (`<C-o>`, `<C-i>`), `:` commands with
 completion, `:map` and `:hi`. `:help` lists every key and command, after `<Space>` which-key shows what may follow,
 and `:qa` quits, once Slack has what you just sent (`:qa!` doesn't wait). Settings, maps and colours go in
 `~/.config/slackers/init.vim`, after `~/.config/wcgw/init.vim`, which every wcgw app reads.
@@ -112,6 +112,7 @@ and `:qa` quits, once Slack has what you just sent (`:qa!` doesn't wait). Settin
 |---|---|---|
 | `<CR>`, a click | `:open` | Opens what's under the cursor: a sidebar row, a Message's Thread, a link, an Activity item's Message; folds a sidebar section by its header |
 | `<C-t>` | `:pop` | Back from what was opened |
+| `q` | `:exit` | Closes the window, as a Thread's beside its Conversation; from the Conversation or the sidebar, quits rather than leave the sidebar alone, as `:qa` does |
 | `\` | `:sidebar` | Hides the sidebar from within it, goes to it from elsewhere, and brings it back |
 | `za` `zo` `zc` `zM` `zR` | | Fold the sidebar's sections |
 | `<Space>f` | `:pick conversations` | Finds a Conversation by name, fzf-style |

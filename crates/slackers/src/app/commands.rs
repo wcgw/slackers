@@ -17,7 +17,7 @@ use crate::icons;
 const MESSAGES: Topic = Topic::new(75, "Messages");
 
 /// slackers' default bindings: keys, the ex command each runs, what which-key says of it, and its `:help` topic.
-const KEYS: [(&str, &str, &str, Topic); 12] = [
+const KEYS: [(&str, &str, &str, Topic); 13] = [
     ("i", "startinsert", "write", MESSAGES),
     ("A", "amend", "edit your message", MESSAGES),
     ("+", "react", "react", MESSAGES),
@@ -35,6 +35,7 @@ const KEYS: [(&str, &str, &str, Topic); 12] = [
     ),
     ("<leader>a", "activity", "activity", Topic::BUFFERS),
     ("<Bslash>", "sidebar", "sidebar", Topic::WINDOWS),
+    ("q", "exit", "close, or quit", Topic::WINDOWS),
 ];
 
 /// Runs `act` as a command does, then keeps everything current as any change does. What the cursor reads after,
@@ -59,6 +60,8 @@ pub(super) fn install(kit: &mut Kit) {
             })
         })
         .help("hide the sidebar, go to it, or bring it back"),
+        Command::<Slackers>::new("exit", 3, |app, kit, _| app.exit(kit))
+            .help("close the window; quit rather than leave the sidebar alone, or from it"),
         Command::<Slackers>::new("activity", 3, |app, kit, _| {
             acting(app, kit, |app, kit| Ok(app.open_activity(kit)))
         })

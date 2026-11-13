@@ -409,6 +409,20 @@ impl Slackers {
         window
     }
 
+    /// `:exit` (`q`): closes the window, as the kit's `q` does, but quits from the sidebar, or where closing would
+    /// leave the sidebar alone, as muttrs' `q` does: a Thread beside its Conversation closes, the Conversation quits.
+    pub(super) fn exit(&mut self, kit: &mut Kit) -> Result<Effects, String> {
+        let current = kit.current_window();
+        let sidebar = self.sidebar_window(kit);
+        let others = kit
+            .window_ids()
+            .into_iter()
+            .filter(|&window| window != current && Some(window) != sidebar)
+            .count();
+        let quitting = Some(current) == sidebar || others == 0;
+        kit.run_ex(self, if quitting { "qall" } else { "quit" })
+    }
+
     /// `:sidebar` (`\`): hides the sidebar from within it, goes to it from anywhere else, and brings it back.
     pub(super) fn toggle_sidebar(&mut self, kit: &mut Kit) {
         match self.sidebar_window(kit) {
