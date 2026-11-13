@@ -1324,7 +1324,7 @@ fn k_shows_a_messages_details_and_asks_for_everyone_who_reacted() {
 }
 
 #[test]
-fn o_opens_a_messages_only_link_and_otherwise_picks_one() {
+fn gx_opens_a_messages_only_link_and_otherwise_picks_one() {
     let mut test = reading_random();
     let link = |url: &str| Inline::Link {
         url: url.into(),
@@ -1338,7 +1338,7 @@ fn o_opens_a_messages_only_link_and_otherwise_picks_one() {
             ..message(5, "U2", "")
         },
     );
-    let effects = test.press("k0o");
+    let effects = test.press("k0gx");
     assert!(effects.contains(&Effect::OpenUrl("https://a.com".into())));
     let send = Button {
         label: "Send".into(),
@@ -1395,6 +1395,13 @@ fn enter_on_a_link_opens_it_and_gy_yanks_it_or_the_messages() {
     assert!(
         effects.iter().any(|effect| matches!(effect,
             Effect::Copy(url) if url.starts_with("https://test.slack.com/"))),
+        "{effects:?}"
+    );
+    // gX opens the message itself in Slack, wherever the cursor is on it, as the other apps' gX.
+    let effects = test.press("$gX");
+    assert!(
+        effects.iter().any(|effect| matches!(effect,
+            Effect::OpenUrl(url) if url.starts_with("https://test.slack.com/"))),
         "{effects:?}"
     );
 }
@@ -2072,7 +2079,7 @@ fn ctrl_y_in_the_open_picker_copies_a_link() {
             ..message(5, "U2", "")
         },
     );
-    test.press("ko");
+    test.press("kgx");
     assert!(shows(&test, "<C-y> copy"), "{}", screen(&test));
     let effects = test.press("b.com<C-y>");
     assert!(effects.contains(&Effect::Copy("https://b.com".into())));

@@ -122,7 +122,8 @@ and `:qa` quits, once Slack has what you just sent (`:qa!` doesn't wait). Settin
 | `+` | `:react [emoji]` | Reacts to the Message, or takes your reaction back |
 | `U` | `:unread` | Marks the Message unread, and those after it |
 | `K` | `:details` | Who wrote the Message and when, who reacted, its buttons and where it leads; `K` again goes into the card, where `Enter` presses a button or opens a link |
-| `o`, `gx` | `:browse` | Opens the link under the cursor, or the Message's; with several, picks one (`Ctrl-y` copies it), or a button |
+| `gx` | `:browse link` | Opens the link under the cursor, or the Message's; with several, picks one (`Ctrl-y` copies it), or a button |
+| `gX` | `:browse` | Opens the Message in Slack's web client |
 | `gy` | `:yanklink` | Copies the link under the cursor, or the Message's on Slack's web client |
 
 In the composer, `Enter` sends, `Shift-Enter` or `Alt-Enter` breaks the line, `@`, `:` and `/` complete people, emoji

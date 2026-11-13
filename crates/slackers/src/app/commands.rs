@@ -23,8 +23,13 @@ const KEYS: [(&str, &str, &str, Topic); 12] = [
     ("+", "react", "react", MESSAGES),
     ("U", "unread", "mark unread from here", MESSAGES),
     ("K", "details", "message details", Topic::OPENING),
-    ("o", "browse", "open a link of the message", Topic::OPENING),
-    ("gx", "browse", "open a link of the message", Topic::OPENING),
+    (
+        "gx",
+        "browse link",
+        "open a link of the message",
+        Topic::OPENING,
+    ),
+    ("gX", "browse", "open the message in Slack", Topic::OPENING),
     ("gy", "yanklink", "yank the message's link", Topic::YANKING),
     (
         "<leader>f",
@@ -88,10 +93,23 @@ pub(super) fn install(kit: &mut Kit) {
             acting(app, kit, Slackers::details)
         })
         .help("who wrote the message, who reacted, where it leads"),
-        Command::<Slackers>::new("browse", 3, |app, kit, _| {
-            acting(app, kit, Slackers::browse)
+        // As in the other apps, `:browse` alone is the thing itself on the web, `:browse link` the link under the
+        // cursor.
+        Command::<Slackers>::new("browse", 3, |app, kit, line| match line.args {
+            "link" => acting(app, kit, Slackers::browse),
+            "" => acting(app, kit, |app, kit| {
+                Ok(vec![Effect::OpenUrl(app.message_url(kit)?)])
+            }),
+            args => Err(format!("E475: Invalid argument: {args}")),
         })
-        .help("open the link under the cursor, or one of the message's"),
+        .help("open the message in Slack; with link, the link under the cursor, or one of the message's")
+        .complete(|_, _, before, _| {
+            if before.is_empty() {
+                vec!["link".to_owned()]
+            } else {
+                Vec::new()
+            }
+        }),
         Command::<Slackers>::new("yanklink", 5, |app, kit, _| app.yank_link(kit))
             .help("yank the link under the cursor, or the message's"),
         Command::<Slackers>::new("vw", 2, |app, kit, line| {
@@ -306,21 +324,24 @@ impl Slackers {
     }
 
     /// `:yanklink` (`gy`): the link under the cursor, else the Message's on Slack's web client, to the clipboard.
+    /// The link to the message under the cursor in Slack's web client, which `:browse` opens.
+    fn message_url(&self, kit: &Kit) -> Result<String, String> {
+        let (place, ts) = Self::message_under_cursor(kit)?;
+        let (workspace, message) = self
+            .message(&place, ts)
+            .ok_or("no message under the cursor")?;
+        workspace
+            .links(&place.conversation.id, message)
+            .into_iter()
+            .find(|link| link.kind == LinkKind::Message)
+            .map(|link| link.url)
+            .ok_or_else(|| "Slack doesn't keep this message: it has no link".to_owned())
+    }
+
     fn yank_link(&mut self, kit: &mut Kit) -> Result<Effects, String> {
         let url = match kit.target_under_cursor() {
             Some(Target::Url(url)) => url,
-            _ => {
-                let (place, ts) = Self::message_under_cursor(kit)?;
-                let (workspace, message) = self
-                    .message(&place, ts)
-                    .ok_or("no message under the cursor")?;
-                workspace
-                    .links(&place.conversation.id, message)
-                    .into_iter()
-                    .find(|link| link.kind == LinkKind::Message)
-                    .map(|link| link.url)
-                    .ok_or("Slack doesn't keep this message: it has no link")?
-            }
+            _ => self.message_url(kit)?,
         };
         kit.info(format!("Yanked {url}"));
         Ok(vec![Effect::Copy(url)])
