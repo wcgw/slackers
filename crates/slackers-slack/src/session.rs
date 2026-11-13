@@ -152,7 +152,7 @@ pub enum Request {
 }
 
 /// What a [`Session`] learned.
-#[derive(Debug)]
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub enum Update {
     /// Signed in. Always the first Update unless [`Update::SignInFailed`] is.
     Ready(Box<Snapshot>),
