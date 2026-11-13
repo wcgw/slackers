@@ -383,6 +383,19 @@ mod tests {
     }
 
     #[test]
+    fn an_item_is_found_by_its_workspace_and_key_while_its_listed() {
+        let mut activity = Activity::default();
+        activity.refresh(w(0));
+        activity.received(w(0), None, page(vec![item("a", 3, true)], None));
+        assert_eq!(
+            activity.entry(w(0), "a").map(|entry| entry.item.at),
+            Some(Ts::from_micros(3_000_000))
+        );
+        assert_eq!(activity.entry(w(1), "a"), None, "another Workspace's");
+        assert_eq!(activity.entry(w(0), "b"), None);
+    }
+
+    #[test]
     fn a_message_is_fetched_once_and_kept() {
         let mut activity = Activity::default();
         let at = item("k", 3, false).message;
