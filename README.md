@@ -112,6 +112,7 @@ and `:qa` quits, once Slack has what you just sent (`:qa!` doesn't wait). Settin
 |---|---|---|
 | `<CR>`, a double click | `:open` | Opens what's under the cursor: a sidebar row, a Message's Thread, a link, an Activity item's Message; folds a sidebar section by its header |
 | `<C-t>` | `:pop` | Back from what was opened |
+| `<Space>bd`, a middle click on its tab | `:bdelete` | Closes the Conversation, Thread or Activity; a draft keeps it open, unless `:bd!` |
 | `q` | `:exit` | Closes the window, as a Thread's beside its Conversation; from the Conversation or the sidebar, quits rather than leave the sidebar alone, as `:qa` does |
 | `\` | `:sidebar` | Hides the sidebar from within it, goes to it from elsewhere, and brings it back |
 | `za` `zo` `zc` `zM` `zR` | | Fold the sidebar's sections |

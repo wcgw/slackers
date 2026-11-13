@@ -573,6 +573,30 @@ impl wcgw_kit::App for Slackers {
     }
 
     /// A window shows `buffer` now: asks for what it shows, unless it's loaded or on its way, and draws it.
+    /// `:bd` (`<leader>bd`, a middle click on its tab): a Conversation's, a Thread's or Activity's buffer goes, with
+    /// what slackers keeps for it; opening it again starts anew. A Thread beside its Conversation takes its window
+    /// with it, as `q` does. The sidebar isn't listed, so it stays.
+    fn deleting(&mut self, kit: &mut Kit, buffer: BufferId) -> Result<Effects, String> {
+        match self.shows.remove(&buffer) {
+            Some(Shows::Place(place)) => {
+                self.places.remove(&place);
+                self.editing.remove(&place);
+                self.references.remove(&place);
+            }
+            Some(Shows::Activity) => self.activity_buffer = None,
+            Some(Shows::Sidebar | Shows::SignIn) | None => {}
+        }
+        self.landing.remove(&buffer);
+        self.widths.remove(&buffer);
+        if let Some(window) = self.thread_window(kit)
+            && kit.window_buffer(window) == Some(buffer)
+            && kit.close_window_id(window)
+        {
+            self.thread_window = None;
+        }
+        Ok(Vec::new())
+    }
+
     fn shown(&mut self, kit: &mut Kit, buffer: BufferId) -> Effects {
         let mut effects = match self.shows.get(&buffer).cloned() {
             Some(Shows::Place(place)) => self.load(&place, false),

@@ -786,6 +786,50 @@ fn a_thread_opens_in_place_of_its_conversation_on_a_narrow_screen_and_beside_it_
 }
 
 #[test]
+fn leader_bd_closes_a_conversation_and_opening_it_again_lists_it_anew() {
+    let mut test = reading_random();
+    test.press("<Space>ffgen<CR>");
+    assert_eq!(main_rows(&test)[0], " T * general");
+
+    test.press("<Space>bd");
+    assert_eq!(main_rows(&test)[0], " T # random", "the one before");
+    assert!(
+        !rows(&test)[0].contains("general"),
+        "out of the tabline: {}",
+        rows(&test)[0]
+    );
+
+    // Back from what's loaded, in a buffer of its own again.
+    test.press("<Space>ffgen<CR>");
+    assert_eq!(main_rows(&test)[0], " T * general");
+    assert!(rows(&test)[0].contains("general"), "{}", rows(&test)[0]);
+}
+
+#[test]
+fn leader_bd_on_a_thread_beside_its_conversation_takes_its_window_too() {
+    let mut test = reading_random();
+    test.update(wcgw_kit::Msg::Resize {
+        width: 160,
+        height: 20,
+    });
+    test.press("k<CR>");
+    assert!(
+        shows(&test, "│ ↳ thread in T # random"),
+        "{}",
+        screen(&test)
+    );
+
+    test.press("<Space>bd");
+    assert!(!shows(&test, "thread in"), "{}", screen(&test));
+    assert!(shows(&test, "NORMAL"), "{}", screen(&test));
+    assert_eq!(
+        cell_of(&test, "│").0,
+        wcgw_kit::shell::SIDEBAR_WIDTH,
+        "the sidebar, then the Conversation"
+    );
+}
+
+#[test]
 fn a_thread_opened_on_a_wide_screen_goes_beside_and_q_closes_it() {
     let mut test = reading_random();
     test.update(wcgw_kit::Msg::Resize {
