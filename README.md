@@ -16,7 +16,7 @@ here, and in the code, are defined in [CONTEXT.md](CONTEXT.md).
 - **Picks up where you left off**: a Conversation or Followed Thread opens on its first unread Message, under a "new"
   rule, and is marked read once you reach its newest.
 - **Reading**: Threads open beside their Conversation; images, animated GIFs, Custom Emoji and avatars show inline;
-  who's typing shows on the pane's title, and whether a DM's other person is active on its sidebar icon.
+  who's typing shows on the status line, and whether a DM's other person is active on its sidebar icon.
 - **Writing**: @-mentions, `:emoji:` and slash commands complete as you type; reactions, editing your Messages,
   marking Messages unread, and pressing apps' buttons (such as Giphy's).
 - **Desktop notifications** for DMs, Mentions and Replies in your Followed Threads, while the window doesn't have
@@ -24,11 +24,13 @@ here, and in the code, are defined in [CONTEXT.md](CONTEXT.md).
 
 ## Requirements
 
-- [Ghostty](https://ghostty.org). Pictures use the kitty graphics protocol's Unicode placeholders, which slackers is
-  built and tested against in Ghostty only.
-- A [Nerd Font](https://www.nerdfonts.com), for the icons.
+- A terminal; [Ghostty](https://ghostty.org) for the best of it. Pictures use the kitty graphics protocol's Unicode
+  placeholders in Ghostty and kitty, and half blocks elsewhere, as in tmux.
+- A [Nerd Font](https://www.nerdfonts.com) for the icons, which Ghostty, kitty and WezTerm ship; elsewhere they're
+  plain characters (`:set icons=nerd` or `plain` says otherwise).
 - Linux, with `secret-tool` from libsecret and a Secret Service keyring (GNOME Keyring, KeePassXC, …), or macOS.
-- Rust 1.88 or newer, to build it.
+- Rust 1.99 or newer, to build it. slackers runs in [wcgw-kit](https://github.com/wcgw/wcgw-kit) (see
+  [ADR 0003](docs/adr/0003-run-in-wcgw-kit.md)), at its `v0.1.0` tag, which cargo fetches.
 
 ## Install
 
@@ -100,20 +102,37 @@ Logs go to `~/.local/state/slackers/slackers.log` (or under `$XDG_STATE_HOME`).
 
 ## Keys
 
-They work as in vim. The status line shows the ones that apply where you are.
+slackers runs in [wcgw-kit](https://github.com/wcgw/wcgw-kit), which works as Neovim does: motions, counts, `/`
+search, folds, windows (`<C-w>h`, `<C-w>l`), the jumplist (`<C-o>`, `<C-i>`), `:` commands with
+completion, `:map` and `:hi`. `:help` lists every key and command, after `<Space>` which-key shows what may follow,
+and `:qa` quits, once Slack has what you just sent (`:qa!` doesn't wait). Settings, maps and colours go in
+`~/.config/slackers/init.vim`, after `~/.config/wcgw/init.vim`, which every wcgw app reads.
 
-| Where | Keys |
-|---|---|
-| Anywhere | `\` sidebar · `/` search the sidebar · `:q` quit |
-| Sidebar | `j`/`k` move · `g`/`G` first, last · `Enter` open · `za` `zo` `zc` fold a section · `zM` `zR` fold or unfold all |
-| Messages | `j`/`k` move · `g`/`G` oldest, newest · `Ctrl-d`/`Ctrl-u` half a page · `Ctrl-e`/`Ctrl-y` a line · `Enter` open its Thread · `i` write · `+` react · `e` edit yours · `U` mark unread from here · `K` details · `o` open its link · `Esc` back |
-| Writing | `Enter` send · `Alt-Enter` new line · `@`, `:` and `/` complete people, emoji and commands · `↑` edit your last · `Ctrl-x Ctrl-e` `$EDITOR` · `Esc` stop |
-| Details (`K`) | `j`/`k` choose · `Enter` or `1`-`9` press or open · `y` copy · `Esc` close |
+| Key | Command | Does |
+|---|---|---|
+| `<CR>`, a double click | `:open` | Opens what's under the cursor: a sidebar row, a Message's Thread, a link, an Activity item's Message; folds a sidebar section by its header |
+| `<C-t>` | `:pop` | Back from what was opened |
+| `q` | `:exit` | Closes the window, as a Thread's beside its Conversation; from the Conversation or the sidebar, quits rather than leave the sidebar alone, as `:qa` does |
+| `\` | `:sidebar` | Hides the sidebar from within it, goes to it from elsewhere, and brings it back |
+| `za` `zo` `zc` `zM` `zR` | | Fold the sidebar's sections |
+| `<Space>ff` | `:pick conversations` | Finds a Conversation by name, fzf-style, as every app finds its own; `<Space>fb`, `fh`, `fk`, `fC`, `fj` find buffers, help, keys, commands and jumps |
+| `<Space>a` | `:activity` | Activity |
+| `i` | `:startinsert` | Writes in the Conversation's or Thread's composer |
+| `A` | `:amend` | Edits your Message in the composer; `Enter` saves it, `Esc` gives it up |
+| `+` | `:react [emoji]` | Reacts to the Message, or takes your reaction back |
+| `U` | `:unread` | Marks the Message unread, and those after it |
+| `K` | `:details` | Who wrote the Message and when, who reacted, its buttons and where it leads; `K` again goes into the card, where `Enter` presses a button or opens a link |
+| `gx` | `:browse link` | Opens the link under the cursor, or the Message's; with several, picks one (`Ctrl-y` yanks it), or a button |
+| `gX` | `:browse` | Opens the Message in Slack's web client |
+| `gy` | `:yanklink` | Copies the link under the cursor, or the Message's on Slack's web client |
 
-The mouse works too. Clicking a row of the sidebar, an Activity item, a suggestion or a choice in a Message's
-details does what `Enter` does on it. Clicking a Message selects it, and clicking it again opens its Thread. The
-wheel scrolls Messages and moves through lists. Hold Shift to select text, as most terminals let you while an app
-uses the mouse.
+In the composer, `Enter` sends, `Shift-Enter` or `Alt-Enter` breaks the line, `@`, `:` and `/` complete people, emoji
+and commands (`Ctrl-n`/`Ctrl-p` choose, `Enter` picks), `↑` in an empty composer edits your last Message there,
+`Ctrl-x Ctrl-e` hands the Draft to `$EDITOR`, and `Esc` leaves it, or gives up an edit. What slackers tells you, such
+as why a Message wasn't sent, shows in the command line until the next key; `:messages` lists it all.
+
+The mouse works too: a click puts the cursor where it lands, a double click opens what it lands on, as in every
+wcgw app, the wheel scrolls the window under it, and a click on the composer writes there. Hold Shift to select text, as most terminals let you while an app uses the mouse.
 
 Drafts are written in Markdown: `**bold**`, `_italic_`, `~~strike~~`, `` `code` ``, code blocks, `> quotes`,
 headings and `[links](https://…)` post as Slack shows them, and editing a Message brings it back in Markdown. `*bold*`

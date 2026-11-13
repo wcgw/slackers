@@ -6,6 +6,7 @@
 
 mod api;
 mod credentials;
+mod download;
 mod error;
 mod mrkdwn;
 mod session;
@@ -14,6 +15,7 @@ mod web;
 mod wire;
 
 pub use credentials::Credentials;
+pub use download::Downloader;
 pub use error::Error;
 pub use session::{
     ActivityCursor, ActivityPage, Bot, Connection, EmojiList, FollowedThread, HistoryPage,

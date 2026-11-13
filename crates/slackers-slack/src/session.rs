@@ -38,12 +38,6 @@ pub enum Request {
     /// Follows whether these people are using Slack, instead of whoever was followed before; answered by
     /// [`LiveEvent::Presence`], soon for each of them and again whenever that changes.
     FollowPresence(Vec<UserId>),
-    /// A file, image, avatar or Custom Emoji; answered by [`Update::Downloaded`].
-    Download {
-        /// Where it is. Requests to Slack's own hosts carry the session's credentials, so private files work;
-        /// requests elsewhere carry none.
-        url: String,
-    },
     /// Posts a Message as the user; answered by [`Update::Posted`].
     Post {
         /// Where.
@@ -152,7 +146,7 @@ pub enum Request {
 }
 
 /// What a [`Session`] learned.
-#[derive(Debug)]
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub enum Update {
     /// Signed in. Always the first Update unless [`Update::SignInFailed`] is.
     Ready(Box<Snapshot>),
@@ -265,13 +259,6 @@ pub enum Update {
         ts: Ts,
         /// Its reactions, or why they aren't known.
         result: Result<Vec<Reaction>, Error>,
-    },
-    /// The answer to [`Request::Download`].
-    Downloaded {
-        /// What was asked for.
-        url: String,
-        /// The bytes, or why there are none.
-        result: Result<Vec<u8>, Error>,
     },
     /// Something just happened in the Workspace.
     Live(LiveEvent),
@@ -708,10 +695,6 @@ async fn serve(api: &Api, request: Request, workspace: &WorkspaceId, notify: &No
             Ok(bot) => notify(Update::Bot(bot)),
             Err(error) => tracing::warn!(%error, bot = %id, "couldn't look up a bot"),
         },
-        Request::Download { url } => {
-            let result = api.download(&url).await;
-            notify(Update::Downloaded { url, result });
-        }
         Request::Post {
             conversation,
             thread,

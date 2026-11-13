@@ -125,7 +125,7 @@ impl Api {
             }
             let bytes = response.bytes().await?;
             let reply: Value = serde_json::from_slice(&bytes)
-                .map_err(|source| Error::Unexpected { method, source })?;
+                .map_err(|source| Error::unexpected(method, source))?;
             if reply["ok"] != Value::Bool(true) {
                 return Err(Error::refused(
                     method,
@@ -133,7 +133,7 @@ impl Api {
                 ));
             }
             return serde_json::from_value(reply)
-                .map_err(|source| Error::Unexpected { method, source });
+                .map_err(|source| Error::unexpected(method, source));
         }
         Err(Error::refused(method, "ratelimited"))
     }

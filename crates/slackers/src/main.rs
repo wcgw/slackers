@@ -5,9 +5,9 @@
 //! ```
 //!
 //! signs in to each `WORKSPACE` with the credentials stored in the keyring under that name (see [`credentials`]),
-//! or to the `workspaces` the config file lists (see [`config`]), and shows the Virtual Workspaces it defines. Keys
-//! work as in vim (see [`app`]); `:q` quits. Logs go to `$XDG_STATE_HOME/slackers/slackers.log`; `RUST_LOG` sets
-//! their level.
+//! or to the `workspaces` the config file lists (see [`config`]), and shows the Virtual Workspaces it defines. It runs
+//! in wcgw-kit, which gives it Neovim's keys, windows and commands (see [`app`]); `:qa` quits. Logs go to
+//! `$XDG_STATE_HOME/slackers/slackers.log`; `RUST_LOG` sets their level.
 
 mod activity;
 mod app;
@@ -15,45 +15,23 @@ mod config;
 mod credentials;
 mod draft;
 mod emoji;
+mod hl;
 mod icons;
 mod layout;
 mod markdown;
-mod pane;
-mod pictures;
+mod runtime;
 mod search;
 mod sidebar;
-mod theme;
 mod typing;
-mod view;
 
-use std::collections::HashMap;
 use std::fs::{self, OpenOptions};
-use std::io::{self, Write as _};
 use std::os::unix::fs::OpenOptionsExt as _;
-use std::path::{Path, PathBuf};
-use std::sync::{Arc, Mutex};
-use std::time::Duration;
+use std::path::PathBuf;
+use std::sync::Mutex;
 
 use anyhow::{Context as _, Result, ensure};
-use base64::Engine as _;
-use base64::engine::general_purpose::STANDARD as BASE64;
-use crossterm::cursor::{Hide, Show};
-use crossterm::event::{
-    DisableFocusChange, DisableMouseCapture, EnableFocusChange, EventStream,
-    KeyboardEnhancementFlags, PopKeyboardEnhancementFlags, PushKeyboardEnhancementFlags,
-};
-use crossterm::execute;
-use crossterm::terminal::{
-    EnterAlternateScreen, LeaveAlternateScreen, disable_raw_mode, enable_raw_mode,
-};
-use futures_util::StreamExt as _;
-use ratatui::DefaultTerminal;
-use slackers_gfx::{CellSize, Ids, Prepared};
-use slackers_slack::{Credentials, Session};
-use tokio::sync::mpsc;
 use tracing_subscriber::EnvFilter;
 
-use crate::app::{App, Command, Drawn, Event, Place, WorkspaceKey};
 use crate::config::Config;
 
 fn main() -> Result<()> {
@@ -78,369 +56,17 @@ fn main() -> Result<()> {
         .collect();
     // The workers mostly wait on Slack, and the UI runs on this thread: tokio's default of one worker per core is far
     // more than they need.
-    let runtime = tokio::runtime::Builder::new_multi_thread()
+    let tokio = tokio::runtime::Builder::new_multi_thread()
         .worker_threads(2)
         .enable_all()
         .build()?;
-
-    let mut terminal = ratatui::try_init()?;
-    terminal_extras(true)?;
-    // An earlier run may have left pictures in this screen, under the ids this one is about to give.
-    slackers_gfx::forget_all(&mut io::stdout())?;
-    let cell = CellSize::query();
-    let app = App::new(labels, config.virtual_workspaces, cell);
-    let outcome = runtime.block_on(run(&mut terminal, app, credentials, config_path, cell));
-    // Best effort on the way out; the next run clears what's left.
-    let _ = terminal_extras(false);
-    let _ = slackers_gfx::forget_all(&mut io::stdout());
-    ratatui::restore();
-    outcome
-}
-
-/// Turns on (or off) what slackers needs beyond ratatui's defaults: focus reports, so that Messages count as read
-/// only while the window has focus; the kitty keyboard protocol, so that Shift+Enter differs from Enter; and mouse
-/// reports, so that clicks and the wheel act on what they're over.
-fn terminal_extras(on: bool) -> io::Result<()> {
-    if on {
-        execute!(
-            io::stdout(),
-            EnableFocusChange,
-            PushKeyboardEnhancementFlags(KeyboardEnhancementFlags::DISAMBIGUATE_ESCAPE_CODES),
-            EnableMouseButtons
-        )
-    } else {
-        execute!(
-            io::stdout(),
-            DisableMouseCapture,
-            PopKeyboardEnhancementFlags,
-            DisableFocusChange
-        )
-    }
-}
-
-/// Asks the terminal to report mouse buttons and the wheel, in SGR's encoding. Unlike crossterm's
-/// `EnableMouseCapture`, it doesn't ask for the mouse's every move: each report wakes the loop, which then draws
-/// again. crossterm's `DisableMouseCapture` turns it off.
-struct EnableMouseButtons;
-
-impl crossterm::Command for EnableMouseButtons {
-    fn write_ansi(&self, f: &mut impl std::fmt::Write) -> std::fmt::Result {
-        f.write_str("\x1b[?1000h\x1b[?1006h")
-    }
-}
-
-/// What reaches the event loop from background work.
-enum Inbox {
-    App(Event),
-    /// A picture finished decoding, and still has to go to the terminal.
-    Prepared {
-        url: String,
-        result: Result<Prepared, slackers_gfx::Error>,
-    },
-}
-
-/// Runs `app` until the user quits, signing in to each of its Workspaces with the `credentials` at the same place.
-async fn run(
-    terminal: &mut DefaultTerminal,
-    mut app: App,
-    credentials: Vec<Result<Credentials>>,
-    config: PathBuf,
-    cell: CellSize,
-) -> Result<()> {
-    let (inbox, mut received) = mpsc::unbounded_channel();
-    let mut sessions = HashMap::new();
-    for (key, credentials) in app.workspace_keys().zip(credentials) {
-        match credentials {
-            Ok(credentials) => {
-                let inbox = inbox.clone();
-                // Runs on the Session's tasks. Sending fails only once the loop below has ended.
-                let session = Session::start(credentials, move |update| {
-                    let _ = inbox.send(Inbox::App(Event::Slack(key, update)));
-                });
-                sessions.insert(key, session);
-            }
-            Err(error) => {
-                let reason = format!("{error:#}");
-                // The receiver is right here: sending can't fail.
-                let _ = inbox.send(Inbox::App(Event::CantSignIn {
-                    workspace: key,
-                    reason,
-                }));
-            }
-        }
-    }
-    let effects = Effects {
-        sessions,
-        inbox,
-        ids: Arc::new(Ids::default()),
-        cell,
-        config,
-    };
-    let mut terminal_events = EventStream::new();
-    loop {
-        let mut drawn = Drawn::default();
-        terminal.draw(|frame| drawn = view::draw(frame, &app))?;
-        let commands = app.update(Event::Drawn(drawn));
-        if effects
-            .carry_out(commands, terminal, &mut terminal_events)
-            .await?
-        {
-            return Ok(());
-        }
-
-        // Wait for a key, news from Slack or a picture, or the next animation frame.
-        let frame_due = app
-            .next_change()
-            .map(|at| at.saturating_sub(app.animation_time()));
-        let first = tokio::select! {
-            terminal_event = terminal_events.next() => match terminal_event {
-                Some(event) => Inbox::App(Event::Terminal(event?)),
-                None => return Ok(()),
-            },
-            Some(item) = received.recv() => item,
-            () = until(frame_due) => continue,
-        };
-        // Take in everything that's waiting before drawing again.
-        let mut items = vec![first];
-        while let Ok(item) = received.try_recv() {
-            items.push(item);
-        }
-        for item in items {
-            let event = match item {
-                Inbox::App(event) => event,
-                Inbox::Prepared { url, result } => match show(result) {
-                    Ok(picture) => Event::PictureReady { url, picture },
-                    Err(error) => {
-                        tracing::warn!(%error, "couldn't show a picture");
-                        Event::PictureFailed { url }
-                    }
-                },
-            };
-            let commands = app.update(event);
-            if effects
-                .carry_out(commands, terminal, &mut terminal_events)
-                .await?
-            {
-                return Ok(());
-            }
-        }
-    }
-}
-
-/// Sends a prepared picture to the terminal. Call it between draws, so that the picture's commands don't
-/// interleave with ratatui's output.
-fn show(result: Result<Prepared, slackers_gfx::Error>) -> Result<slackers_gfx::Picture> {
-    let mut stdout = io::stdout().lock();
-    let picture = result?.send(&mut stdout)?;
-    stdout.flush()?;
-    Ok(picture)
-}
-
-/// Carries out [`Command`]s: the app's only way to reach Slack, the terminal and other programs.
-struct Effects {
-    /// Each Workspace's Session, for those whose credentials were found.
-    sessions: HashMap<WorkspaceKey, Session>,
-    /// Where background work reports back to the event loop.
-    inbox: mpsc::UnboundedSender<Inbox>,
-    ids: Arc<Ids>,
-    cell: CellSize,
-    /// Where the config file is.
-    config: PathBuf,
-}
-
-impl Effects {
-    /// Carries out `commands`. Returns whether one of them was to quit.
-    ///
-    /// # Errors
-    ///
-    /// If the terminal can't be restored after handing it to an editor.
-    async fn carry_out(
-        &self,
-        commands: Vec<Command>,
-        terminal: &mut DefaultTerminal,
-        terminal_events: &mut EventStream,
-    ) -> Result<bool> {
-        for command in commands {
-            match command {
-                Command::Quit => return Ok(true),
-                Command::Slack(workspace, request) => {
-                    if let Some(session) = self.sessions.get(&workspace) {
-                        session.request(request);
-                    }
-                }
-                Command::Prepare { url, bytes, fit } => {
-                    let (inbox, ids, cell) = (self.inbox.clone(), Arc::clone(&self.ids), self.cell);
-                    // Decoding and resizing are CPU-heavy, and staging writes files: keep them off the loop's
-                    // thread. The result comes back through the inbox; should the task panic, the emoji simply
-                    // stays drawn by name.
-                    drop(tokio::task::spawn_blocking(move || {
-                        let result = slackers_gfx::prepare(&bytes, fit, cell, &ids);
-                        let _ = inbox.send(Inbox::Prepared { url, result });
-                    }));
-                }
-                Command::SaveVirtualWorkspaces(virtual_workspaces) => {
-                    // A small file, rarely written: write it right away, on this thread, so that saves can't
-                    // overtake one another.
-                    let saved = tokio::task::block_in_place(|| {
-                        config::save_virtual_workspaces(&self.config, &virtual_workspaces)
-                    });
-                    if let Err(error) = saved {
-                        tracing::warn!(error = format!("{error:#}"), "couldn't save the config");
-                        let _ = self
-                            .inbox
-                            .send(Inbox::App(Event::SaveFailed(format!("{error:#}"))));
-                    }
-                }
-                Command::Open(url) => {
-                    let inbox = self.inbox.clone();
-                    drop(tokio::spawn(async move {
-                        if let Err(error) = open(&url).await {
-                            tracing::warn!(error = format!("{error:#}"), "couldn't open a link");
-                            let _ = inbox.send(Inbox::App(Event::OpenFailed(format!("{error:#}"))));
-                        }
-                    }));
-                }
-                Command::Forget(pictures) => {
-                    let mut stdout = io::stdout().lock();
-                    for picture in pictures {
-                        picture.forget(&mut stdout)?;
-                    }
-                    stdout.flush()?;
-                }
-                Command::Copy(text) => {
-                    // OSC 52: the terminal puts the text on the clipboard, even over ssh.
-                    let mut stdout = io::stdout().lock();
-                    write!(stdout, "\x1b]52;c;{}\x07", BASE64.encode(text))?;
-                    stdout.flush()?;
-                }
-                Command::Notify { title, body } => {
-                    let mut stdout = io::stdout().lock();
-                    stdout.write_all(notification(&title, &body).as_bytes())?;
-                    stdout.flush()?;
-                }
-                Command::Edit { place, text } => {
-                    // The old stream's reader thread would steal the editor's keystrokes: drop it now. The new
-                    // one reads nothing until the loop polls it, after the editor exits.
-                    *terminal_events = EventStream::new();
-                    self.edit(place, &text, terminal).await?;
-                }
-            }
-        }
-        Ok(false)
-    }
-
-    /// Hands the terminal to `$VISUAL` or `$EDITOR` (or `vi`) to edit `text`, and reports the outcome through the
-    /// inbox.
-    async fn edit(&self, place: Place, text: &str, terminal: &mut DefaultTerminal) -> Result<()> {
-        let path = std::env::temp_dir().join(format!("slackers-draft-{}.md", std::process::id()));
-        execute!(
-            io::stdout(),
-            DisableMouseCapture,
-            PopKeyboardEnhancementFlags,
-            DisableFocusChange,
-            LeaveAlternateScreen,
-            Show
-        )?;
-        disable_raw_mode()?;
-        let editor = std::env::var("VISUAL")
-            .or_else(|_| std::env::var("EDITOR"))
-            .unwrap_or_else(|_| "vi".to_owned());
-        let outcome = edit_file(&path, text, &editor).await;
-        let _ = tokio::fs::remove_file(&path).await;
-        enable_raw_mode()?;
-        execute!(io::stdout(), EnterAlternateScreen, Hide)?;
-        terminal_extras(true)?;
-        terminal.clear()?;
-        // Whatever the terminal did with pictures while the editor had it, start afresh.
-        slackers_gfx::forget_all(&mut io::stdout())?;
-        let _ = self.inbox.send(Inbox::App(Event::PicturesLost));
-        let outcome = outcome.map_err(|error| format!("{error:#}"));
-        let _ = self
-            .inbox
-            .send(Inbox::App(Event::Edited { place, outcome }));
-        Ok(())
-    }
-}
-
-/// The OSC 777 sequence asking the terminal for a desktop notification titled `title`, saying `body`. They come from
-/// other people, so control characters, which could end the sequence early and start another, are dropped; and so
-/// are semicolons from the title, which would end it. Both are cut short to keep within the 2048 bytes Ghostty takes.
-fn notification(title: &str, body: &str) -> String {
-    let printable = |text: &str| -> String { text.chars().filter(|c| !c.is_control()).collect() };
-    let title = cut(&printable(title).replace(';', ","), 256);
-    let body = cut(&printable(body), 1024);
-    format!("\x1b]777;notify;{title};{body}\x07")
-}
-
-/// `text`, cut at a character boundary to at most `bytes` bytes, ellipsis included, when it's longer.
-fn cut(text: &str, bytes: usize) -> String {
-    if text.len() <= bytes {
-        return text.to_owned();
-    }
-    let room = bytes.saturating_sub('…'.len_utf8());
-    let end = (0..=room)
-        .rev()
-        .find(|&at| text.is_char_boundary(at))
-        .unwrap_or(0);
-    format!("{}…", &text[..end])
-}
-
-/// Opens `url` in the user's browser, as the desktop opens links: with `open` on macOS, `xdg-open` elsewhere. Its
-/// output is discarded, so that it can't draw over the app.
-async fn open(url: &str) -> Result<()> {
-    let program = if cfg!(target_os = "macos") {
-        "open"
-    } else {
-        "xdg-open"
-    };
-    let status = tokio::process::Command::new(program)
-        .arg(url)
-        .stdin(std::process::Stdio::null())
-        .stdout(std::process::Stdio::null())
-        .stderr(std::process::Stdio::null())
-        .status()
-        .await
-        .with_context(|| format!("couldn't run {program}"))?;
-    ensure!(status.success(), "{program} exited with {status}");
+    tokio.block_on(runtime::run(
+        labels,
+        config.virtual_workspaces,
+        credentials,
+        config_path,
+    ))?;
     Ok(())
-}
-
-/// Writes `text` to `path`, readable by the user alone, runs `editor` on it (a program, optionally followed by
-/// arguments, split at whitespace), and returns what the file holds then, without trailing line breaks.
-async fn edit_file(path: &Path, text: &str, editor: &str) -> Result<String> {
-    let mut options = tokio::fs::OpenOptions::new();
-    options.write(true).create(true).truncate(true).mode(0o600);
-    let mut file = options
-        .open(path)
-        .await
-        .with_context(|| format!("creating {}", path.display()))?;
-    tokio::io::AsyncWriteExt::write_all(&mut file, text.as_bytes()).await?;
-    drop(file);
-
-    let mut words = editor.split_whitespace();
-    let program = words.next().unwrap_or("vi");
-    let status = tokio::process::Command::new(program)
-        .args(words)
-        .arg(path)
-        .status()
-        .await
-        .with_context(|| format!("couldn't run {program}"))?;
-    ensure!(
-        status.success(),
-        "{program} exited with {status}; the draft is unchanged"
-    );
-    let edited = tokio::fs::read_to_string(path)
-        .await
-        .with_context(|| format!("reading {}", path.display()))?;
-    Ok(edited.trim_end_matches('\n').to_owned())
-}
-
-/// Completes after `duration`, or never for `None`.
-async fn until(duration: Option<Duration>) {
-    match duration {
-        Some(duration) => tokio::time::sleep(duration).await,
-        None => std::future::pending().await,
-    }
 }
 
 /// Sends logs to `$XDG_STATE_HOME/slackers/slackers.log`: the terminal belongs to the UI.
@@ -466,61 +92,4 @@ fn start_logging() -> Result<()> {
         )
         .init();
     Ok(())
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn a_notification_cannot_end_its_sequence_early_nor_run_long() {
-        assert_eq!(
-            notification("Ana; in #general", "a;b \x1b]52;c;evil\x07 \u{9b}done"),
-            "\x1b]777;notify;Ana, in #general;a;b ]52;c;evil done\x07"
-        );
-        let long = notification(&"é".repeat(500), &"日本".repeat(1000));
-        assert!(long.len() < 2048, "{}", long.len());
-        let parts: Vec<&str> = long.trim_end_matches('\x07').splitn(4, ';').collect();
-        assert!(parts[2].len() <= 256 && parts[2].ends_with('…'));
-        assert!(parts[3].len() <= 1024 && parts[3].ends_with('…'));
-        assert_eq!(cut("short", 10), "short");
-    }
-
-    /// A scratch directory holding a fake editor that runs `script` on its file argument (`$1`).
-    fn fake_editor(name: &str, script: &str) -> (PathBuf, String) {
-        let directory =
-            std::env::temp_dir().join(format!("slackers-test-{}-{name}", std::process::id()));
-        fs::create_dir_all(&directory).unwrap();
-        let editor = directory.join("editor.sh");
-        fs::write(&editor, format!("#!/bin/sh\n{script}\n")).unwrap();
-        fs::set_permissions(&editor, std::os::unix::fs::PermissionsExt::from_mode(0o700)).unwrap();
-        (directory, editor.display().to_string())
-    }
-
-    #[tokio::test]
-    async fn the_editor_edits_a_private_copy_of_the_draft() {
-        let (directory, editor) = fake_editor(
-            "edits",
-            r#"[ "$(cat "$1")" = "draft" ] && printf 'edited\n\n' > "$1""#,
-        );
-        let path = directory.join("draft.md");
-        assert_eq!(edit_file(&path, "draft", &editor).await.unwrap(), "edited");
-        let mode =
-            std::os::unix::fs::PermissionsExt::mode(&fs::metadata(&path).unwrap().permissions());
-        assert_eq!(mode & 0o777, 0o600);
-        fs::remove_dir_all(directory).unwrap();
-    }
-
-    #[tokio::test]
-    async fn a_failing_editor_leaves_the_draft_alone() {
-        let (directory, editor) = fake_editor("fails", "exit 3");
-        let error = edit_file(&directory.join("draft.md"), "draft", &editor)
-            .await
-            .unwrap_err();
-        assert!(
-            error.to_string().contains("the draft is unchanged"),
-            "{error}"
-        );
-        fs::remove_dir_all(directory).unwrap();
-    }
 }

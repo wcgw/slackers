@@ -1,15 +1,14 @@
-//! Which emoji to draw how: standard emoji as their characters, Custom Emoji as pictures once loaded. And which emoji
+//! Which emoji to draw how: standard emoji as their characters, Custom Emoji as pictures. And which emoji
 //! to offer for a name being written.
 
+use std::cell::RefCell;
 use std::cmp::Reverse;
 use std::collections::HashMap;
 use std::sync::LazyLock;
 
 use emojis::SkinTone;
-use slackers_gfx::Picture;
 use slackers_model::{CustomEmoji, CustomEmojiSet, Emoji};
 
-use crate::pictures::{PictureState, Pictures};
 use crate::search;
 
 /// A Workspace's emoji: its Custom Emoji, by name, the standard emoji Slack lists, and how much the user uses each.
@@ -21,8 +20,8 @@ pub(crate) struct Emojis {
     /// How many times the user used each emoji, by name.
     used: HashMap<String, u32>,
     /// The last completion: the name and limit it was for, and what it found. Matching every name a large
-    /// Workspace has takes milliseconds, and the app asks again after every event.
-    completed: Option<(String, usize, Vec<EmojiMatch>)>,
+    /// Workspace has takes milliseconds, and the composer asks again after every key.
+    completed: RefCell<Option<(String, usize, Vec<EmojiMatch>)>>,
 }
 
 /// An emoji to offer.
@@ -59,15 +58,12 @@ struct Rank {
 }
 
 /// How to draw one emoji.
-#[derive(Debug, PartialEq)]
+#[derive(Debug, PartialEq, Eq)]
 pub(crate) enum Drawable<'a> {
     /// As these characters.
     Text(&'a str),
-    /// As the picture at `url`: as `loaded`, once it is; until then, as its `:name:`.
-    Picture {
-        url: &'a str,
-        loaded: Option<&'a Picture>,
-    },
+    /// As the picture at this URL.
+    Picture(&'a str),
     /// As its `:name:`: there's nothing better.
     Name,
 }
@@ -96,26 +92,26 @@ impl Emojis {
         });
         self.offered = standard.chain(custom_names).collect();
         self.custom = custom;
-        self.completed = None;
+        self.completed.take();
     }
 
     /// Sets how many times the user used each emoji, by name.
     pub(crate) fn set_used(&mut self, used: HashMap<String, u32>) {
         self.used = used;
-        self.completed = None;
+        self.completed.take();
     }
 
     /// Counts one more use of the emoji `name`.
     pub(crate) fn note_use(&mut self, name: &str) {
         *self.used.entry(name.to_owned()).or_default() += 1;
-        self.completed = None;
+        self.completed.take();
     }
 
     /// The emoji to offer for `name`, being written, best first, at most `limit` of them: those with a name `name`
     /// starts a word of, ignoring case. All of a name comes first, then the most used, then those `name` starts a
     /// name of rather than a later word, then standard emoji, most common first, then Custom Emoji by name.
-    pub(crate) fn complete(&mut self, name: &str, limit: usize) -> Vec<EmojiMatch> {
-        if let Some((last, last_limit, found)) = &self.completed
+    pub(crate) fn complete(&self, name: &str, limit: usize) -> Vec<EmojiMatch> {
+        if let Some((last, last_limit, found)) = &*self.completed.borrow()
             && last == name
             && *last_limit == limit
         {
@@ -165,12 +161,24 @@ impl Emojis {
                 },
             })
             .collect();
-        self.completed = Some((name.to_owned(), limit, found.clone()));
+        self.completed
+            .replace(Some((name.to_owned(), limit, found.clone())));
         found
     }
 
-    /// How to draw `emoji` right now, given the `pictures` loaded so far.
-    pub(crate) fn drawable<'a>(&'a self, emoji: &'a Emoji, pictures: &'a Pictures) -> Drawable<'a> {
+    /// Every emoji to offer, each with the other names it goes by: those the user uses most first, the rest in
+    /// Slack's order, then Custom Emoji by name.
+    pub(crate) fn offered(&self) -> Vec<(&str, &[&'static str])> {
+        let mut offered: Vec<&Offered> = self.offered.iter().collect();
+        offered.sort_by_key(|offered| Reverse(self.used.get(&offered.name).copied().unwrap_or(0)));
+        offered
+            .into_iter()
+            .map(|offered| (offered.name.as_str(), offered.aliases.as_slice()))
+            .collect()
+    }
+
+    /// How to draw `emoji`.
+    pub(crate) fn drawable<'a>(&'a self, emoji: &'a Emoji) -> Drawable<'a> {
         if let Some(text) = emoji.unicode.as_deref() {
             return Drawable::Text(text);
         }
@@ -188,14 +196,7 @@ impl Emojis {
         };
         // A Workspace's Custom Emoji shadow standard ones of the same name, as in Slack.
         match self.custom.resolve(&emoji.name) {
-            Some(CustomEmoji::Image { url }) => match pictures.state(url) {
-                PictureState::Ready(picture) => Drawable::Picture {
-                    url,
-                    loaded: Some(picture),
-                },
-                PictureState::Awaiting => Drawable::Picture { url, loaded: None },
-                PictureState::Failed => Drawable::Name,
-            },
+            Some(CustomEmoji::Image { url }) => Drawable::Picture(url),
             Some(CustomEmoji::Standard { name }) => {
                 standard(name).map_or(Drawable::Name, Drawable::Text)
             }
@@ -267,16 +268,13 @@ mod tests {
 
     #[test]
     fn standard_emoji_draw_as_text_with_skin_tones() {
-        let (emojis, pictures) = (Emojis::default(), Pictures::default());
-        assert_eq!(
-            emojis.drawable(&Emoji::named("+1"), &pictures),
-            Drawable::Text("👍")
-        );
+        let emojis = Emojis::default();
+        assert_eq!(emojis.drawable(&Emoji::named("+1")), Drawable::Text("👍"));
         let mut toned = Emoji::named("thumbsup");
         toned.skin_tone = Some(3);
-        assert_eq!(emojis.drawable(&toned, &pictures), Drawable::Text("👍🏼"));
+        assert_eq!(emojis.drawable(&toned), Drawable::Text("👍🏼"));
         let unknown = Emoji::named("no-such-emoji");
-        assert_eq!(emojis.drawable(&unknown, &pictures), Drawable::Name);
+        assert_eq!(emojis.drawable(&unknown), Drawable::Name);
     }
 
     #[test]
@@ -305,38 +303,31 @@ mod tests {
             skin_tone: None,
             unicode: Some("🎉".into()),
         };
-        let (emojis, pictures) = (Emojis::default(), Pictures::default());
-        assert_eq!(emojis.drawable(&emoji, &pictures), Drawable::Text("🎉"));
+        assert_eq!(Emojis::default().drawable(&emoji), Drawable::Text("🎉"));
     }
 
     #[test]
-    fn custom_emoji_follow_their_picture() {
+    fn custom_emoji_are_pictures_or_the_standard_ones_they_stand_for() {
         let mut emojis = Emojis::default();
         let mut custom = CustomEmojiSet::default();
         custom.insert_image("parrot", "https://e/parrot.gif");
         custom.insert_alias("yes", "white_check_mark");
         emojis.set(custom, Vec::new());
-        let mut pictures = Pictures::default();
 
+        assert_eq!(emojis.drawable(&Emoji::named("yes")), Drawable::Text("✅"));
         assert_eq!(
-            emojis.drawable(&Emoji::named("yes"), &pictures),
-            Drawable::Text("✅")
+            emojis.drawable(&Emoji::named("parrot")),
+            Drawable::Picture("https://e/parrot.gif")
         );
-        let parrot = Emoji::named("parrot");
-        let url = "https://e/parrot.gif";
-        let awaiting = Drawable::Picture { url, loaded: None };
-        assert_eq!(emojis.drawable(&parrot, &pictures), awaiting);
-        pictures.want(url, slackers_gfx::Fit::Emoji);
-        assert_eq!(emojis.drawable(&parrot, &pictures), awaiting);
-        let picture = slackers_gfx::Picture::for_tests(&slackers_gfx::Ids::default(), 1, 1);
-        pictures.loaded(url.into(), picture);
-        assert!(matches!(
-            emojis.drawable(&parrot, &pictures),
-            Drawable::Picture { url: at, loaded: Some(_) } if at == url
-        ));
-        pictures.forget_all();
-        pictures.failed(url.into());
-        assert_eq!(emojis.drawable(&parrot, &pictures), Drawable::Name);
+    }
+
+    #[test]
+    fn the_emoji_used_most_are_offered_first() {
+        let mut emojis = emojis(&["parrot"], &["+1", "tada"]);
+        emojis.note_use("tada");
+        let offered: Vec<&str> = emojis.offered().iter().map(|(name, _)| *name).collect();
+        assert_eq!(offered, ["tada", "+1", "parrot"]);
+        assert!(emojis.offered()[1].1.contains(&"thumbsup"));
     }
 
     #[test]
@@ -387,7 +378,7 @@ mod tests {
 
     #[test]
     fn a_standard_emoji_is_found_by_its_other_names_and_offered_by_slacks() {
-        let mut emojis = emojis(&["thumbsup_all"], &["+1", "thinking_face"]);
+        let emojis = emojis(&["thumbsup_all"], &["+1", "thinking_face"]);
         let found = emojis.complete("thumbsup", 10);
         assert_eq!(names(&found), ["+1", "thumbsup_all"]);
         assert_eq!(
@@ -410,7 +401,7 @@ mod tests {
 
     #[test]
     fn a_custom_emoji_shadows_a_standard_one_of_the_same_name() {
-        let mut emojis = emojis(&["tada"], &["tada", "taco"]);
+        let emojis = emojis(&["tada"], &["tada", "taco"]);
         assert_eq!(names(&emojis.complete("ta", 10)), ["taco", "tada"]);
     }
 }

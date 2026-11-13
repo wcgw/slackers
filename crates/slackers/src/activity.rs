@@ -1,5 +1,5 @@
-//! Activity, merged from every Workspace: what's loaded of each, what to ask Slack for next, where the user is in
-//! it, and the Messages fetched to show for its items.
+//! Activity, merged from every Workspace: what's loaded of each, what to ask Slack for next, and the Messages
+//! fetched to show for its items. Where the user is in it is the kit's: the cursor of the window showing it.
 //!
 //! Each Workspace's Activity loads a page at a time, newest first. Merged, the items show newest first down to where
 //! a Workspace with older pages still to load stops: past that, its items would be missing from among the others'.
@@ -19,8 +19,6 @@ pub(crate) struct Activity {
     messages: HashMap<(WorkspaceKey, ConversationId, Ts), Option<Message>>,
     /// Messages asked for and not answered yet.
     fetching: HashSet<(WorkspaceKey, ConversationId, Ts)>,
-    /// The selected item, by Workspace and key; `None` for the newest.
-    selected: Option<(WorkspaceKey, String)>,
 }
 
 /// One Workspace's Activity, as far as loaded.
@@ -180,53 +178,11 @@ impl Activity {
         })
     }
 
-    /// The position of the selected item among the [entries](Activity::entries).
-    pub(crate) fn selected(&self) -> usize {
-        let Some((workspace, key)) = &self.selected else {
-            return 0;
-        };
+    /// The item with `key` from the Workspace at `workspace`, if it's among the [entries](Activity::entries).
+    pub(crate) fn entry(&self, workspace: WorkspaceKey, key: &str) -> Option<Entry<'_>> {
         self.entries()
-            .iter()
-            .position(|entry| entry.workspace == *workspace && entry.item.key == *key)
-            .unwrap_or(0)
-    }
-
-    /// The selected item, if there are any.
-    pub(crate) fn selected_entry(&self) -> Option<Entry<'_>> {
-        self.entries().get(self.selected()).copied()
-    }
-
-    /// Moves the selection `by` items down, older, or up, newer, when negative, stopping at either end.
-    pub(crate) fn select_by(&mut self, by: isize) {
-        let entries = self.entries();
-        let last = entries.len().saturating_sub(1);
-        let at = self.selected().saturating_add_signed(by).min(last);
-        self.selected = entries
-            .get(at)
-            .map(|entry| (entry.workspace, entry.item.key.clone()));
-    }
-
-    /// Selects the item with `key` from the Workspace at `workspace`, if it's among the
-    /// [entries](Activity::entries). Returns whether it is.
-    pub(crate) fn select(&mut self, workspace: WorkspaceKey, key: &str) -> bool {
-        let listed = self
-            .entries()
-            .iter()
-            .any(|entry| entry.workspace == workspace && entry.item.key == key);
-        if listed {
-            self.selected = Some((workspace, key.to_owned()));
-        }
-        listed
-    }
-
-    /// Selects the newest item.
-    pub(crate) fn select_newest(&mut self) {
-        self.selected = None;
-    }
-
-    /// Selects the oldest item loaded.
-    pub(crate) fn select_oldest(&mut self) {
-        self.select_by(isize::MAX);
+            .into_iter()
+            .find(|entry| entry.workspace == workspace && entry.item.key == key)
     }
 
     /// Where the Message at `at`, in `key`, stands, as fetched for an item.
@@ -427,30 +383,16 @@ mod tests {
     }
 
     #[test]
-    fn the_selection_stays_on_its_item_as_newer_ones_come() {
+    fn an_item_is_found_by_its_workspace_and_key_while_its_listed() {
         let mut activity = Activity::default();
-        activity.received(
-            w(0),
-            None,
-            page(vec![item("b", 2, false), item("a", 1, false)], None),
-        );
-        assert_eq!(activity.selected(), 0);
-        activity.select_by(1);
-        assert_eq!(
-            activity.selected_entry().map(|e| e.item.key.as_str()),
-            Some("a")
-        );
-        activity.select_by(5);
-        assert_eq!(activity.selected(), 1, "stops at the end");
         activity.refresh(w(0));
-        activity.received(w(0), None, page(vec![item("c", 3, false)], None));
-        assert_eq!(activity.selected(), 2, "still on a");
-        activity.select_newest();
-        assert_eq!(activity.selected(), 0);
-        activity.select_oldest();
-        assert_eq!(activity.selected(), 2);
-        activity.select_by(-10);
-        assert_eq!(activity.selected(), 0);
+        activity.received(w(0), None, page(vec![item("a", 3, true)], None));
+        assert_eq!(
+            activity.entry(w(0), "a").map(|entry| entry.item.at),
+            Some(Ts::from_micros(3_000_000))
+        );
+        assert_eq!(activity.entry(w(1), "a"), None, "another Workspace's");
+        assert_eq!(activity.entry(w(0), "b"), None);
     }
 
     #[test]

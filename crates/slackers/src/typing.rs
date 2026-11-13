@@ -9,38 +9,39 @@ use crate::app::Place;
 
 /// How long someone counts as typing after Slack last said they were: its clients say so every few seconds while
 /// their user types, and nothing once they stop.
-const TYPING_FOR: Duration = Duration::from_secs(6);
+pub(crate) const TYPING_FOR: Duration = Duration::from_secs(6);
 
-/// Who's typing where, each until a while after Slack last said so. Times are animation time.
+/// Who's typing where, each until [`TYPING_FOR`] after Slack last said so: the app asks to hear when that is, and
+/// tells [`Typing::stopped`].
 #[derive(Debug, Default)]
 pub(crate) struct Typing {
-    /// Who's typing, by where, in the order they started, with when each stops counting as typing.
-    by_place: HashMap<Place, Vec<(UserId, Duration)>>,
-}
-
-/// Who's typing somewhere.
-#[derive(Debug, PartialEq, Eq)]
-pub(crate) struct Typists<'a> {
-    /// Who, in the order they started.
-    pub(crate) who: Vec<&'a UserId>,
-    /// When the first of them stops counting as typing, unless Slack says otherwise first; `None` when nobody's
-    /// typing.
-    pub(crate) changes: Option<Duration>,
+    /// Who's typing, by where, in the order they started, with the time Slack last said so, as counted by `heard`.
+    by_place: HashMap<Place, Vec<(UserId, u64)>>,
+    /// How many times Slack said someone was typing.
+    heard: u64,
 }
 
 impl Typing {
-    /// Notes that `user` is typing at `place`, as Slack said at `now`.
-    pub(crate) fn heard(&mut self, place: Place, user: UserId, now: Duration) {
-        // Forget whoever stopped, anywhere, so that nothing piles up.
-        self.by_place.retain(|_, typists| {
-            typists.retain(|&(_, until)| until > now);
-            !typists.is_empty()
-        });
-        let until = now + TYPING_FOR;
+    /// Notes that `user` is typing at `place`, as Slack just said. Returns what to tell [`Typing::stopped`] once
+    /// [`TYPING_FOR`] has passed.
+    pub(crate) fn heard(&mut self, place: Place, user: UserId) -> u64 {
+        self.heard += 1;
         let typists = self.by_place.entry(place).or_default();
         match typists.iter_mut().find(|(who, _)| *who == user) {
-            Some((_, was)) => *was = until,
-            None => typists.push((user, until)),
+            Some((_, was)) => *was = self.heard,
+            None => typists.push((user, self.heard)),
+        }
+        self.heard
+    }
+
+    /// [`TYPING_FOR`] has passed since Slack said, as `heard`, that `user` was typing at `place`: unless it said so
+    /// again since, they stopped.
+    pub(crate) fn stopped(&mut self, place: &Place, user: &UserId, heard: u64) {
+        if let Some(typists) = self.by_place.get_mut(place) {
+            typists.retain(|(who, when)| who != user || *when != heard);
+            if typists.is_empty() {
+                self.by_place.remove(place);
+            }
         }
     }
 
@@ -51,19 +52,14 @@ impl Typing {
         }
     }
 
-    /// Who's typing at `place` as of `now`.
-    pub(crate) fn at(&self, place: &Place, now: Duration) -> Typists<'_> {
-        let typing = || {
-            self.by_place
-                .get(place)
-                .into_iter()
-                .flatten()
-                .filter(move |&&(_, until)| until > now)
-        };
-        Typists {
-            who: typing().map(|(who, _)| who).collect(),
-            changes: typing().map(|&(_, until)| until).min(),
-        }
+    /// Who's typing at `place`, in the order they started.
+    pub(crate) fn at(&self, place: &Place) -> Vec<&UserId> {
+        self.by_place
+            .get(place)
+            .into_iter()
+            .flatten()
+            .map(|(who, _)| who)
+            .collect()
     }
 }
 
@@ -84,63 +80,44 @@ mod tests {
         }
     }
 
-    fn secs(s: u64) -> Duration {
-        Duration::from_secs(s)
-    }
-
-    fn who(typing: &Typing, place: &Place, now: Duration) -> Vec<String> {
+    fn who(typing: &Typing, place: &Place) -> Vec<String> {
         typing
-            .at(place, now)
-            .who
+            .at(place)
             .into_iter()
             .map(ToString::to_string)
             .collect()
     }
 
     #[test]
-    fn typing_lasts_a_while_after_slack_last_says_so() {
+    fn typing_lasts_until_slack_stops_saying_so() {
         let mut typing = Typing::default();
-        typing.heard(place(None), UserId::new("U1"), secs(10));
-        typing.heard(place(None), UserId::new("U2"), secs(12));
-        assert_eq!(who(&typing, &place(None), secs(12)), ["U1", "U2"]);
-        assert_eq!(typing.at(&place(None), secs(12)).changes, Some(secs(16)));
-        assert!(
-            who(&typing, &place(Some(5)), secs(12)).is_empty(),
-            "not in a Thread"
-        );
+        let (ada, bob) = (UserId::new("U1"), UserId::new("U2"));
+        let first = typing.heard(place(None), ada.clone());
+        let second = typing.heard(place(None), bob.clone());
+        assert_eq!(who(&typing, &place(None)), ["U1", "U2"]);
+        assert!(who(&typing, &place(Some(5))).is_empty(), "not in a Thread");
 
-        typing.heard(place(None), UserId::new("U1"), secs(15));
+        let again = typing.heard(place(None), ada.clone());
+        typing.stopped(&place(None), &ada, first);
         assert_eq!(
-            who(&typing, &place(None), secs(17)),
+            who(&typing, &place(None)),
             ["U1", "U2"],
             "U1 again, in their place"
         );
-        assert_eq!(who(&typing, &place(None), secs(18)), ["U1"]);
-        assert_eq!(typing.at(&place(None), secs(18)).changes, Some(secs(21)));
-        assert_eq!(
-            typing.at(&place(None), secs(21)),
-            Typists {
-                who: Vec::new(),
-                changes: None
-            }
-        );
+        typing.stopped(&place(None), &bob, second);
+        assert_eq!(who(&typing, &place(None)), ["U1"]);
+        typing.stopped(&place(None), &ada, again);
+        assert!(who(&typing, &place(None)).is_empty());
+        assert!(typing.by_place.is_empty(), "nothing piles up");
     }
 
     #[test]
     fn posting_ends_typing_where_posted() {
         let mut typing = Typing::default();
-        typing.heard(place(None), UserId::new("U1"), secs(1));
-        typing.heard(place(Some(5)), UserId::new("U1"), secs(1));
+        typing.heard(place(None), UserId::new("U1"));
+        typing.heard(place(Some(5)), UserId::new("U1"));
         typing.posted(&place(Some(5)), &UserId::new("U1"));
-        assert!(who(&typing, &place(Some(5)), secs(2)).is_empty());
-        assert_eq!(who(&typing, &place(None), secs(2)), ["U1"]);
-    }
-
-    #[test]
-    fn whoever_stopped_is_forgotten() {
-        let mut typing = Typing::default();
-        typing.heard(place(None), UserId::new("U1"), secs(1));
-        typing.heard(place(Some(5)), UserId::new("U2"), secs(100));
-        assert_eq!(typing.by_place.len(), 1);
+        assert!(who(&typing, &place(Some(5))).is_empty());
+        assert_eq!(who(&typing, &place(None)), ["U1"]);
     }
 }
