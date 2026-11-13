@@ -29,8 +29,8 @@ here, and in the code, are defined in [CONTEXT.md](CONTEXT.md).
 - A [Nerd Font](https://www.nerdfonts.com) for the icons, which Ghostty, kitty and WezTerm ship; elsewhere they're
   plain characters (`:set icons=nerd` or `plain` says otherwise).
 - Linux, with `secret-tool` from libsecret and a Secret Service keyring (GNOME Keyring, KeePassXC, …), or macOS.
-- Rust 1.99 or newer, to build it, and [wcgw-kit](https://github.com/wcgw/wcgw-kit) checked out beside slackers:
-  slackers runs in it (see [ADR 0003](docs/adr/0003-run-in-wcgw-kit.md)).
+- Rust 1.99 or newer, to build it. slackers runs in [wcgw-kit](https://github.com/wcgw/wcgw-kit) (see
+  [ADR 0003](docs/adr/0003-run-in-wcgw-kit.md)), at its `v0.1.0` tag, which cargo fetches.
 
 ## Install
 

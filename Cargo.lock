@@ -3219,6 +3219,7 @@ dependencies = [
 [[package]]
 name = "wcgw-kit"
 version = "0.1.0"
+source = "git+https://github.com/wcgw/wcgw-kit?tag=v0.1.0#88762d4dc388ffb287bda3a94ae5476804c5ea58"
 dependencies = [
  "crossterm",
  "futures-util",
@@ -3236,6 +3237,7 @@ dependencies = [
 [[package]]
 name = "wcgw-kit-gfx"
 version = "0.1.0"
+source = "git+https://github.com/wcgw/wcgw-kit?tag=v0.1.0#88762d4dc388ffb287bda3a94ae5476804c5ea58"
 dependencies = [
  "base64 0.22.1",
  "image",

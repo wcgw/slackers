@@ -51,8 +51,8 @@ slackers-gfx goes, and so do slackers' modes, panes, focus, key handling, drawin
   opens: it was slackers' alone.
 - Notices stay in the command line until the next key, as Vim's messages do, rather than going after 8 seconds; the
   status line says how connections stand and who's typing, but no longer which keys apply.
-- slackers depends on the kit by path until the kit is published (the kit's D18), which raises the Rust it builds
-  with to the kit's 1.99.
+- slackers depends on the kit at its `v0.1.0` tag (the kit's D18; it was a path to a local checkout until then),
+  which raises the Rust it builds with to the kit's 1.99.
 - Pictures are drawn in more terminals: the kit falls back on half blocks where kitty's Unicode placeholders aren't
   known to work (its D15), which supersedes [ADR 0002](0002-ghostty-kitty-unicode-placeholders.md)'s Ghostty-only
   stance.
