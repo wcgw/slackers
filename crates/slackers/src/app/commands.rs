@@ -38,7 +38,12 @@ const KEYS: [(&str, &str, &str, Topic); 12] = [
         Topic::BUFFERS,
     ),
     ("<leader>a", "activity", "Activity", Topic::BUFFERS),
-    ("<Bslash>", "sidebar", "sidebar", Topic::WINDOWS),
+    (
+        "<Bslash>",
+        "sidebar",
+        "the sidebar: go, hide, bring back",
+        Topic::WINDOWS,
+    ),
     ("q", "exit", "close, or quit", Topic::WINDOWS),
 ];
 
@@ -63,7 +68,7 @@ pub(super) fn install(kit: &mut Kit) {
                 Ok(Vec::new())
             })
         })
-        .help("hide the sidebar, go to it, or bring it back"),
+        .help("hide the sidebar from within it, go to it from anywhere else, or bring it back"),
         Command::<Slackers>::new("exit", 3, |app, kit, _| app.exit(kit))
             .help("close the window; quit rather than leave the sidebar alone, or from it"),
         Command::<Slackers>::new("activity", 3, |app, kit, _| {
