@@ -19,25 +19,25 @@ const MESSAGES: Topic = Topic::new(75, "Messages");
 /// slackers' default bindings: keys, the ex command each runs, what which-key says of it, and its `:help` topic.
 const KEYS: [(&str, &str, &str, Topic); 12] = [
     ("i", "startinsert", "write", MESSAGES),
-    ("A", "amend", "edit your message", MESSAGES),
+    ("A", "amend", "edit your Message", MESSAGES),
     ("+", "react", "react", MESSAGES),
     ("U", "unread", "mark unread from here", MESSAGES),
-    ("K", "details", "message details", Topic::OPENING),
+    ("K", "details", "Message details", Topic::OPENING),
     (
         "gx",
         "browse link",
-        "open a link of the message",
+        "open a link of the Message",
         Topic::OPENING,
     ),
-    ("gX", "browse", "open the message in Slack", Topic::OPENING),
-    ("gy", "yanklink", "yank the message's link", Topic::YANKING),
+    ("gX", "browse", "open the Message in Slack", Topic::OPENING),
+    ("gy", "yanklink", "yank the Message's link", Topic::YANKING),
     (
         "<leader>f",
         "pick conversations",
-        "find a conversation",
+        "find a Conversation",
         Topic::BUFFERS,
     ),
-    ("<leader>a", "activity", "activity", Topic::BUFFERS),
+    ("<leader>a", "activity", "Activity", Topic::BUFFERS),
     ("<Bslash>", "sidebar", "sidebar", Topic::WINDOWS),
     ("q", "exit", "close, or quit", Topic::WINDOWS),
 ];
@@ -70,7 +70,7 @@ pub(super) fn install(kit: &mut Kit) {
             acting(app, kit, |app, kit| Ok(app.open_activity(kit)))
         })
         .jumps()
-        .help("mentions, reactions, replies and DMs, newest first"),
+        .help("Activity: Mentions, Reactions, Replies and DMs, newest first"),
         Command::<Slackers>::new("thread", 3, |app, kit, _| {
             acting(app, kit, |app, kit| {
                 let (place, ts) = Slackers::message_under_cursor(kit)?;
@@ -78,21 +78,21 @@ pub(super) fn install(kit: &mut Kit) {
             })
         })
         .jumps()
-        .help("the thread of the message"),
+        .help("the Thread of the Message"),
         Command::<Slackers>::new("amend", 3, |app, kit, _| acting(app, kit, Slackers::amend))
-            .help("edit your message in the composer"),
+            .help("edit your Message in the composer"),
         Command::<Slackers>::new("react", 3, |app, kit, line| {
             acting(app, kit, |app, kit| app.react(kit, line))
         })
-        .help("react to the message, or take your reaction back"),
+        .help("react to the Message, or take your Reaction back"),
         Command::<Slackers>::new("unread", 3, |app, kit, _| {
             acting(app, kit, Slackers::mark_unread)
         })
-        .help("mark the message and those after it unread"),
+        .help("mark the Message and those after it Unread"),
         Command::<Slackers>::new("details", 3, |app, kit, _| {
             acting(app, kit, Slackers::details)
         })
-        .help("who wrote the message, who reacted, where it leads"),
+        .help("who wrote the Message, who reacted, where it leads"),
         // As in the other apps, `:browse` alone is the thing itself on the web, `:browse link` the link under the
         // cursor.
         Command::<Slackers>::new("browse", 3, |app, kit, line| match line.args {
@@ -102,7 +102,7 @@ pub(super) fn install(kit: &mut Kit) {
             }),
             args => Err(format!("E475: Invalid argument: {args}")),
         })
-        .help("open the message in Slack; with link, the link under the cursor, or one of the message's")
+        .help("open the Message in Slack; with link, the link under the cursor, or one of the Message's")
         .complete(|_, _, before, _| {
             if before.is_empty() {
                 vec!["link".to_owned()]
@@ -111,11 +111,11 @@ pub(super) fn install(kit: &mut Kit) {
             }
         }),
         Command::<Slackers>::new("yanklink", 5, |app, kit, _| app.yank_link(kit))
-            .help("yank the link under the cursor, or the message's"),
+            .help("yank the link under the cursor, else the Message's"),
         Command::<Slackers>::new("vw", 2, |app, kit, line| {
             acting(app, kit, |app, kit| app.virtual_workspace(kit, line))
         })
-        .help("vw add NAME, vw rm NAME: put the channel in a virtual workspace, or take it out")
+        .help("vw add NAME, vw rm NAME: put the Channel in a Virtual Workspace, or take it out")
         .complete(|app, _, before, _| match before {
             [] => vec!["add".to_owned(), "rm".to_owned()],
             [_] => app
@@ -309,7 +309,7 @@ impl Slackers {
             })
             .collect();
         let picker =
-            Picker::list("Open", picks, "Nothing to open").verb("<C-y>", "copy", |_, kit, pick| {
+            Picker::list("Open", picks, "Nothing to open").verb("<C-y>", "yank", |_, kit, pick| {
                 match pick {
                     Picked::Target(Target::Url(url)) => {
                         // A verb leaves the picker open: copied, there is nothing more to pick.

@@ -2062,7 +2062,7 @@ fn quitting_with_nothing_on_its_way_or_a_bang_is_at_once() {
 }
 
 #[test]
-fn ctrl_y_in_the_open_picker_copies_a_link() {
+fn ctrl_y_in_the_open_picker_yanks_a_link() {
     let mut test = reading_random();
     let link = |url: &str| Inline::Link {
         url: url.into(),
@@ -2080,7 +2080,7 @@ fn ctrl_y_in_the_open_picker_copies_a_link() {
         },
     );
     test.press("kgx");
-    assert!(shows(&test, "<C-y> copy"), "{}", screen(&test));
+    assert!(shows(&test, "<C-y> yank"), "{}", screen(&test));
     let effects = test.press("b.com<C-y>");
     assert!(effects.contains(&Effect::Copy("https://b.com".into())));
     assert_eq!(told(&test), "Yanked https://b.com");
