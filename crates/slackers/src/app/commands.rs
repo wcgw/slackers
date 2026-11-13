@@ -323,7 +323,6 @@ impl Slackers {
         Ok(kit.open_picker(self, picker))
     }
 
-    /// `:yanklink` (`gy`): the link under the cursor, else the Message's on Slack's web client, to the clipboard.
     /// The link to the message under the cursor in Slack's web client, which `:browse` opens.
     fn message_url(&self, kit: &Kit) -> Result<String, String> {
         let (place, ts) = Self::message_under_cursor(kit)?;
@@ -338,6 +337,7 @@ impl Slackers {
             .ok_or_else(|| "Slack doesn't keep this message: it has no link".to_owned())
     }
 
+    /// `:yanklink` (`gy`): the link under the cursor, else the Message's on Slack's web client, to the clipboard.
     fn yank_link(&mut self, kit: &mut Kit) -> Result<Effects, String> {
         let url = match kit.target_under_cursor() {
             Some(Target::Url(url)) => url,
