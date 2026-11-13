@@ -105,7 +105,13 @@ impl Slackers {
                 target: Some(Target::Activity),
             },
         ));
+        let mut keys = std::collections::HashSet::new();
         for (section, items) in self.sidebar.sections() {
+            // Two Virtual Workspaces of one name, as a config edited by hand may have, are two sections.
+            let mut key = section.key();
+            while !keys.insert(key.clone()) {
+                key.push('\'');
+            }
             let badge = items
                 .iter()
                 .map(|item| self.badge_of_item(item))
@@ -153,7 +159,7 @@ impl Slackers {
             }
             let folded = lines.len();
             blocks.push((
-                BlockKey::new(section.key()),
+                BlockKey::new(key),
                 Content {
                     lines,
                     folds: vec![Fold {

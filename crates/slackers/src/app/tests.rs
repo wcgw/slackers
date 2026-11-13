@@ -1721,3 +1721,92 @@ fn pictures_come_through_their_workspace() {
         Some((W0, "https://avatars/bob.png"))
     );
 }
+
+#[test]
+fn a_thread_shows_on_its_parent_with_how_many_replies_and_when_the_last_came() {
+    let test = reading_random();
+    let main = main_rows(&test);
+    let hi = main.iter().position(|row| row == " · hi").expect("grouped");
+    assert_eq!(main[hi + 1], "   ↳ 1  00:00", "{main:#?}");
+}
+
+#[test]
+fn files_show_by_name_and_images_take_their_room() {
+    let mut test = ready();
+    test.press("jjj<CR>");
+    let shared = Message {
+        files: vec![
+            slackers_model::File {
+                name: "notes.pdf".into(),
+                mimetype: "application/pdf".into(),
+                link: Some("https://files.slack.com/notes.pdf".into()),
+                image: None,
+            },
+            slackers_model::File {
+                name: "cat.png".into(),
+                mimetype: "image/png".into(),
+                link: None,
+                image: Some(slackers_model::Image {
+                    url: "https://files.slack.com/cat.png".into(),
+                    width: 100,
+                    height: 60,
+                }),
+            },
+        ],
+        ..message(1, "U9", "look")
+    };
+    slack(&mut test, history("C1", vec![shared], false));
+    let main = main_rows(&test);
+    let file = main
+        .iter()
+        .position(|row| row == "   ▤ notes.pdf")
+        .unwrap_or_else(|| panic!("{main:#?}"));
+    assert_eq!(
+        main[file + 1..file + 4],
+        ["", "", ""],
+        "an image 3 rows tall, drawn by the kit"
+    );
+    test.press("G");
+    let effects = test.press("3k$<CR>");
+    assert!(effects.contains(&Effect::OpenUrl("https://files.slack.com/notes.pdf".into())));
+}
+
+#[test]
+fn with_several_workspaces_a_notification_names_its_own() {
+    let mut test = starting(&["test", "other"], Vec::new(), 100, 20);
+    slack(&mut test, Update::Ready(Box::new(test_snapshot())));
+    slack(&mut test, Update::User(user("U9", "Bob")));
+    test.update(wcgw_kit::Msg::FocusLost);
+    let effects = posted(&mut test, "D1", message(11, "U9", "psst"));
+    assert_eq!(
+        notified(&effects),
+        [("Bob · Test".to_owned(), "psst".to_owned())]
+    );
+}
+
+#[test]
+fn two_virtual_workspaces_of_one_name_are_two_sections() {
+    let named_k = |channel: &str| VirtualWorkspace {
+        name: "K".into(),
+        channels: vec![ChannelRef {
+            workspace: "test".into(),
+            channel: channel.into(),
+        }],
+    };
+    let mut test = starting(
+        &["test"],
+        vec![named_k("random"), named_k("general")],
+        100,
+        20,
+    );
+    slack(&mut test, Update::Ready(Box::new(test_snapshot())));
+    assert_eq!(
+        sidebar(&test)[2..6],
+        [
+            "▾ ≡ K                       •",
+            "T # random                  •",
+            "▾ ≡ K",
+            "T * general"
+        ]
+    );
+}
