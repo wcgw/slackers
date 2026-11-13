@@ -115,7 +115,7 @@ and `:qa` quits, once Slack has what you just sent (`:qa!` doesn't wait). Settin
 | `q` | `:exit` | Closes the window, as a Thread's beside its Conversation; from the Conversation or the sidebar, quits rather than leave the sidebar alone, as `:qa` does |
 | `\` | `:sidebar` | Hides the sidebar from within it, goes to it from elsewhere, and brings it back |
 | `za` `zo` `zc` `zM` `zR` | | Fold the sidebar's sections |
-| `<Space>f` | `:pick conversations` | Finds a Conversation by name, fzf-style |
+| `<Space>ff` | `:pick conversations` | Finds a Conversation by name, fzf-style, as every app finds its own; `<Space>fb`, `fh`, `fk`, `fC`, `fj` find buffers, help, keys, commands and jumps |
 | `<Space>a` | `:activity` | Activity |
 | `i` | `:startinsert` | Writes in the Conversation's or Thread's composer |
 | `A` | `:amend` | Edits your Message in the composer; `Enter` saves it, `Esc` gives it up |

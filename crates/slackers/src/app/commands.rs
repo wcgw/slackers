@@ -32,7 +32,7 @@ const KEYS: [(&str, &str, &str, Topic); 12] = [
     ("gX", "browse", "open the Message in Slack", Topic::OPENING),
     ("gy", "yanklink", "yank the Message's link", Topic::YANKING),
     (
-        "<leader>f",
+        "<leader>ff",
         "pick conversations",
         "find a Conversation",
         Topic::BUFFERS,

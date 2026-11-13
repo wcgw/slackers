@@ -837,9 +837,9 @@ fn a_double_click_opens_what_it_lands_on_and_a_click_alone_does_not() {
 }
 
 #[test]
-fn leader_f_finds_a_conversation_by_name() {
+fn leader_ff_finds_a_conversation_by_name() {
     let mut test = ready();
-    test.press("<Space>f");
+    test.press("<Space>ff");
     assert!(shows(&test, "Conversations"), "{}", screen(&test));
     test.press("rand<CR>");
     assert_eq!(main_rows(&test)[0], " T # random");
