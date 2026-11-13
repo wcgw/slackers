@@ -166,6 +166,11 @@ fn rows(test: &Test) -> Vec<String> {
     test.screen().rows
 }
 
+/// The windows' rows, under the tabline, which the kit shows always.
+fn windows(test: &Test) -> Vec<String> {
+    rows(test).split_off(1)
+}
+
 /// What the screen says, row by row.
 fn screen(test: &Test) -> String {
     rows(test).join("\n")
@@ -205,7 +210,7 @@ fn click_on(test: &mut Test, text: &str) -> Effects {
 
 /// The rows of the window right of the sidebar, from its winbar down.
 fn main_rows(test: &Test) -> Vec<String> {
-    rows(test)
+    windows(test)
         .iter()
         .map(|row| {
             row.split_once('│')
@@ -216,7 +221,7 @@ fn main_rows(test: &Test) -> Vec<String> {
 
 /// The sidebar's rows, trimmed.
 fn sidebar(test: &Test) -> Vec<String> {
-    rows(test)
+    windows(test)
         .iter()
         .map(|row| row.split('│').next().unwrap_or("").trim().to_owned())
         .collect()
@@ -747,7 +752,7 @@ fn a_thread_opens_in_place_of_its_conversation_on_a_narrow_screen_and_beside_it_
     );
     let main = main_rows(&test);
     assert_eq!(
-        main[1], " ↳ thread in T # random",
+        main[0], " ↳ thread in T # random",
         "below the tabline: {main:#?}"
     );
     assert!(main.iter().any(|row| row.contains("─── 1 reply ───")));
@@ -767,14 +772,14 @@ fn a_thread_opens_in_place_of_its_conversation_on_a_narrow_screen_and_beside_it_
         height: 20,
     });
     assert_eq!(
-        main_rows(&test)[1],
+        main_rows(&test)[0],
         " ↳ thread in T # random",
         "{}",
         screen(&test)
     );
     test.press("<C-t>");
     assert_eq!(
-        main_rows(&test)[1],
+        main_rows(&test)[0],
         " T # random",
         "back to the conversation"
     );
@@ -807,12 +812,12 @@ fn backslash_hides_the_sidebar_from_within_it_goes_to_it_and_brings_it_back() {
     test.press("<Bslash>");
     assert!(!shows(&test, "Activity"), "{}", screen(&test));
     assert_eq!(
-        rows(&test)[0],
+        windows(&test)[0],
         " T Test › # random",
         "the winbar names the section, breadcrumb-style"
     );
     assert!(
-        rows(&test)[1].contains(&" ".repeat(38)),
+        windows(&test)[1].contains(&" ".repeat(38)),
         "laid out again for the whole width"
     );
     test.press("<Bslash>");
@@ -1070,7 +1075,7 @@ fn a_command_that_posts_for_the_user_elsewhere_is_followed_there() {
             before: None
         }
     ));
-    assert_eq!(main_rows(&test)[1], " T @ Bob", "{}", screen(&test));
+    assert_eq!(main_rows(&test)[0], " T @ Bob", "{}", screen(&test));
 }
 
 #[test]
@@ -1725,7 +1730,7 @@ fn activity_lists_what_happened_and_opens_an_items_message() {
             before: None
         }
     ));
-    assert_eq!(main_rows(&test)[1], " T * general", "{}", screen(&test));
+    assert_eq!(main_rows(&test)[0], " T * general", "{}", screen(&test));
     slack(
         &mut test,
         history(
