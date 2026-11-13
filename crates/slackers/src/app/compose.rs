@@ -178,6 +178,10 @@ impl Slackers {
         let mut effects = if self.editing.contains_key(&place) {
             self.save_edit(kit, &place, written)
         } else {
+            // As in Slack, on to the newest, which the window then follows to what's sent.
+            let end = super::navigate::cursor_at_end(kit, buffer);
+            let window = kit.current_window();
+            kit.set_cursor(window, end);
             self.post(kit, &place, written)
         };
         self.title_composer(kit, buffer, &place);

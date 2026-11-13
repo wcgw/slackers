@@ -10,7 +10,7 @@ use wcgw_kit::shell::{Choice as Pick, Command, Invocation, Pick as Picked, Picke
 use super::workspace::{Choice, LinkKind};
 use super::{Effect, Effects, Kit, Phase, Slackers, Target, slack};
 use crate::config::VirtualWorkspace;
-use crate::hl::{ACCENT, BUTTON, DIM, PRIMARY_BUTTON, READ, UNREAD};
+use crate::hl::{ACCENT, ALERT, BUTTON, DIM, LIVE, PRIMARY_BUTTON, READ, RECONNECTING, UNREAD};
 use crate::icons;
 
 /// What slackers' own commands on Messages are about, in `:help`: between opening and buffers.
@@ -37,15 +37,15 @@ const KEYS: [(&str, &str, &str, Topic); 12] = [
     ("<Bslash>", "sidebar", "sidebar", Topic::WINDOWS),
 ];
 
-/// Runs `act` as a command does, then keeps everything current as any change does.
+/// Runs `act` as a command does, then keeps everything current as any change does. What the cursor reads after,
+/// `keyed` marks read.
 fn acting(
     app: &mut Slackers,
     kit: &mut Kit,
     act: impl FnOnce(&mut Slackers, &mut Kit) -> Result<Effects, String>,
 ) -> Result<Effects, String> {
-    let reading = app.reading_newest(kit);
     let mut effects = act(app, kit)?;
-    effects.extend(app.changed(kit, &reading));
+    effects.extend(app.changed(kit, &[]));
     Ok(effects)
 }
 
@@ -114,9 +114,18 @@ pub(super) fn install(kit: &mut Kit) {
             .bind(&[Mode::Normal], notation, command, description, topic);
     }
     kit.add_picker("conversations", |app, kit| app.conversation_picker(kit));
-    kit.add_segment(Segment::new(Side::Left, 10, |app: &Slackers, kit| {
-        Some(app.connections(kit))
-    }));
+    // The connections, coloured by how they stand, as many segments.
+    for (standing, group) in [
+        (Standing::Down, ALERT),
+        (Standing::Reconnecting, RECONNECTING),
+        (Standing::Connecting, ACCENT),
+        (Standing::Live, LIVE),
+    ] {
+        let segment = Segment::new(Side::Left, 10, move |app: &Slackers, kit| {
+            app.connections(kit, standing)
+        });
+        kit.add_segment(segment.with_group(group));
+    }
     kit.add_segment(Segment::new(Side::Right, 0, |app: &Slackers, kit| {
         app.typing_segment(kit)
     }));
@@ -411,28 +420,40 @@ impl Slackers {
         Picker::list("Conversations", choices, "No conversation by that name")
     }
 
-    /// How the Workspaces' connections stand, for the statusline: `live` when every one is, else how each that isn't
-    /// stands.
-    fn connections(&self, kit: &Kit) -> String {
+    /// The Workspaces whose connections stand as `standing`, for the statusline; `live` once every one is.
+    fn connections(&self, kit: &Kit, standing: Standing) -> Option<String> {
         let mut parts = Vec::new();
+        let mut all_live = true;
         for (_, sign_in) in self.workspaces.iter() {
-            let (icon, state) = match &sign_in.phase {
-                Phase::SigningIn => (icons::LOADING, "signing in".to_owned()),
-                Phase::Failed(_) => (icons::ALERT, "signed out".to_owned()),
+            let (icon, state, stands) = match &sign_in.phase {
+                Phase::SigningIn => (
+                    icons::LOADING,
+                    "signing in".to_owned(),
+                    Standing::Connecting,
+                ),
+                Phase::Failed(_) => (icons::ALERT, "signed out".to_owned(), Standing::Down),
                 Phase::Ready(workspace) => match workspace.connection {
                     Some(Connection::Live) => continue,
-                    None => (icons::LOADING, "connecting".to_owned()),
-                    Some(Connection::Reconnecting { attempt }) => {
-                        (icons::OFFLINE, format!("reconnecting ({attempt})"))
-                    }
+                    None => (
+                        icons::LOADING,
+                        "connecting".to_owned(),
+                        Standing::Connecting,
+                    ),
+                    Some(Connection::Reconnecting { attempt }) => (
+                        icons::OFFLINE,
+                        format!("reconnecting ({attempt})"),
+                        Standing::Reconnecting,
+                    ),
                 },
             };
-            parts.push(format!("{}{} {state}", kit.icon(icon), sign_in.label));
+            all_live = false;
+            if stands == standing {
+                parts.push(format!("{}{} {state}", kit.icon(icon), sign_in.label));
+            }
         }
-        if parts.is_empty() {
-            format!("{}live", kit.icon(icons::LIVE))
-        } else {
-            parts.join("  ")
+        match standing {
+            Standing::Live => all_live.then(|| format!("{}live", kit.icon(icons::LIVE))),
+            _ => (!parts.is_empty()).then(|| parts.join("  ")),
         }
     }
 
@@ -463,6 +484,19 @@ impl Slackers {
         }
         (!said.is_empty()).then(|| said.join("  "))
     }
+}
+
+/// How a Workspace's connection stands, as the statusline colours it.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Standing {
+    /// Signed out, or never signed in.
+    Down,
+    /// Live once, and coming back.
+    Reconnecting,
+    /// Signing in, or not live yet.
+    Connecting,
+    /// Every one live.
+    Live,
 }
 
 /// `text`'s first word, and the rest without leading spaces.

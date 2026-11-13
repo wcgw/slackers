@@ -27,7 +27,7 @@ use crate::activity::{Entry, Fetched};
 use crate::emoji::Drawable;
 use crate::hl::{
     ACCENT, ACTIVE, ALERT, BOT, BUTTON, CODE, DIM, HEADER, LINK, MENTION, MENTION_ME, NEW as RULE,
-    PRIMARY_BUTTON, QUOTE, READ, UNREAD,
+    OPEN, PRIMARY_BUTTON, QUOTE, READ, UNREAD,
 };
 use crate::icons;
 use crate::layout::{self, Piece as LayoutPiece};
@@ -83,10 +83,8 @@ impl Slackers {
                 .into_iter()
                 .any(|window| kit.window_buffer(window) == Some(buffer))
         });
-        let tint = kit
-            .style(Group::CURSOR_LINE)
-            .bg
-            .map(|bg| Style::new().bg(bg));
+        // The rows of what windows show, in their group's background: the cursor's row is `CursorLine`'s.
+        let tint = kit.style(OPEN).bg.map(|bg| Style::new().bg(bg));
         let open = |spans: Vec<Span>, is_open: bool| match (tint, is_open) {
             (Some(tint), true) => spans
                 .into_iter()
@@ -94,8 +92,15 @@ impl Slackers {
                 .collect(),
             _ => spans,
         };
-        let width = usize::from(SIDEBAR_WIDTH);
+        let width = usize::from(
+            self.sidebar_window(kit)
+                .and_then(|window| kit.window_text_area(window))
+                .map_or(SIDEBAR_WIDTH, |area| area.width),
+        );
         let mut blocks: Vec<(BlockKey, Content<Target>)> = Vec::new();
+        // Each row's line, counting from Activity's, for the first with something unread.
+        let mut line = 1;
+        let mut first_unread = None;
         let activity = open(self.activity_row(kit, width), activity_shown);
         blocks.push((
             BlockKey::new("activity"),
@@ -116,9 +121,21 @@ impl Slackers {
                 .iter()
                 .map(|item| self.badge_of_item(item))
                 .fold(Badge::default(), Badge::plus);
-            let header = |folded| Line::Text(self.header_row(kit, section, folded, badge, width));
+            let header = |folded| {
+                let row = self.header_row(kit, section, folded, badge, width);
+                Line::Text(
+                    row.into_iter()
+                        .map(|span| span.with_target(Target::Fold))
+                        .collect(),
+                )
+            };
             let mut lines = vec![header(false)];
+            line += 1;
             for item in items {
+                if first_unread.is_none() && self.badge_of_item(item).unread {
+                    first_unread = Some(line);
+                }
+                line += 1;
                 let (row, is_open) = match item {
                     Item::Conversation(conversation) => {
                         // Only a Workspace's own section needs no mark of the Workspace on each row.
@@ -171,6 +188,7 @@ impl Slackers {
                 },
             ));
         }
+        self.first_unread = first_unread;
         kit.buffer_mut(self.sidebar_buffer)
             .doc_mut()
             .set_blocks(blocks);
@@ -395,7 +413,8 @@ impl Slackers {
                 effects.push(slack(key, request));
             }
         }
-        let width = usize::from(self.width_of(kit, buffer));
+        let width = usize::from(kit.text_width(buffer));
+        self.widths.insert(buffer, kit.text_width(buffer));
         let now = Timestamp::now();
         let entries = self.activity.entries();
         let mut blocks: Vec<(BlockKey, Content<Target>)> = entries
@@ -535,10 +554,14 @@ impl Slackers {
     /// Draws `place`'s Messages in `buffer`, wrapped to its window's width, and its winbar; and lets the window
     /// follow the buffer's end once its cursor landed where it opened.
     pub(super) fn render_place(&mut self, kit: &mut Kit, buffer: BufferId, place: &Place) {
-        let width = self.width_of(kit, buffer);
+        let width = kit.text_width(buffer);
+        self.widths.insert(buffer, width);
         let blocks = self.place_blocks(kit, place, width);
         let winbar = self.winbar(kit, place);
+        // A DM's name may have arrived since the buffer was named after its id.
+        let name = self.buffer_name(place);
         let shown = kit.buffer_mut(buffer);
+        shown.set_name(name);
         shown.doc_mut().set_blocks(blocks);
         shown.set_winbar(Some(winbar));
         if let Some(key) = self.landing.get(&buffer) {

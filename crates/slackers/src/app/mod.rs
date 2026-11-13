@@ -34,7 +34,7 @@ use slackers_model::{Button, ConversationId, Message, Ts, UserId};
 use slackers_slack::{Request, Update};
 use wcgw_kit::BufferId;
 use wcgw_kit::doc::Document;
-use wcgw_kit::shell::{Placement, Size, WindowId};
+use wcgw_kit::shell::{CursorLine, Placement, Size, WindowId};
 
 use crate::activity::Activity;
 use crate::config::VirtualWorkspace;
@@ -120,6 +120,8 @@ fn slack(key: WorkspaceKey, request: Request) -> Effect {
 pub(crate) enum Target {
     /// Activity, merged from every Workspace: the sidebar's first row.
     Activity,
+    /// A section of the sidebar, by its header: opening it folds it, or unfolds it.
+    Fold,
     /// A Conversation.
     Conversation(ConversationRef),
     /// A Followed Thread, by its Conversation and parent.
@@ -292,6 +294,13 @@ pub(crate) struct Slackers {
     wanted_people: RefCell<Option<(WorkspaceKey, String)>>,
     /// Where the user is, for the times Messages show.
     zone: TimeZone,
+    /// Whether the sidebar's cursor goes to the first row with something unread, as Workspaces sign in: until the
+    /// user does anything.
+    suggesting: bool,
+    /// The sidebar's first row with something unread, as last drawn.
+    first_unread: Option<usize>,
+    /// The width each buffer was last laid out for, to lay it out again when its window's changes.
+    widths: HashMap<BufferId, u16>,
 }
 
 impl Slackers {
@@ -310,6 +319,8 @@ impl Slackers {
         let sign_in_buffer = kit.current_buffer();
         let main_window = kit.current_window();
         let sidebar_buffer = kit.add_buffer("sidebar", Document::new(), false);
+        kit.buffer_mut(sidebar_buffer)
+            .set_cursorline(CursorLine::Row);
         let sidebar_window = kit.open_window(
             Placement::FarLeft,
             Size::Cells(SIDEBAR_WIDTH),
@@ -348,6 +359,9 @@ impl Slackers {
             details: None,
             wanted_people: RefCell::new(None),
             zone: TimeZone::system(),
+            suggesting: true,
+            first_unread: None,
+            widths: HashMap::new(),
         };
         app.list_sidebar();
         // Nothing is signed in to yet: nothing to ask for.
@@ -417,7 +431,37 @@ impl Slackers {
         self.sidebar.set(&crate::sidebar::Section::Threads, threads);
         effects.extend(self.refresh(kit));
         effects.extend(self.refresh_details(kit));
+        self.suggest_in_sidebar(kit);
         effects
+    }
+
+    /// Puts the sidebar's cursor on its first row with something unread, without opening it (opening reads it,
+    /// which the user should choose), until the user does anything.
+    fn suggest_in_sidebar(&self, kit: &mut Kit) {
+        let (true, Some(row), Some(window)) =
+            (self.suggesting, self.first_unread, self.sidebar_window(kit))
+        else {
+            return;
+        };
+        let layout = wcgw_kit::doc::Layout::new(kit.buffer(self.sidebar_buffer).doc(), u16::MAX);
+        let cursor = wcgw_kit::doc::Cursor::at_row(&layout, row);
+        kit.set_cursor(window, cursor);
+    }
+
+    /// Lays out again the buffers whose windows changed width since they were last laid out, as a `:vsplit` does.
+    fn rewrap(&mut self, kit: &mut Kit) {
+        let changed: Vec<BufferId> = self
+            .widths
+            .iter()
+            .filter(|&(&buffer, &width)| {
+                !kit.windows_showing(buffer).is_empty() && kit.text_width(buffer) != width
+            })
+            .map(|(&buffer, _)| buffer)
+            .collect();
+        for buffer in changed {
+            // Nothing to ask for that wasn't asked for when it was last drawn.
+            let _ = self.render(kit, buffer);
+        }
     }
 }
 
@@ -451,9 +495,9 @@ impl wcgw_kit::App for Slackers {
     /// What the text under the cursor refers to: a row of the sidebar opens its Conversation, Thread or Activity; a
     /// Message, its Thread; a link, the browser; an Activity item, its Message.
     fn open(&mut self, kit: &mut Kit, target: Target) -> Result<Effects, String> {
-        let reading = self.reading_newest(kit);
         let mut effects = self.open_target(kit, target)?;
-        effects.extend(self.changed(kit, &reading));
+        // A key or a click opens: what it reads, `keyed` marks, after.
+        effects.extend(self.changed(kit, &[]));
         Ok(effects)
     }
 
@@ -504,6 +548,8 @@ impl wcgw_kit::App for Slackers {
     /// After every key: the cursor may have reached the newest Message, or the oldest loaded; a word may need
     /// people found; a composer may need its title changed.
     fn keyed(&mut self, kit: &mut Kit) -> Effects {
+        self.suggesting = false;
+        self.rewrap(kit);
         let mut effects = self.find_wanted_people();
         effects.extend(self.keep_composers(kit));
         effects.extend(self.load_older_at_top(kit));

@@ -7,7 +7,7 @@ use jiff::Timestamp;
 use slackers_model::{ConversationKind, MessageRef, Timeline, Ts, Unread};
 use slackers_slack::Request;
 use wcgw_kit::BufferId;
-use wcgw_kit::doc::{BlockKey, Cursor, Document};
+use wcgw_kit::doc::{BlockKey, Cursor, Document, FoldOp, Layout};
 use wcgw_kit::shell::{Placement, Size, WindowId};
 
 use super::{
@@ -24,6 +24,10 @@ impl Slackers {
     pub(super) fn open_target(&mut self, kit: &mut Kit, target: Target) -> Result<Effects, String> {
         match target {
             Target::Activity => Ok(self.open_activity(kit)),
+            Target::Fold => {
+                kit.fold(Some(FoldOp::Toggle), false);
+                Ok(Vec::new())
+            }
             Target::Conversation(conversation) => {
                 Ok(self.open_conversation(kit, &conversation, None))
             }
@@ -116,6 +120,8 @@ impl Slackers {
             return buffer;
         }
         let buffer = kit.add_buffer(self.buffer_name(place), Document::new(), true);
+        kit.buffer_mut(buffer)
+            .set_cursorline(wcgw_kit::shell::CursorLine::Item);
         kit.set_composer(buffer, compose::composer(place));
         self.shows.insert(buffer, Shows::Place(place.clone()));
         self.places.insert(place.clone(), buffer);
@@ -172,19 +178,19 @@ impl Slackers {
             Some(read_up_to) => self.new_after.insert(place.clone(), read_up_to),
             None => self.new_after.remove(&place),
         };
-        let landing = match (at, unread) {
+        let start = match (at, unread) {
             (Some(ts), _) => {
                 self.reaching.insert(conversation.clone(), (ts, JUMP_PAGES));
-                Some(ts.to_string())
+                Start::On(ts.to_string())
             }
             (None, Some(read_up_to)) => {
                 self.reaching
                     .insert(conversation.clone(), (read_up_to, JUMP_PAGES));
-                Some(NEW.to_owned())
+                Start::On(NEW.to_owned())
             }
             (None, None) => {
                 self.reaching.remove(conversation);
-                None
+                Start::End
             }
         };
         let buffer = self.place_buffer(kit, &place);
@@ -199,7 +205,7 @@ impl Slackers {
         }
         let main = self.main_window(kit);
         kit.focus_window(main);
-        self.show_here(kit, buffer, landing, true);
+        self.show_here(kit, buffer, start);
         let mut effects = self.load(&place, false);
         effects.extend(self.reach(conversation));
         effects
@@ -221,9 +227,11 @@ impl Slackers {
             Some(read_up_to) => self.new_after.insert(place.clone(), read_up_to),
             None => self.new_after.remove(place),
         };
-        let landing = at
-            .map(|ts| ts.to_string())
-            .or_else(|| unread.map(|_| NEW.to_owned()));
+        let start = match (at, unread) {
+            (Some(ts), _) => Start::On(ts.to_string()),
+            (None, Some(_)) => Start::On(NEW.to_owned()),
+            (None, None) => Start::End,
+        };
         let buffer = self.place_buffer(kit, place);
         if self.room(kit) >= SPLIT_AT {
             match self.thread_window(kit) {
@@ -233,12 +241,8 @@ impl Slackers {
                 None => {
                     let main = self.main_window(kit);
                     kit.focus_window(main);
-                    // Opened on another buffer first, so that the Thread's cursor starts where it should.
-                    let window = kit.open_window(
-                        Placement::Right,
-                        Size::Cells(self.thread_width(kit)),
-                        self.sign_in_buffer,
-                    );
+                    let width = self.thread_width(kit);
+                    let window = kit.open_window(Placement::Right, Size::Cells(width), buffer);
                     self.thread_window = Some(window);
                 }
             }
@@ -246,7 +250,7 @@ impl Slackers {
             let main = self.main_window(kit);
             kit.focus_window(main);
         }
-        self.show_here(kit, buffer, landing, true);
+        self.show_here(kit, buffer, start);
         self.load(place, false)
     }
 
@@ -256,6 +260,8 @@ impl Slackers {
             Some(buffer) => buffer,
             None => {
                 let buffer = kit.add_buffer("activity", Document::new(), true);
+                kit.buffer_mut(buffer)
+                    .set_cursorline(wcgw_kit::shell::CursorLine::Item);
                 self.shows.insert(buffer, Shows::Activity);
                 self.activity_buffer = Some(buffer);
                 buffer
@@ -267,7 +273,7 @@ impl Slackers {
         }
         let main = self.main_window(kit);
         kit.focus_window(main);
-        self.show_here(kit, buffer, None, false);
+        self.show_here(kit, buffer, Start::Left);
         self.refresh_activity_everywhere()
     }
 
@@ -308,9 +314,7 @@ impl Slackers {
     }
 
     /// Opens the Message at `at` in the Workspace at `key`, the cursor on it: in its Thread if it's a Reply, else in
-    /// its Conversation, loading older history as far as [`JUMP_PAGES`] pages to reach it. A window that showed it
-    /// before goes back where it left it: the kit lets an application place a cursor only in a window new to the
-    /// buffer.
+    /// its Conversation, loading older history as far as [`JUMP_PAGES`] pages to reach it.
     pub(super) fn go_to(
         &mut self,
         kit: &mut Kit,
@@ -338,26 +342,26 @@ impl Slackers {
         })
     }
 
-    /// Shows `buffer` in the current window. With `landing`, the cursor starts on the block of that key (when the
-    /// window never showed the buffer), and the window follows the buffer's end only once it's there; else, for a
-    /// buffer that `follows` its end, as a chat does, it starts and stays at the end.
-    fn show_here(
-        &mut self,
-        kit: &mut Kit,
-        buffer: BufferId,
-        landing: Option<String>,
-        follows: bool,
-    ) {
-        match landing {
-            Some(key) => {
+    /// Shows `buffer` in the current window, its cursor where `start` says.
+    fn show_here(&mut self, kit: &mut Kit, buffer: BufferId, start: Start) {
+        let window = kit.current_window();
+        match start {
+            Start::On(key) => {
+                // Until the cursor lands, following the end would take it away.
                 kit.buffer_mut(buffer).set_follows_end(false);
-                self.landing.insert(buffer, key.clone());
-                kit.show_buffer_at(buffer, Cursor::on_block(BlockKey::new(key)));
+                kit.show_buffer(buffer);
+                kit.set_cursor(window, Cursor::on_block(BlockKey::new(key.clone())));
+                self.landing.insert(buffer, key);
             }
-            None => {
-                if !self.landing.contains_key(&buffer) {
-                    kit.buffer_mut(buffer).set_follows_end(follows);
-                }
+            Start::End => {
+                self.landing.remove(&buffer);
+                kit.buffer_mut(buffer).set_follows_end(true);
+                kit.show_buffer(buffer);
+                let end = cursor_at_end(kit, buffer);
+                kit.set_cursor(window, end);
+            }
+            Start::Left => {
+                kit.buffer_mut(buffer).set_follows_end(false);
                 kit.show_buffer(buffer);
             }
         }
@@ -474,27 +478,19 @@ impl Slackers {
         }
     }
 
-    /// The cells beside the sidebar.
+    /// The cells beside the sidebar, and the column between them.
     pub(super) fn room(&self, kit: &Kit) -> u16 {
         let (width, _) = kit.size();
-        let sidebar = self.sidebar_window(kit).map_or(0, |_| SIDEBAR_WIDTH + 1);
+        let sidebar = self
+            .sidebar_window(kit)
+            .and_then(|window| kit.window_text_area(window))
+            .map_or(0, |area| area.width + 1);
         width.saturating_sub(sidebar)
     }
 
     /// The width of a Thread's window beside its Conversation's.
     pub(super) fn thread_width(&self, kit: &Kit) -> u16 {
         (self.room(kit) * 45 / 100).saturating_sub(1).max(20)
-    }
-
-    /// The width of the text of the window showing `buffer`, as slackers lays its windows out: what Messages are
-    /// wrapped to.
-    pub(super) fn width_of(&self, kit: &Kit, buffer: BufferId) -> u16 {
-        let room = self.room(kit);
-        match self.thread_window(kit) {
-            Some(window) if kit.window_buffer(window) == Some(buffer) => self.thread_width(kit),
-            Some(_) => room.saturating_sub(self.thread_width(kit) + 1),
-            None => room,
-        }
     }
 
     /// The Conversation the main window shows, or whose Thread it shows.
@@ -600,32 +596,28 @@ impl Slackers {
     }
 
     /// The Places shown in a window whose cursor is on their newest Message, as far as loaded: those being read.
-    pub(super) fn reading_newest(&self, kit: &mut Kit) -> Vec<Place> {
-        let current = kit.current_window();
+    pub(super) fn reading_newest(&self, kit: &Kit) -> Vec<Place> {
         let mut reading = Vec::new();
         for window in kit.window_ids() {
             let Some(place) = kit
                 .window_buffer(window)
                 .and_then(|buffer| self.place_of(buffer))
-                .cloned()
             else {
                 continue;
             };
-            kit.focus_window(window);
-            let on = match kit.targets_under_cursor() {
+            let on = match kit.targets_in(window) {
                 [_, Some(Target::Message(_, ts))] => Some(*ts),
                 _ => None,
             };
             let newest = self
                 .workspaces
                 .get(place.conversation.workspace)
-                .and_then(|workspace| workspace.timeline(&place))
+                .and_then(|workspace| workspace.timeline(place))
                 .and_then(Timeline::newest);
-            if on.is_some() && on == newest && !reading.contains(&place) {
-                reading.push(place);
+            if on.is_some() && on == newest && !reading.contains(place) {
+                reading.push(place.clone());
             }
         }
-        kit.focus_window(current);
         reading
     }
 
@@ -682,6 +674,22 @@ impl Slackers {
         }
         effects
     }
+}
+
+/// Where the cursor goes in a buffer a window shows.
+enum Start {
+    /// On the block of this key, as soon as it's there; the window follows the buffer's end only after.
+    On(String),
+    /// On the newest, following the end as a chat does.
+    End,
+    /// Where the window left it.
+    Left,
+}
+
+/// A cursor on the last row of `buffer`, laid out as wide as a window showing it.
+pub(super) fn cursor_at_end(kit: &Kit, buffer: BufferId) -> Cursor {
+    let layout = Layout::new(kit.buffer(buffer).doc(), kit.text_width(buffer));
+    Cursor::at_row(&layout, layout.row_count().saturating_sub(1))
 }
 
 /// What a Conversation called `name` is called in a buffer's name: `#name` for a Channel, `@name` for a DM.

@@ -43,10 +43,8 @@ slackers-gfx goes, and so do slackers' modes, panes, focus, key handling, drawin
 - Keys change: motions are Vim's (`gg` rather than `g`; no `h` or `Esc` to go back: `q` closes a Thread's window,
   `<C-t>` goes back); editing one's Message is `A`, leaving Vim's `e` its motion; Tab is the jumplist's, not a
   window switch. README.md lists them.
-- Notices stay in the command line until replaced, as Vim's messages do, rather than going after 8 seconds; the
+- Notices stay in the command line until the next key, as Vim's messages do, rather than going after 8 seconds; the
   status line says how connections stand and who's typing, but no longer which keys apply.
-- The kit sets a window's cursor only when the window first shows a buffer: opening a Conversation shown before goes
-  back where its window left it, rather than to its first unread Message or to an Activity item's Message.
 - slackers depends on the kit by path until the kit is published (the kit's D18), which raises the Rust it builds
   with to the kit's 1.99.
 - Pictures are drawn in more terminals: the kit falls back on half blocks where kitty's Unicode placeholders aren't

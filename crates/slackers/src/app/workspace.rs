@@ -611,11 +611,7 @@ impl Workspace {
                 .collect();
             body = files.join(", ");
         }
-        // Within the 2048 bytes Ghostty takes.
-        Effect::Notify {
-            title: cut(&title, 256),
-            body: cut(&body, 1024),
-        }
+        Effect::Notify { title, body }
     }
 
     /// What to call `conversation`: a DM after the other person, anything else by its name.
@@ -856,19 +852,6 @@ pub(crate) fn broadcast_name(broadcast: Broadcast) -> &'static str {
     }
 }
 
-/// `text`, cut at a character boundary to at most `bytes` bytes, ellipsis included, when it's longer.
-fn cut(text: &str, bytes: usize) -> String {
-    if text.len() <= bytes {
-        return text.to_owned();
-    }
-    let room = bytes.saturating_sub('…'.len_utf8());
-    let end = (0..=room)
-        .rev()
-        .find(|&at| text.is_char_boundary(at))
-        .unwrap_or(0);
-    format!("{}…", &text[..end])
-}
-
 /// Whether `url` is an `http` or `https` link.
 pub(crate) fn is_web(url: &str) -> bool {
     let scheme = url.split_once("://").map_or("", |(scheme, _)| scheme);
@@ -906,13 +889,6 @@ pub(crate) fn describe(error: &Error) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    #[test]
-    fn a_long_text_is_cut_at_a_character() {
-        assert_eq!(cut("short", 10), "short");
-        let long = cut(&"日本".repeat(1000), 1024);
-        assert!(long.len() <= 1024 && long.ends_with('…'));
-    }
 
     #[test]
     fn only_web_links_lead_anywhere() {

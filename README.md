@@ -110,7 +110,7 @@ which every wcgw app reads.
 
 | Key | Command | Does |
 |---|---|---|
-| `<CR>`, a click | `:open` | Opens what's under the cursor: a sidebar row, a Message's Thread, a link, an Activity item's Message |
+| `<CR>`, a click | `:open` | Opens what's under the cursor: a sidebar row, a Message's Thread, a link, an Activity item's Message; folds a sidebar section by its header |
 | `<C-t>` | `:pop` | Back from what was opened |
 | `\` | `:sidebar` | Hides the sidebar from within it, goes to it from elsewhere, and brings it back |
 | `za` `zo` `zc` `zM` `zR` | | Fold the sidebar's sections |

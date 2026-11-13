@@ -37,6 +37,12 @@ pub(crate) const QUOTE: Group = Group::new("SlackersQuote");
 pub(crate) const BOT: Group = Group::new("SlackersBot");
 /// Section headers, and the name of what a window shows.
 pub(crate) const HEADER: Group = Group::new("SlackersHeader");
+/// The background of the sidebar's rows that windows show, as the open Conversation's.
+pub(crate) const OPEN: Group = Group::new("SlackersOpen");
+/// The connections, while every one is live.
+pub(crate) const LIVE: Group = Group::new("SlackersLive");
+/// A connection coming back.
+pub(crate) const RECONNECTING: Group = Group::new("SlackersReconnecting");
 
 /// People's names, and the initials of Workspaces without an icon: each always gets the same one.
 pub(crate) const AUTHORS: [Group; 8] = [
@@ -52,7 +58,7 @@ pub(crate) const AUTHORS: [Group; 8] = [
 
 /// slackers' groups but the authors', and the standard ones they are drawn as when a colorscheme says nothing of
 /// them.
-const GROUPS: [(Group, Group); 17] = [
+const GROUPS: [(Group, Group); 20] = [
     (DIM, Group::COMMENT),
     (READ, Group::COMMENT),
     (UNREAD, Group::BOLD),
@@ -69,6 +75,9 @@ const GROUPS: [(Group, Group); 17] = [
     (QUOTE, Group::MARKUP_QUOTE),
     (BOT, Group::COMMENT),
     (HEADER, Group::BOLD),
+    (OPEN, Group::VISUAL),
+    (LIVE, Group::DIAGNOSTIC_OK),
+    (RECONNECTING, Group::DIAGNOSTIC_WARN),
     (AUTHORS[0], Group::FUNCTION),
 ];
 
@@ -177,6 +186,8 @@ impl Palette {
             format!("hi SlackersQuote guifg={}", self.comment),
             format!("hi SlackersBot gui=bold guifg={}", self.fg_dark),
             "hi SlackersHeader gui=bold".to_owned(),
+            format!("hi SlackersLive guifg={}", self.green),
+            format!("hi SlackersReconnecting guifg={}", self.yellow),
         ];
         lines.extend(
             authors

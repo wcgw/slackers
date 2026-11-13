@@ -300,7 +300,7 @@ fn text(blocks: Vec<Block>) -> RichText {
 /// Reply, read to its newest.
 fn reading_random() -> Test {
     let mut test = ready();
-    test.press("4j<CR>");
+    test.press("gg4j<CR>");
     let parent = Message {
         thread: Some(ThreadSummary {
             replies: 1,
@@ -364,12 +364,41 @@ fn signing_in_lists_the_sidebar_and_asks_for_names_presence_and_activity() {
         shows(&test, "@ Bob"),
         "a DM is named after the other person"
     );
+    let effects = test.press("<CR>");
+    assert!(
+        asks(
+            &effects,
+            &Request::History {
+                conversation: id("C2"),
+                before: None
+            }
+        ),
+        "the cursor waited on the first unread, not opening it"
+    );
+}
+
+#[test]
+fn the_sidebar_suggests_the_first_unread_only_until_the_user_moves() {
+    let mut test = starting(&["test", "other"], Vec::new(), 100, 20);
+    test.press("j");
+    slack(&mut test, Update::Ready(Box::new(test_snapshot())));
+    let effects = test.press("<CR>");
+    assert!(
+        !asks(
+            &effects,
+            &Request::History {
+                conversation: id("C2"),
+                before: None
+            }
+        ),
+        "the user moved first"
+    );
 }
 
 #[test]
 fn sections_fold_as_vim_folds() {
     let mut test = ready();
-    test.press("jjjza");
+    test.press("ggjjjza");
     assert!(!shows(&test, "general"), "{}", screen(&test));
     assert!(shows(&test, "▸ T Test"), "the closed fold's summary");
     test.press("zo");
@@ -478,7 +507,7 @@ fn a_conversation_that_appears_joins_the_sidebar_where_it_belongs() {
 #[test]
 fn opening_a_conversation_loads_it_beside_the_sidebar_and_goes_there() {
     let mut test = ready();
-    let effects = test.press("jjj<CR>");
+    let effects = test.press("ggjjj<CR>");
     assert!(asks(
         &effects,
         &Request::History {
@@ -505,7 +534,7 @@ fn opening_a_conversation_loads_it_beside_the_sidebar_and_goes_there() {
 #[test]
 fn messages_hang_off_their_authors_and_group_under_one_header() {
     let mut test = ready();
-    test.press("jjj<CR>");
+    test.press("ggjjj<CR>");
     let long =
         "a message long enough that it has to wrap to stay within the window beside the sidebar";
     slack(
@@ -546,7 +575,7 @@ fn messages_hang_off_their_authors_and_group_under_one_header() {
 #[test]
 fn a_conversation_opens_on_its_first_unread_under_a_rule_and_is_read_at_its_newest() {
     let mut test = ready();
-    test.press("4j<CR>");
+    test.press("gg4j<CR>");
     let effects = slack(
         &mut test,
         history(
@@ -588,7 +617,7 @@ fn a_conversation_opens_on_its_first_unread_under_a_rule_and_is_read_at_its_newe
 #[test]
 fn nothing_is_read_while_the_terminal_lacks_focus() {
     let mut test = ready();
-    test.press("4j<CR>");
+    test.press("gg4j<CR>");
     test.update(wcgw_kit::Msg::FocusLost);
     slack(
         &mut test,
@@ -627,7 +656,7 @@ fn what_arrives_while_reading_at_the_newest_is_read_and_followed() {
 #[test]
 fn reaching_the_top_loads_older_history_once() {
     let mut test = ready();
-    test.press("jjj<CR>");
+    test.press("ggjjj<CR>");
     let page: Vec<Message> = (2..20)
         .rev()
         .map(|s| message(s * 600, "U9", "something"))
@@ -666,7 +695,7 @@ fn reaching_back_for_the_first_unread_loads_pages_until_it_is_there() {
     let mut snapshot = test_snapshot();
     snapshot.conversations[1].1 = Unread::counted(seconds(1), seconds(9), true, 0);
     slack(&mut test, Update::Ready(Box::new(snapshot)));
-    test.press("4j<CR>");
+    test.press("gg4j<CR>");
     let effects = slack(
         &mut test,
         history("C2", vec![message(9, "U2", "nine")], true),
@@ -1301,7 +1330,7 @@ fn enter_on_a_link_opens_it_and_gy_yanks_it_or_the_messages() {
             ..message(5, "U2", "")
         },
     );
-    let effects = test.press("k$<CR>");
+    let effects = click_on(&mut test, "there");
     assert!(effects.contains(&Effect::OpenUrl("https://a.com".into())));
     let effects = test.press("gy");
     assert!(effects.contains(&Effect::Copy("https://a.com".into())));
@@ -1327,8 +1356,13 @@ fn shift_u_marks_messages_unread_and_the_conversation_stays_so_until_one_opens()
     assert!(unread(&test, "C2"));
     let effects = test.press("G");
     assert!(asked(&effects).is_empty(), "kept unread");
-    // Opened again, the window goes back where it was: at the newest, which reads it.
     let effects = test.press("<C-w>h<CR>");
+    assert!(
+        asked(&effects).is_empty(),
+        "opened again on its first unread"
+    );
+    assert_eq!(under_cursor(&test), Some((place("C2", None), seconds(2))));
+    let effects = test.press("G");
     assert!(asks(
         &effects,
         &Request::Mark {
@@ -1471,7 +1505,7 @@ fn followed_threads_with_replies_to_read_head_the_sidebar_and_open_on_the_first_
         "{}",
         screen(&test)
     );
-    let effects = test.press("jj<CR>");
+    let effects = test.press("ggjj<CR>");
     assert!(asks(
         &effects,
         &Request::Replies {
@@ -1543,7 +1577,7 @@ fn presence_shows_on_a_dms_icon() {
 #[test]
 fn bots_that_dont_say_their_names_are_looked_up_once() {
     let mut test = ready();
-    test.press("jjj<CR>");
+    test.press("ggjjj<CR>");
     let bot = |s| Message {
         author: Author::UnnamedBot(slackers_model::BotId::new("B1")),
         ..message(s, "", "beep")
@@ -1571,7 +1605,7 @@ fn bots_that_dont_say_their_names_are_looked_up_once() {
 #[test]
 fn activity_lists_what_happened_and_opens_an_items_message() {
     let mut test = ready();
-    test.press("<CR>");
+    test.press("gg<CR>");
     assert_eq!(main_rows(&test)[0], " ! Activity", "{}", screen(&test));
     let mention = ActivityItem {
         key: "m1".into(),
@@ -1673,7 +1707,7 @@ fn vw_add_puts_the_channel_in_a_virtual_workspace_and_rm_takes_it_out() {
 #[test]
 fn dms_stay_out_of_virtual_workspaces() {
     let mut test = ready();
-    test.press("5j<CR>:vw add K<CR>");
+    test.press("gg5j<CR>:vw add K<CR>");
     assert_eq!(
         told(&test),
         "DMs stay with their workspace: only channels join a virtual workspace"
@@ -1696,7 +1730,7 @@ fn saving_the_config_can_fail() {
 fn pictures_come_through_their_workspace() {
     let mut test = ready();
     let _ = test.kit.set_graphics(Graphics::HalfBlocks);
-    test.press("jjj<CR>");
+    test.press("ggjjj<CR>");
     slack(
         &mut test,
         Update::User(User {
@@ -1733,7 +1767,7 @@ fn a_thread_shows_on_its_parent_with_how_many_replies_and_when_the_last_came() {
 #[test]
 fn files_show_by_name_and_images_take_their_room() {
     let mut test = ready();
-    test.press("jjj<CR>");
+    test.press("ggjjj<CR>");
     let shared = Message {
         files: vec![
             slackers_model::File {
@@ -1809,4 +1843,110 @@ fn two_virtual_workspaces_of_one_name_are_two_sections() {
             "T * general"
         ]
     );
+}
+
+#[test]
+fn enter_on_a_sections_header_folds_it() {
+    let mut test = ready();
+    test.press("ggjj<CR>");
+    assert!(!shows(&test, "general"), "{}", screen(&test));
+    test.press("<CR>");
+    assert!(shows(&test, "general"));
+    click_on(&mut test, "T Test");
+    assert!(!shows(&test, "general"), "a click too");
+}
+
+#[test]
+fn the_message_under_the_cursor_is_tinted_whole() {
+    let test = reading_random();
+    let cursorline = test.kit.style(wcgw_kit::hl::Group::CURSOR_LINE).bg;
+    let (x, y) = cell_of(&test, "· hi");
+    assert_eq!(test.style_at(x + 20, y).bg, cursorline, "{}", screen(&test));
+    let (x, y) = cell_of(&test, "↳ 1");
+    assert_eq!(test.style_at(x, y).bg, cursorline, "every row of it");
+    let (x, y) = cell_of(&test, "hello");
+    assert_ne!(test.style_at(x, y).bg, cursorline, "not the one before");
+}
+
+#[test]
+fn an_activity_item_goes_to_its_message_in_a_conversation_shown_before() {
+    let mut test = ready();
+    test.press("ggjjj<CR>");
+    slack(
+        &mut test,
+        history(
+            "C1",
+            vec![message(40, "U9", "after"), message(30, "U9", "hey you")],
+            false,
+        ),
+    );
+    assert_eq!(under_cursor(&test), Some((place("C1", None), seconds(40))));
+    test.press(":activity<CR>");
+    let mention = ActivityItem {
+        key: "m1".into(),
+        at: seconds(30),
+        unread: true,
+        message: MessageRef {
+            conversation: id("C1"),
+            ts: seconds(30),
+            thread: None,
+        },
+        happened: Happened::Mention {
+            author: UserId::new("U9"),
+            of: MentionOf::User,
+        },
+    };
+    slack(
+        &mut test,
+        Update::Activity {
+            cursor: None,
+            result: Ok(ActivityPage {
+                items: vec![mention],
+                next: None,
+            }),
+        },
+    );
+    test.press("gg<CR>");
+    assert_eq!(under_cursor(&test), Some((place("C1", None), seconds(30))));
+}
+
+#[test]
+fn messages_are_laid_out_again_for_a_window_split_beside() {
+    let mut test = reading_random();
+    let long =
+        "a message long enough that it wraps once the window beside the sidebar is split in two";
+    posted(&mut test, "C2", message(7, "U2", long));
+    let whole = " · a message long enough that it wraps once the window beside the";
+    assert!(shows(&test, whole), "{}", screen(&test));
+    test.press(":vsplit<CR>j");
+    assert!(!shows(&test, whole), "{}", screen(&test));
+    assert!(shows(&test, "│ · a message long enough that it"));
+}
+
+#[test]
+fn a_dms_buffer_takes_the_name_of_whom_its_with_once_known() {
+    let mut test = starting(&["test"], Vec::new(), 100, 20);
+    slack(&mut test, Update::Ready(Box::new(test_snapshot())));
+    test.press("gg5j<CR>");
+    assert!(shows(&test, "NORMAL  @U9"), "{}", screen(&test));
+    slack(&mut test, Update::User(user("U9", "Bob")));
+    assert!(shows(&test, "NORMAL  @Bob"), "{}", screen(&test));
+}
+
+#[test]
+fn the_connections_are_coloured_by_how_they_stand() {
+    let mut test = ready();
+    let (x, y) = cell_of(&test, "test connecting");
+    assert_eq!(test.style_at(x, y).fg, test.kit.style(crate::hl::ACCENT).fg);
+    slack(&mut test, Update::Connection(Connection::Live));
+    let (x, y) = cell_of(&test, "live");
+    assert_eq!(test.style_at(x, y).fg, test.kit.style(crate::hl::LIVE).fg);
+}
+
+#[test]
+fn help_opens_beside_the_sidebar_which_keeps_its_width() {
+    let mut test = ready();
+    test.press(":help<CR>");
+    assert!(shows(&test, "NORMAL  help"));
+    assert_eq!(cell_of(&test, "│").0, 30, "{}", screen(&test));
 }
