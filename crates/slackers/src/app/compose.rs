@@ -10,10 +10,11 @@ use slackers_slack::Request;
 use unicode_width::UnicodeWidthStr as _;
 use wcgw_kit::BufferId;
 use wcgw_kit::hl::Group;
+use wcgw_kit::key::{Code, Key, Mods};
 use wcgw_kit::shell::{Composer, Suggestion, Word};
 
 use super::workspace::{Offer, Offered, SUGGESTIONS};
-use super::{Editing, Effects, Kit, Outgoing, Place, Slackers, slack};
+use super::{Editing, Effect, Effects, Kit, Outgoing, Place, Slackers, Started, slack};
 use crate::draft::{Completing, Mentioned, Reference, References, Written};
 use crate::emoji::Drawable;
 use crate::hl::DIM;
@@ -36,6 +37,8 @@ pub(super) fn composer(place: &Place) -> Composer<Slackers> {
             |app: &Slackers, kit, buffer, word| app.complete(kit, buffer, word),
             |app: &mut Slackers, kit, buffer, chosen| app.accepted(kit, buffer, chosen),
         )
+        .on_word(|app: &mut Slackers, _, buffer, word| app.written(buffer, word))
+        .on_key(|app: &mut Slackers, kit, buffer, key| app.composer_key(kit, buffer, key))
 }
 
 /// What a suggestion is, as the composer hands it back once chosen.
@@ -75,10 +78,7 @@ impl Slackers {
         };
         let references = self.references.get(place).cloned().unwrap_or_default();
         let offers: Vec<Offer> = match &completing {
-            Completing::Mention(name) => {
-                self.wanted_people.replace(Some((key, name.clone())));
-                workspace.suggest(place, name)
-            }
+            Completing::Mention(name) => workspace.suggest(place, name),
             Completing::Command(name) => workspace.suggest_commands(name),
             Completing::Emoji(name) => workspace
                 .emojis
@@ -166,6 +166,79 @@ impl Slackers {
         }
         self.title_composer(kit, buffer, &place);
         Vec::new()
+    }
+
+    /// The word before the cursor in `buffer`'s composer changed to `word`: for an @-mention, Slack is asked whom it
+    /// knows by that name, unless it was asked already.
+    fn written(&mut self, buffer: BufferId, word: &Word<'_>) -> Effects {
+        let mut effects = Vec::new();
+        let Some(key) = self
+            .place_of(buffer)
+            .map(|place| place.conversation.workspace)
+        else {
+            return effects;
+        };
+        self.mentioning = match Completing::of(word) {
+            Some(Completing::Mention(name)) => Some((key, name)),
+            _ => None,
+        };
+        if let Some((key, name)) = &self.mentioning
+            && let Some(workspace) = self.workspaces.get_mut(*key)
+        {
+            workspace.find_people(*key, name, &mut effects);
+        }
+        effects
+    }
+
+    /// A key typed in `buffer`'s composer that slackers takes before the composer does: `<Up>` in an empty one
+    /// edits the user's newest Message there, as in Slack; `<Esc>` gives an edit up, back to writing what was set
+    /// aside when the edit started there; `<CR>` on an emptied edit says why nothing happens.
+    fn composer_key(&mut self, kit: &mut Kit, buffer: BufferId, key: Key) -> Option<Effects> {
+        let place = self.place_of(buffer)?.clone();
+        let composer = kit.composer(buffer)?;
+        let (empty, blank) = (composer.is_empty(), composer.text().trim().is_empty());
+        let menu = !composer.suggestions().is_empty();
+        let editing = self.editing.get(&place).map(|editing| editing.started);
+        match (key.code, key.mods == Mods::NONE, editing) {
+            (Code::Up, true, None) if empty => {
+                let ts = self.newest_of_mine(&place)?;
+                let (workspace, message) = self.message(&place, ts)?;
+                let draft = workspace.draft_of(&message.content);
+                self.write_edit(
+                    kit,
+                    &place,
+                    ts,
+                    &draft.text,
+                    draft.references,
+                    Started::InComposer,
+                );
+                Some(Vec::new())
+            }
+            // With suggestions showing, `<Esc>` closes them first.
+            (Code::Esc, _, Some(started)) if !menu => {
+                self.stop_editing(kit, &place);
+                match started {
+                    Started::InComposer => Some(Vec::new()),
+                    Started::OnMessage => None,
+                }
+            }
+            (Code::Enter, true, Some(_)) if blank && !menu => {
+                kit.error("an edit can't be empty: <Esc> gives it up");
+                Some(Vec::new())
+            }
+            _ => None,
+        }
+    }
+
+    /// The user's newest Message at `place`, if there's one.
+    fn newest_of_mine(&self, place: &Place) -> Option<Ts> {
+        let workspace = self.workspaces.get(place.conversation.workspace)?;
+        workspace
+            .timeline(place)?
+            .messages()
+            .rev()
+            .find(|message| message.is_by(&workspace.me))
+            .map(|message| message.ts)
     }
 
     /// What sending `text` from `buffer`'s composer does: saves the edit being written there, runs the slash
@@ -259,7 +332,7 @@ impl Slackers {
     }
 
     /// `:amend` (`A`): edits the user's Message under the cursor in its composer, setting aside what's written
-    /// there until the edit is saved, or given up by emptying the composer.
+    /// there until the edit is saved, or given up with `<Esc>`.
     pub(super) fn amend(&mut self, kit: &mut Kit) -> Result<Effects, String> {
         let (place, ts) = Self::message_under_cursor(kit)?;
         let (workspace, message) = self
@@ -269,12 +342,19 @@ impl Slackers {
             return Err("only your own messages can be edited".to_owned());
         }
         let draft = workspace.draft_of(&message.content);
-        self.write_edit(kit, &place, ts, &draft.text, draft.references);
+        self.write_edit(
+            kit,
+            &place,
+            ts,
+            &draft.text,
+            draft.references,
+            Started::OnMessage,
+        );
         kit.run_ex(self, "startinsert")
     }
 
     /// Puts `text`, an edit of the Message at `ts`, in `place`'s composer, with what its labels stand for, setting
-    /// aside what's being written there.
+    /// aside what's being written there; giving it up goes back where it `started`.
     pub(super) fn write_edit(
         &mut self,
         kit: &mut Kit,
@@ -282,6 +362,7 @@ impl Slackers {
         ts: Ts,
         text: &str,
         references: References,
+        started: Started,
     ) {
         let buffer = self.place_buffer(kit, place);
         let Some(composer) = kit.composer_mut(buffer) else {
@@ -295,8 +376,14 @@ impl Slackers {
             Some(earlier) => earlier.set_aside,
             None => (!before.0.is_empty()).then(|| (before.0, before.1.unwrap_or_default())),
         };
-        self.editing
-            .insert(place.clone(), Editing { ts, set_aside });
+        self.editing.insert(
+            place.clone(),
+            Editing {
+                ts,
+                set_aside,
+                started,
+            },
+        );
         self.title_composer(kit, buffer, place);
     }
 
@@ -330,23 +417,8 @@ impl Slackers {
         self.title_composer(kit, buffer, place);
     }
 
-    /// After a key: an edit whose composer was emptied is given up, and each composer's border says whether it
-    /// holds an edit and whom it @-mentions.
+    /// After a key: the current composer's border says whether it holds an edit, and whom it @-mentions.
     pub(super) fn keep_composers(&mut self, kit: &mut Kit) -> Effects {
-        let given_up: Vec<Place> = self
-            .editing
-            .keys()
-            .filter(|place| {
-                self.places
-                    .get(place)
-                    .and_then(|&buffer| kit.composer(buffer))
-                    .is_some_and(|composer| composer.is_empty())
-            })
-            .cloned()
-            .collect();
-        for place in given_up {
-            self.stop_editing(kit, &place);
-        }
         let buffer = kit.current_buffer();
         if let Some(place) = self.place_of(buffer).cloned() {
             self.title_composer(kit, buffer, &place);
@@ -375,14 +447,19 @@ impl Slackers {
         composer.set_title(title);
     }
 
-    /// Asks Slack whom it knows by the name completion last saw, unless it was asked already.
-    pub(super) fn find_wanted_people(&mut self) -> Effects {
-        let mut effects = Vec::new();
-        if let Some((key, name)) = self.wanted_people.take()
-            && let Some(workspace) = self.workspaces.get_mut(key)
-        {
-            workspace.find_people(key, &name, &mut effects);
+    /// The Messages, edits and slash commands on their way to Slack.
+    pub(super) fn sending(&self) -> usize {
+        self.outbox.len() + self.edits_sent.len() + self.commands_sent.len()
+    }
+
+    /// Quits, freeing the pictures the terminal holds, once nothing is on its way to Slack any more, if `:qa` asked
+    /// to.
+    pub(super) fn quit_when_sent(&mut self, kit: &mut Kit) -> Effects {
+        if !self.quitting || self.sending() > 0 {
+            return Vec::new();
         }
+        let mut effects = kit.set_graphics(wcgw_kit::gfx::Graphics::Off);
+        effects.push(Effect::Quit);
         effects
     }
 

@@ -1087,20 +1087,68 @@ fn shift_a_edits_ones_own_message_and_enter_saves_it() {
 }
 
 #[test]
-fn someone_elses_message_cant_be_edited_and_emptying_an_edit_gives_it_up() {
+fn someone_elses_message_cant_be_edited_and_esc_gives_an_edit_up() {
     let mut test = reading_random();
     test.press("A");
     assert_eq!(told(&test), "only your own messages can be edited");
     posted(&mut test, "C2", message(7, "UME", "ok"));
     test.press("idraft<Esc>GA");
     assert_eq!(composed(&test, &place("C2", None)), "ok");
-    test.press("<BS><BS>");
+    test.press("<BS><BS><CR>");
+    assert_eq!(told(&test), "an edit can't be empty: <Esc> gives it up");
+    assert!(shows(&test, " editing "), "still editing");
+    test.press("<Esc>");
     assert_eq!(
         composed(&test, &place("C2", None)),
         "draft",
         "what was set aside comes back"
     );
     assert!(!shows(&test, " editing "));
+    assert!(
+        !shows(&test, "INSERT"),
+        "back on the Message, as it started"
+    );
+}
+
+#[test]
+fn up_in_an_empty_composer_edits_ones_newest_and_esc_goes_back_to_writing() {
+    let mut test = reading_random();
+    posted(&mut test, "C2", message(7, "UME", "mine"));
+    posted(&mut test, "C2", message(8, "U2", "theirs"));
+    test.press("i<Up>");
+    assert_eq!(composed(&test, &place("C2", None)), "mine");
+    assert!(shows(&test, " editing "), "{}", screen(&test));
+    let effects = test.press("!<CR>");
+    assert!(asks(
+        &effects,
+        &Request::Edit {
+            conversation: id("C2"),
+            ts: seconds(7),
+            text: vec![Part::Text("mine!".into())],
+        }
+    ));
+    test.press("<Up><Esc>");
+    assert!(composed(&test, &place("C2", None)).is_empty());
+    assert!(shows(&test, "INSERT"), "back to writing, where it started");
+    test.press("x<Up>");
+    assert_eq!(
+        composed(&test, &place("C2", None)),
+        "x",
+        "only an empty composer"
+    );
+}
+
+#[test]
+fn a_click_elsewhere_keeps_an_edit_for_later() {
+    let mut test = reading_random();
+    posted(&mut test, "C2", message(7, "UME", "mine"));
+    test.press("GA!");
+    click_on(&mut test, "general");
+    assert!(!shows(&test, "INSERT"));
+    assert_eq!(composed(&test, &place("C2", None)), "mine!");
+    assert!(test.app.editing.contains_key(&place("C2", None)));
+    test.press("<C-o>");
+    assert!(shows(&test, " editing "), "{}", screen(&test));
 }
 
 #[test]
@@ -1949,4 +1997,60 @@ fn help_opens_beside_the_sidebar_which_keeps_its_width() {
     test.press(":help<CR>");
     assert!(shows(&test, "NORMAL  help"));
     assert_eq!(cell_of(&test, "│").0, 30, "{}", screen(&test));
+}
+
+#[test]
+fn quitting_waits_for_what_is_on_its_way_to_slack() {
+    let mut test = reading_random();
+    let quits = |effects: &Effects| effects.contains(&Effect::Quit);
+    test.press("isoon<CR><Esc>");
+    assert!(!quits(&test.press(":qa<CR>")));
+    assert!(
+        told(&test).starts_with("quitting once Slack has what you sent"),
+        "{}",
+        told(&test)
+    );
+    let effects = slack(
+        &mut test,
+        Update::Posted {
+            id: 0,
+            conversation: id("C2"),
+            result: Ok(message(9, "UME", "soon")),
+        },
+    );
+    assert!(quits(&effects));
+}
+
+#[test]
+fn quitting_with_nothing_on_its_way_or_a_bang_is_at_once() {
+    let mut test = reading_random();
+    assert!(test.press(":qa<CR>").contains(&Effect::Quit));
+    let mut test = reading_random();
+    test.press("isoon<CR><Esc>");
+    assert!(test.press(":qa!<CR>").contains(&Effect::Quit));
+}
+
+#[test]
+fn ctrl_y_in_the_open_picker_copies_a_link() {
+    let mut test = reading_random();
+    let link = |url: &str| Inline::Link {
+        url: url.into(),
+        label: None,
+    };
+    edited(
+        &mut test,
+        "C2",
+        Message {
+            content: text(vec![Block::Paragraph(vec![
+                link("https://a.com"),
+                link("https://b.com"),
+            ])]),
+            ..message(5, "U2", "")
+        },
+    );
+    test.press("ko");
+    assert!(shows(&test, "<C-y> copy"), "{}", screen(&test));
+    let effects = test.press("b.com<C-y>");
+    assert!(effects.contains(&Effect::Copy("https://b.com".into())));
+    assert_eq!(told(&test), "Yanked https://b.com");
 }

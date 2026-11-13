@@ -25,7 +25,6 @@ mod workspace;
 #[cfg(test)]
 mod tests;
 
-use std::cell::RefCell;
 use std::collections::HashMap;
 use std::time::SystemTime;
 
@@ -33,6 +32,7 @@ use jiff::tz::TimeZone;
 use slackers_model::{Button, ConversationId, Message, Ts, UserId};
 use slackers_slack::{Request, Update};
 use wcgw_kit::BufferId;
+use wcgw_kit::app::Quitting;
 use wcgw_kit::doc::Document;
 use wcgw_kit::shell::{CursorLine, Placement, Size, WindowId};
 
@@ -205,6 +205,16 @@ struct Editing {
     ts: Ts,
     /// What was being written there before, set aside until the edit is saved or given up; `None` if nothing was.
     set_aside: Option<(String, References)>,
+    started: Started,
+}
+
+/// Where an edit was started, which giving it up goes back to.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Started {
+    /// In the composer, with `<Up>`: back to writing there.
+    InComposer,
+    /// On its Message, with `A`: back to Normal mode.
+    OnMessage,
 }
 
 /// A slash command just run, which may post for the user elsewhere, as `/dm` does.
@@ -289,9 +299,11 @@ pub(crate) struct Slackers {
     held_notifications: Vec<(WorkspaceKey, ConversationId, Message)>,
     /// The Message whose details the hover card shows, while it does.
     details: Option<(Place, Ts)>,
-    /// The name completion would have Slack search people for, by Workspace, until the key that asked is handled:
-    /// completing can't ask Slack itself.
-    wanted_people: RefCell<Option<(WorkspaceKey, String)>>,
+    /// The name an @-mention being written has, by Workspace, as the composer last said: what to have Slack find
+    /// people by once it answers for a shorter one.
+    mentioning: Option<(WorkspaceKey, String)>,
+    /// Whether slackers quits once what's on its way to Slack is there, as `:qa` asked.
+    quitting: bool,
     /// Where the user is, for the times Messages show.
     zone: TimeZone,
     /// Whether the sidebar's cursor goes to the first row with something unread, as Workspaces sign in: until the
@@ -357,7 +369,8 @@ impl Slackers {
             focused: true,
             held_notifications: Vec::new(),
             details: None,
-            wanted_people: RefCell::new(None),
+            mentioning: None,
+            quitting: false,
             zone: TimeZone::system(),
             suggesting: true,
             first_unread: None,
@@ -489,7 +502,25 @@ impl wcgw_kit::App for Slackers {
             Msg::Refresh => Vec::new(),
         };
         effects.extend(self.changed(kit, &reading));
+        effects.extend(self.quit_when_sent(kit));
         effects
+    }
+
+    /// `:q` on the last window, or `:qa`: at once, unless Messages, edits or slash commands are on their way to
+    /// Slack, which slackers waits for; `:qa!` doesn't.
+    fn quit(&mut self, kit: &mut Kit) -> Quitting {
+        let sending = self.sending();
+        if sending == 0 {
+            return Quitting::Now;
+        }
+        self.quitting = true;
+        let what = if sending == 1 {
+            "what you sent".to_owned()
+        } else {
+            format!("the {sending} things you sent")
+        };
+        kit.info(format!("quitting once Slack has {what}; :qa! quits now"));
+        Quitting::Later
     }
 
     /// What the text under the cursor refers to: a row of the sidebar opens its Conversation, Thread or Activity; a
@@ -545,13 +576,12 @@ impl wcgw_kit::App for Slackers {
         effects
     }
 
-    /// After every key: the cursor may have reached the newest Message, or the oldest loaded; a word may need
-    /// people found; a composer may need its title changed.
+    /// After every key: the cursor may have reached the newest Message, or the oldest loaded; a window may have
+    /// changed width; a composer may need its title changed.
     fn keyed(&mut self, kit: &mut Kit) -> Effects {
         self.suggesting = false;
         self.rewrap(kit);
-        let mut effects = self.find_wanted_people();
-        effects.extend(self.keep_composers(kit));
+        let mut effects = self.keep_composers(kit);
         effects.extend(self.load_older_at_top(kit));
         effects.extend(self.load_older_activity(kit));
         let reading = self.reading_newest(kit);

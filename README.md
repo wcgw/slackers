@@ -105,8 +105,8 @@ Logs go to `~/.local/state/slackers/slackers.log` (or under `$XDG_STATE_HOME`).
 slackers runs in [wcgw-kit](https://github.com/wcgw/wcgw-kit), which works as Neovim does: motions, counts, `/`
 search, folds, windows (`<C-w>h`, `<C-w>l`, `q` to close one), the jumplist (`<C-o>`, `<C-i>`), `:` commands with
 completion, `:map` and `:hi`. `:help` lists every key and command, after `<Space>` which-key shows what may follow,
-and `:qa` quits. Settings, maps and colours go in `~/.config/slackers/init.vim`, after `~/.config/wcgw/init.vim`,
-which every wcgw app reads.
+and `:qa` quits, once Slack has what you just sent (`:qa!` doesn't wait). Settings, maps and colours go in
+`~/.config/slackers/init.vim`, after `~/.config/wcgw/init.vim`, which every wcgw app reads.
 
 | Key | Command | Does |
 |---|---|---|
@@ -117,17 +117,17 @@ which every wcgw app reads.
 | `<Space>f` | `:pick conversations` | Finds a Conversation by name, fzf-style |
 | `<Space>a` | `:activity` | Activity |
 | `i` | `:startinsert` | Writes in the Conversation's or Thread's composer |
-| `A` | `:amend` | Edits your Message in the composer; `Enter` saves it, emptying the composer gives it up |
+| `A` | `:amend` | Edits your Message in the composer; `Enter` saves it, `Esc` gives it up |
 | `+` | `:react [emoji]` | Reacts to the Message, or takes your reaction back |
 | `U` | `:unread` | Marks the Message unread, and those after it |
 | `K` | `:details` | Who wrote the Message and when, who reacted, its buttons and where it leads |
-| `o`, `gx` | `:browse` | Opens the link under the cursor, or the Message's; with several, picks one, or a button |
+| `o`, `gx` | `:browse` | Opens the link under the cursor, or the Message's; with several, picks one (`Ctrl-y` copies it), or a button |
 | `gy` | `:yanklink` | Copies the link under the cursor, or the Message's on Slack's web client |
 
 In the composer, `Enter` sends, `Shift-Enter` or `Alt-Enter` breaks the line, `@`, `:` and `/` complete people, emoji
-and commands (`Ctrl-n`/`Ctrl-p` choose, `Enter` picks), `Ctrl-x Ctrl-e` hands the Draft to `$EDITOR`, and `Esc`
-leaves it. What slackers tells you, such as why a Message wasn't sent, shows in the command line until the next
-key; `:messages` lists it all.
+and commands (`Ctrl-n`/`Ctrl-p` choose, `Enter` picks), `↑` in an empty composer edits your last Message there,
+`Ctrl-x Ctrl-e` hands the Draft to `$EDITOR`, and `Esc` leaves it, or gives up an edit. What slackers tells you, such
+as why a Message wasn't sent, shows in the command line until the next key; `:messages` lists it all.
 
 The mouse works too: a click opens what it lands on, the wheel scrolls the window under it, and a click on the
 composer writes there. Hold Shift to select text, as most terminals let you while an app uses the mouse.

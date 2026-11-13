@@ -12,7 +12,7 @@ use slackers_slack::{EmojiList, LiveEvent, Snapshot, Update};
 use super::workspace::describe;
 use super::{
     ConversationRef, Effect, Effects, Following, HELD_NOTIFICATIONS, Kit, Phase, Place, Slackers,
-    Workspace, WorkspaceKey, slack,
+    Started, Workspace, WorkspaceKey, slack,
 };
 use crate::draft::References;
 use crate::sidebar::{Item, Section};
@@ -93,7 +93,8 @@ impl Slackers {
                         let mut references = References::default();
                         let text = written.text.clone();
                         references.put_back(written);
-                        self.write_edit(kit, &place, ts, &text, references);
+                        // To fix it, the user goes to the composer.
+                        self.write_edit(kit, &place, ts, &text, references, Started::InComposer);
                     }
                 }
             }
@@ -311,7 +312,12 @@ impl Slackers {
                 workspace.found.insert(query, people);
                 kit.refresh_completion(self);
                 // The name may have grown while Slack searched.
-                effects.extend(self.find_wanted_people());
+                if let Some((at, name)) = self.mentioning.clone()
+                    && at == key
+                    && let Some(workspace) = self.workspaces.get_mut(key)
+                {
+                    workspace.find_people(key, &name, &mut effects);
+                }
             }
             Update::Live(event) => effects.extend(self.live(kit, key, event)),
             Update::Connection(connection) => {

@@ -231,7 +231,7 @@ impl Slackers {
     }
 
     /// `:browse` (`o`, `gx`): opens the link under the cursor; else the Message's link or file when it has just one,
-    /// and a picker of where it leads and its buttons otherwise.
+    /// and a picker of where it leads and its buttons otherwise, `<C-y>` copying a link.
     fn browse(&mut self, kit: &mut Kit) -> Result<Effects, String> {
         if let Some(Target::Url(url)) = kit.target_under_cursor() {
             return Ok(vec![Effect::OpenUrl(url)]);
@@ -288,7 +288,16 @@ impl Slackers {
                 }
             })
             .collect();
-        let picker = Picker::list("Open", picks, "Nothing to open");
+        let picker =
+            Picker::list("Open", picks, "Nothing to open").verb("<C-y>", "copy", |_, kit, pick| {
+                match pick {
+                    Picked::Target(Target::Url(url)) => {
+                        kit.info(format!("Yanked {url}"));
+                        vec![Effect::Copy(url)]
+                    }
+                    _ => Vec::new(),
+                }
+            });
         Ok(kit.open_picker(self, picker))
     }
 
