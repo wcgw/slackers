@@ -6,7 +6,7 @@
 //!
 //! signs in to each `WORKSPACE` with the credentials stored in the keyring under that name (see [`credentials`]),
 //! or to the `workspaces` the config file lists (see [`config`]), and shows the Virtual Workspaces it defines. It runs
-//! in wcgw-kit, which gives it Neovim's keys, windows and commands (see [`app`]); `:q` quits. Logs go to
+//! in wcgw-kit, which gives it Neovim's keys, windows and commands (see [`app`]); `:qa` quits. Logs go to
 //! `$XDG_STATE_HOME/slackers/slackers.log`; `RUST_LOG` sets their level.
 
 mod activity;

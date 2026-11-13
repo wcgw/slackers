@@ -104,9 +104,9 @@ Logs go to `~/.local/state/slackers/slackers.log` (or under `$XDG_STATE_HOME`).
 
 slackers runs in [wcgw-kit](https://github.com/wcgw/wcgw-kit), which works as Neovim does: motions, counts, `/`
 search, folds, windows (`<C-w>h`, `<C-w>l`, `q` to close one), the jumplist (`<C-o>`, `<C-i>`), `:` commands with
-completion, `:map` and `:hi`. `:help` lists every key and command; after `<Space>`, which-key shows what may follow.
-Settings, maps and colours go in `~/.config/slackers/init.vim`, after `~/.config/wcgw/init.vim`, which every wcgw
-app reads.
+completion, `:map` and `:hi`. `:help` lists every key and command, after `<Space>` which-key shows what may follow,
+and `:qa` quits. Settings, maps and colours go in `~/.config/slackers/init.vim`, after `~/.config/wcgw/init.vim`,
+which every wcgw app reads.
 
 | Key | Command | Does |
 |---|---|---|
