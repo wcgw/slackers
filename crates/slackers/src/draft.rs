@@ -1,30 +1,28 @@
 //! Drafts: what the user writes before posting it, whom it @-mentions and what else it refers to, and the word being
-//! completed.
+//! completed. The kit's composer holds the text being written (its D4); slackers holds what the labels in it stand
+//! for.
 
-use crossterm::event::KeyEvent;
-use ratatui::buffer::Buffer;
-use ratatui::layout::Rect;
-use ratatui::style::Style;
-use ratatui::widgets::Widget;
-use ratatui_textarea::{CursorMove, TextArea};
 use slackers_model::{Broadcast, ConversationId, UserId};
 use slackers_slack::Part;
+use wcgw_kit::shell::Word;
 
-use crate::app::Place;
 use crate::markdown;
 
-/// The text written for one Place, in Markdown, and the references picked while writing it, or held by the Message
-/// it edits.
+/// What the labels in a Draft stand for: the references picked while writing it, or held by the Message it edits.
 ///
 /// A reference is written as its label, such as `@Ada Lovelace` for an @-mention or `#general` for a Channel, and is
 /// posted as the real thing for as long as that label stays whole in the text. Anything else that looks like one,
 /// such as an `@ada` typed without picking anyone, is posted as typed.
-#[derive(Debug)]
-pub(crate) struct Draft {
-    area: TextArea<'static>,
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub(crate) struct References {
     picked: Vec<Picked>,
-    /// What an empty Draft shows: whether it's a Message or a Reply.
-    placeholder: &'static str,
+}
+
+/// A Draft as one would write it: its text, and what its labels stand for. What editing a Message starts with.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub(crate) struct Draft {
+    pub(crate) text: String,
+    pub(crate) references: References,
 }
 
 /// A word being written that can be completed, by what it starts with.
@@ -68,138 +66,43 @@ struct Picked {
 pub(crate) struct Written {
     /// As typed, with picked @-mentions written as their labels.
     pub(crate) text: String,
-    picked: Vec<Picked>,
+    references: References,
 }
 
-impl Draft {
-    /// An empty Draft for `place`.
-    pub(crate) fn new(place: &Place) -> Self {
-        let placeholder = if place.thread.is_some() {
-            "reply"
-        } else {
-            "message"
-        };
-        Self {
-            area: text_area("", placeholder),
-            picked: Vec::new(),
-            placeholder,
-        }
-    }
-
-    pub(crate) fn lines(&self) -> &[String] {
-        self.area.lines()
-    }
-
-    pub(crate) fn is_empty(&self) -> bool {
-        self.area.is_empty()
-    }
-
-    /// Its text, lines joined by `\n`.
-    pub(crate) fn text(&self) -> String {
-        self.area.lines().join("\n")
-    }
-
-    /// Edits it as `key` says, as a text field does.
-    pub(crate) fn input(&mut self, key: KeyEvent) {
-        self.area.input(key);
-    }
-
-    pub(crate) fn insert_newline(&mut self) {
-        self.area.insert_newline();
-    }
-
-    /// Replaces its text with `text`, say as an external editor left it, with the cursor at the end. @-mentions
-    /// picked before stay picked wherever their labels are still whole.
-    pub(crate) fn set_text(&mut self, text: &str) {
-        self.area = text_area(text, self.placeholder);
-    }
-
-    /// The word being completed, if one is: the word before the cursor, when it starts with `@` or `:` and the
-    /// rest could be a name. A word with either inside, such as an email address or a time, isn't one.
-    pub(crate) fn completing(&self) -> Option<Completing> {
-        let word = self.word()?;
-        if let Some(name) = word.strip_prefix('/')
-            && self.area.cursor().0 == 0
-            && self.lines()[0].starts_with(word)
+impl Completing {
+    /// What `word`, before the cursor, is being completed to, if anything: a word starting with `@` or `:` whose
+    /// rest could be a name, or with `/` when it's the Draft's first. A word with either inside, such as an email
+    /// address or a time, isn't one.
+    pub(crate) fn of(word: &Word<'_>) -> Option<Self> {
+        let text = word.text;
+        if let Some(name) = text.strip_prefix('/')
+            && word.first
         {
             let in_name = |c: char| c.is_alphanumeric() || matches!(c, '-' | '_');
             return name
                 .chars()
                 .all(in_name)
-                .then(|| Completing::Command(name.to_owned()));
+                .then(|| Self::Command(name.to_owned()));
         }
-        if let Some(name) = word.strip_prefix('@') {
+        if let Some(name) = text.strip_prefix('@') {
             let in_name = |c: char| c.is_alphanumeric() || matches!(c, '.' | '-' | '_' | '\'');
             return name
                 .chars()
                 .all(in_name)
-                .then(|| Completing::Mention(name.to_owned()));
+                .then(|| Self::Mention(name.to_owned()));
         }
         // Two characters at least, so that `:D` and the like stay as typed.
-        let name = word.strip_prefix(':')?;
+        let name = text.strip_prefix(':')?;
         let in_name = |c: char| c.is_alphanumeric() || matches!(c, '-' | '_' | '+' | '\'');
         (name.chars().nth(1).is_some() && name.chars().all(in_name))
-            .then(|| Completing::Emoji(name.to_owned()))
+            .then(|| Self::Emoji(name.to_owned()))
     }
+}
 
-    /// The word before the cursor: what's between the cursor and the whitespace before it, or the line's start.
-    fn word(&self) -> Option<&str> {
-        let cursor = self.area.cursor();
-        let line = self.area.lines().get(cursor.0)?;
-        let end = line
-            .char_indices()
-            .nth(cursor.1)
-            .map_or(line.len(), |(at, _)| at);
-        let before = &line[..end];
-        Some(
-            before
-                .rsplit_once(char::is_whitespace)
-                .map_or(before, |(_, word)| word),
-        )
-    }
-
-    /// Writes `with` and a space in place of the word being completed, if there's one.
-    fn complete(&mut self, with: &str) -> bool {
-        if self.completing().is_none() {
-            return false;
-        }
-        // The word, its `@` or `:` included.
-        let written = self.word().map_or(0, |word| word.chars().count());
-        for _ in 0..written {
-            self.area.delete_char();
-        }
-        self.area.insert_str(format!("{with} "));
-        true
-    }
-
-    /// Writes an @-mention of `mentioned`, called `name`, and a space, in place of the word being completed. A name
-    /// already picked for someone else is told apart by a number.
-    pub(crate) fn pick(&mut self, mentioned: Mentioned, name: &str) {
-        let reference = Reference::Mention(mentioned);
-        let label = self.label_for(&format!("@{name}"), &reference);
-        if self.complete(&label) {
-            self.hold(label, reference);
-        }
-    }
-
-    /// Writes `text` at the end.
-    pub(crate) fn push_text(&mut self, text: &str) {
-        self.area.move_cursor(CursorMove::Bottom);
-        self.area.move_cursor(CursorMove::End);
-        self.area.insert_str(text);
-    }
-
-    /// Writes `reference` at the end, as `label`; a label already standing for something else is told apart by a
-    /// number.
-    pub(crate) fn push_reference(&mut self, label: &str, reference: Reference) {
-        let label = self.label_for(label, &reference);
-        self.push_text(&label);
-        self.hold(label, reference);
-    }
-
+impl References {
     /// `label`, or if it stands for something other than `reference` already, the first of `label (2)`,
     /// `label (3)`, … that doesn't.
-    fn label_for(&self, label: &str, reference: &Reference) -> String {
+    pub(crate) fn label_for(&self, label: &str, reference: &Reference) -> String {
         (1..)
             .map(|n| match n {
                 1 => label.to_owned(),
@@ -214,28 +117,16 @@ impl Draft {
     }
 
     /// Notes that `label` stands for `reference`, unless it does already.
-    fn hold(&mut self, label: String, reference: Reference) {
+    pub(crate) fn hold(&mut self, label: String, reference: Reference) {
         if !self.picked.iter().any(|picked| picked.label == label) {
             self.picked.push(Picked { label, reference });
         }
     }
 
-    /// Writes the slash command `name`, `/` included, and a space, in place of the word being completed.
-    pub(crate) fn pick_command(&mut self, name: &str) {
-        self.complete(name);
-    }
-
-    /// Writes the emoji `name`, between colons, and a space, in place of the word being completed. Slack draws it
-    /// once posted.
-    pub(crate) fn pick_emoji(&mut self, name: &str) {
-        self.complete(&format!(":{name}:"));
-    }
-
-    /// The labels of the @-mentions its text holds, in the order they were picked.
-    pub(crate) fn mentions(&self) -> impl Iterator<Item = &str> {
-        let text = self.text();
+    /// The labels of the @-mentions `text` holds, in the order they were picked.
+    pub(crate) fn mentions(&self, text: &str) -> Vec<&str> {
         let mut held = vec![false; self.picked.len()];
-        for part in split(&text, &self.picked) {
+        for part in split(text, &self.picked) {
             if let Split::Picked(index) = part {
                 held[index] = true;
             }
@@ -245,32 +136,21 @@ impl Draft {
             .zip(held)
             .filter(|(picked, held)| *held && matches!(picked.reference, Reference::Mention(_)))
             .map(|(picked, _)| picked.label.as_str())
+            .collect()
     }
 
-    /// Takes what it holds, leaving it empty; or `None`, leaving it as it is, when it holds only blanks.
-    pub(crate) fn take(&mut self) -> Option<Written> {
-        let text = self.text();
-        if text.trim().is_empty() {
-            return None;
-        }
-        self.area = text_area("", self.placeholder);
-        Some(Written {
+    /// What sending `text` posts, taking every reference along: none are left for what's written next.
+    pub(crate) fn take(&mut self, text: String) -> Written {
+        Written {
             text,
-            picked: std::mem::take(&mut self.picked),
-        })
+            references: std::mem::take(self),
+        }
     }
 
-    /// Puts back `written`, which couldn't be sent, ahead of anything written since.
+    /// Takes back the references of `written`, which couldn't be sent. A label picked since for someone else keeps
+    /// them.
     pub(crate) fn put_back(&mut self, written: Written) {
-        let since = self.text();
-        let text = if since.is_empty() {
-            written.text
-        } else {
-            format!("{}\n{since}", written.text)
-        };
-        self.set_text(&text);
-        // A label picked since for someone else keeps them.
-        for picked in written.picked {
+        for picked in written.references.picked {
             if !self.picked.iter().any(|kept| kept.label == picked.label) {
                 self.picked.push(picked);
             }
@@ -278,9 +158,18 @@ impl Draft {
     }
 }
 
-impl Widget for &Draft {
-    fn render(self, area: Rect, buffer: &mut Buffer) {
-        self.area.render(area, buffer);
+impl Draft {
+    /// Writes `text` at the end.
+    pub(crate) fn push_text(&mut self, text: &str) {
+        self.text.push_str(text);
+    }
+
+    /// Writes `reference` at the end, as `label`; a label already standing for something else is told apart by a
+    /// number.
+    pub(crate) fn push_reference(&mut self, label: &str, reference: Reference) {
+        let label = self.references.label_for(label, &reference);
+        self.text.push_str(&label);
+        self.references.hold(label, reference);
     }
 }
 
@@ -324,11 +213,12 @@ impl Written {
 
     /// `text`, a piece of its text, with what each picked label in it stands for in its place.
     fn referenced(&self, text: &str) -> Vec<Part> {
-        split(text, &self.picked)
+        let picked = &self.references.picked;
+        split(text, picked)
             .into_iter()
             .map(|piece| match piece {
                 Split::Text(text) => Part::Text(text.to_owned()),
-                Split::Picked(index) => match &self.picked[index].reference {
+                Split::Picked(index) => match &picked[index].reference {
                     Reference::Mention(Mentioned::Person(id)) => Part::User(id.clone()),
                     Reference::Mention(Mentioned::Broadcast(broadcast)) => {
                         Part::Broadcast(*broadcast)
@@ -385,47 +275,21 @@ fn split<'a>(text: &'a str, picked: &[Picked]) -> Vec<Split<'a>> {
     parts
 }
 
-/// A text field holding `text`, with the cursor at its end, showing `placeholder` while empty.
-fn text_area(text: &str, placeholder: &'static str) -> TextArea<'static> {
-    let mut area = TextArea::new(text.lines().map(str::to_owned).collect());
-    area.set_cursor_line_style(Style::default());
-    area.set_placeholder_text(placeholder);
-    area.move_cursor(CursorMove::Bottom);
-    area.move_cursor(CursorMove::End);
-    area
-}
-
 #[cfg(test)]
 mod tests {
-    use crossterm::event::{KeyCode, KeyModifiers};
-    use slackers_model::ConversationId;
-
     use super::*;
-    use crate::app::{ConversationRef, WorkspaceKey};
 
-    fn draft(text: &str) -> Draft {
-        let place = Place {
-            conversation: ConversationRef {
-                workspace: WorkspaceKey::nth(0),
-                id: ConversationId::new("C1"),
-            },
-            thread: None,
-        };
-        let mut draft = Draft::new(&place);
-        draft.set_text(text);
-        draft
-    }
-
-    fn person(id: &str) -> Mentioned {
-        Mentioned::Person(UserId::new(id))
-    }
-
-    fn sent(draft: &mut Draft) -> Vec<Part> {
-        draft.take().expect("something to send").parts()
+    fn person(id: &str) -> Reference {
+        Reference::Mention(Mentioned::Person(UserId::new(id)))
     }
 
     fn text(text: &str) -> Part {
         Part::Text(text.into())
+    }
+
+    /// What `text`, the word before the cursor, is completed to; the Draft's first word when `first`.
+    fn completing(text: &str, first: bool) -> Option<Completing> {
+        Completing::of(&Word { text, first })
     }
 
     fn mention(name: &str) -> Option<Completing> {
@@ -436,98 +300,90 @@ mod tests {
         Some(Completing::Emoji(name.into()))
     }
 
+    /// `references` picked in order, as completing does: each label in place of the word, and a space.
+    fn written(picks: &[(&str, Reference)], rest: &str) -> (String, References) {
+        let mut references = References::default();
+        let mut text = String::new();
+        for (label, reference) in picks {
+            let label = references.label_for(label, reference);
+            text.push_str(&label);
+            text.push(' ');
+            references.hold(label, reference.clone());
+        }
+        text.push_str(rest);
+        (text, references)
+    }
+
     #[test]
     fn a_word_starting_with_an_at_is_a_mention_being_written() {
-        assert_eq!(draft("hi @ad").completing(), mention("ad"));
-        assert_eq!(draft("@").completing(), mention(""));
-        assert_eq!(draft("first\n@o'bri").completing(), mention("o'bri"));
-        for not_one in ["hi", "hi @ada ", "ada@example.com", "@ada,", "(@ada"] {
-            assert_eq!(draft(not_one).completing(), None, "{not_one}");
+        assert_eq!(completing("@ad", false), mention("ad"));
+        assert_eq!(completing("@", true), mention(""));
+        assert_eq!(completing("@o'bri", false), mention("o'bri"));
+        for not_one in ["hi", "ada@example.com", "@ada,", "(@ada"] {
+            assert_eq!(completing(not_one, false), None, "{not_one}");
         }
-        // It's the word before the cursor that counts.
-        let mut moved = draft("@ada and more");
-        moved.area.move_cursor(CursorMove::Head);
-        for _ in 0.."@ad".len() {
-            moved.area.move_cursor(CursorMove::Forward);
-        }
-        assert_eq!(moved.completing(), mention("ad"));
     }
 
     #[test]
     fn a_word_starting_with_a_colon_and_two_more_is_an_emoji_being_written() {
-        assert_eq!(draft("nice :ta").completing(), emoji("ta"));
-        assert_eq!(draft(":+1").completing(), emoji("+1"));
-        assert_eq!(draft(":it's-a_ok").completing(), emoji("it's-a_ok"));
-        assert_eq!(draft(":お疲").completing(), emoji("お疲"));
-        for not_one in [
-            ":", ":D", ":-)", "12:30", "note:ab", ":tada:", ":tada: ", "::std",
-        ] {
-            assert_eq!(draft(not_one).completing(), None, "{not_one}");
+        assert_eq!(completing(":ta", false), emoji("ta"));
+        assert_eq!(completing(":+1", true), emoji("+1"));
+        assert_eq!(completing(":it's-a_ok", false), emoji("it's-a_ok"));
+        assert_eq!(completing(":お疲", false), emoji("お疲"));
+        for not_one in [":", ":D", ":-)", "12:30", "note:ab", ":tada:", "::std"] {
+            assert_eq!(completing(not_one, false), None, "{not_one}");
         }
     }
 
     #[test]
     fn a_slash_and_a_word_starting_a_draft_is_a_command() {
         let command = |name: &str| Some(Completing::Command(name.into()));
-        assert_eq!(draft("/").completing(), command(""));
-        assert_eq!(draft("/gi").completing(), command("gi"));
-        assert_eq!(draft("/my-app_x").completing(), command("my-app_x"));
-        for not_one in ["hi /gi", "/giphy cats", "first\n/gi", "//x", "/a.b"] {
-            assert_eq!(draft(not_one).completing(), None, "{not_one}");
+        assert_eq!(completing("/", true), command(""));
+        assert_eq!(completing("/gi", true), command("gi"));
+        assert_eq!(completing("/my-app_x", true), command("my-app_x"));
+        assert_eq!(completing("/gi", false), None, "not the first word");
+        for not_one in ["//x", "/a.b"] {
+            assert_eq!(completing(not_one, true), None, "{not_one}");
         }
 
-        let mut written = draft("/giphy cats and @");
-        written.pick(person("U1"), "Ada");
+        let (mention, mut references) = written(&[("@Ada", person("U1"))], "");
         assert_eq!(
-            written.take().unwrap().command(),
+            references
+                .take(format!("/giphy cats and {mention}"))
+                .command(),
             Some((
                 "/giphy".to_owned(),
                 vec![text("cats and "), Part::User(UserId::new("U1")), text(" ")]
             ))
         );
+        let plain = |typed: &str| References::default().take(typed.to_owned());
         assert_eq!(
-            draft("/dnd").take().unwrap().command(),
+            plain("/dnd").command(),
             Some(("/dnd".to_owned(), Vec::new()))
         );
-        for text in [" /giphy cats", "/ x", "//x", "a/b"] {
-            assert_eq!(draft(text).take().unwrap().command(), None, "{text}");
+        for typed in [" /giphy cats", "/ x", "//x", "a/b"] {
+            assert_eq!(plain(typed).command(), None, "{typed}");
         }
     }
 
     #[test]
-    fn picking_an_emoji_writes_its_name_between_colons_as_slack_reads_it() {
-        let mut draft = draft("nice :ta");
-        draft.pick_emoji("tada");
-        assert_eq!(draft.text(), "nice :tada: ");
-        assert_eq!(draft.completing(), None);
-        draft.pick_emoji("tada");
-        assert_eq!(draft.text(), "nice :tada: ", "nothing to complete");
-        assert_eq!(sent(&mut draft), [text("nice :tada: ")]);
-    }
-
-    #[test]
-    fn picking_writes_the_label_and_sending_turns_it_into_the_mention() {
-        let mut draft = draft("thanks @ad");
-        draft.pick(person("U1"), "Ada Lovelace");
-        draft.input(KeyEvent::new(KeyCode::Char('!'), KeyModifiers::NONE));
-        assert_eq!(draft.text(), "thanks @Ada Lovelace !");
-        assert_eq!(draft.completing(), None);
-        assert_eq!(draft.mentions().collect::<Vec<_>>(), ["@Ada Lovelace"]);
+    fn sending_turns_a_picked_label_into_the_mention() {
+        let (typed, mut references) = written(&[("@Ada Lovelace", person("U1"))], "!");
+        let typed = format!("thanks {typed}");
+        assert_eq!(references.mentions(&typed), ["@Ada Lovelace"]);
         assert_eq!(
-            sent(&mut draft),
+            references.take(typed).parts(),
             [text("thanks "), Part::User(UserId::new("U1")), text(" !")]
         );
-        assert!(draft.is_empty() && draft.mentions().next().is_none());
+        assert!(references.mentions("@Ada Lovelace").is_empty(), "all taken");
     }
 
     #[test]
     fn only_whole_labels_starting_a_word_are_mentions() {
-        let mut draft = draft("@");
-        draft.pick(person("U1"), "Ada");
-        let typed = draft.text() + "x@Ada @Adam @Ada_ @Ada, @Ada";
-        draft.set_text(&typed);
+        let (typed, mut references) = written(&[("@Ada", person("U1"))], "");
+        let typed = typed + "x@Ada @Adam @Ada_ @Ada, @Ada";
         assert_eq!(
-            sent(&mut draft),
+            references.take(typed).parts(),
             [
                 Part::User(UserId::new("U1")),
                 text(" x@Ada @Adam @Ada_ "),
@@ -540,16 +396,19 @@ mod tests {
 
     #[test]
     fn the_longest_label_wins_and_namesakes_are_numbered() {
-        let mut draft = draft("@");
-        draft.pick(person("U1"), "Ada");
-        draft.area.insert_str("@");
-        draft.pick(person("U2"), "Ada Lovelace");
-        draft.area.insert_str("@");
-        draft.pick(person("U3"), "Ada");
-        draft.area.insert_str("@");
-        draft.pick(person("U1"), "Ada");
-        assert_eq!(draft.text(), "@Ada @Ada Lovelace @Ada (2) @Ada ");
-        let mentioned: Vec<Part> = sent(&mut draft)
+        let (typed, mut references) = written(
+            &[
+                ("@Ada", person("U1")),
+                ("@Ada Lovelace", person("U2")),
+                ("@Ada", person("U3")),
+                ("@Ada", person("U1")),
+            ],
+            "",
+        );
+        assert_eq!(typed, "@Ada @Ada Lovelace @Ada (2) @Ada ");
+        let mentioned: Vec<Part> = references
+            .take(typed)
+            .parts()
             .into_iter()
             .filter(|part| *part != text(" "))
             .collect();
@@ -561,21 +420,19 @@ mod tests {
 
     #[test]
     fn edited_text_keeps_the_labels_left_whole() {
-        let mut draft = draft("@");
-        draft.pick(person("U1"), "Ada");
-        draft.area.insert_str("@");
-        draft.pick(Mentioned::Broadcast(Broadcast::Here), "here");
-        draft.set_text("@Ada, @her");
-        assert_eq!(draft.mentions().collect::<Vec<_>>(), ["@Ada"]);
+        let here = Reference::Mention(Mentioned::Broadcast(Broadcast::Here));
+        let (_, mut references) = written(&[("@Ada", person("U1")), ("@here", here)], "");
+        let typed = "@Ada, @her".to_owned();
+        assert_eq!(references.mentions(&typed), ["@Ada"]);
         assert_eq!(
-            sent(&mut draft),
+            references.take(typed).parts(),
             [Part::User(UserId::new("U1")), text(", @her")]
         );
     }
 
     #[test]
     fn channels_and_groups_post_as_what_their_labels_stand_for() {
-        let mut draft = draft("");
+        let mut draft = Draft::default();
         draft.push_text("see ");
         draft.push_reference("#general", Reference::Channel(ConversationId::new("C1")));
         draft.push_text(", ");
@@ -584,17 +441,16 @@ mod tests {
         draft.push_text(" and ");
         draft.push_reference("#general", Reference::Channel(ConversationId::new("C2")));
         assert_eq!(
-            draft.text(),
-            "see #general, @group and #general (2)",
+            draft.text, "see #general, @group and #general (2)",
             "another Channel by the same name is told apart"
         );
         assert_eq!(
-            draft.mentions().collect::<Vec<_>>(),
+            draft.references.mentions(&draft.text),
             ["@group"],
             "only those notified"
         );
         assert_eq!(
-            sent(&mut draft),
+            draft.references.take(draft.text.clone()).parts(),
             [
                 text("see "),
                 Part::Channel(ConversationId::new("C1")),
@@ -608,11 +464,10 @@ mod tests {
 
     #[test]
     fn its_markdown_posts_as_slacks_markup_around_the_labels() {
-        let mut draft = draft("# For @");
-        draft.pick(person("U1"), "Ada");
-        draft.push_text("\n**see [the docs](https://a.com), @Ada**");
+        let (typed, mut references) = written(&[("@Ada", person("U1"))], "");
+        let typed = format!("# For {typed}\n**see [the docs](https://a.com), @Ada**");
         assert_eq!(
-            sent(&mut draft),
+            references.take(typed).parts(),
             [
                 text("*For "),
                 Part::User(UserId::new("U1")),
@@ -629,14 +484,11 @@ mod tests {
     }
 
     #[test]
-    fn what_wasnt_sent_goes_back_ahead_of_what_was_written_since() {
-        let mut draft = draft("@");
-        draft.pick(person("U1"), "Ada");
-        let written = draft.take().unwrap();
-        assert!(draft.take().is_none(), "nothing left to send");
-        draft.set_text("later");
-        draft.put_back(written);
-        assert_eq!(draft.lines(), ["@Ada ", "later"]);
-        assert_eq!(draft.mentions().collect::<Vec<_>>(), ["@Ada"]);
+    fn what_wasnt_sent_keeps_its_references_unless_a_label_was_taken_since() {
+        let (typed, mut references) = written(&[("@Ada", person("U1"))], "");
+        let sent = references.take(typed);
+        let (_, mut since) = written(&[("@Bob", person("U2"))], "");
+        since.put_back(sent);
+        assert_eq!(since.mentions("@Ada @Bob"), ["@Bob", "@Ada"]);
     }
 }

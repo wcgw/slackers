@@ -1,22 +1,24 @@
 //! Wrapping styled text, with unbreakable pieces such as emoji pictures, into lines of a given width.
+//!
+//! The kit wraps a buffer's lines too, but from the window's left edge: slackers wraps a Message's text itself, to
+//! the window's width, so that every line of it hangs off its author's avatar.
 
-use ratatui::style::Style;
-use ratatui::text::Span;
 use unicode_width::UnicodeWidthStr as _;
+use wcgw_kit::doc::Span;
 
 /// Something to lay out.
 #[derive(Debug)]
-pub(crate) enum Piece {
+pub(crate) enum Piece<T> {
     /// Text, which may break at spaces (or anywhere, for a word longer than a line) and contains no line breaks
-    /// other than `\n`, which ends the line.
-    Text(String, Style),
+    /// other than `\n`, which ends the line. Each piece it breaks into keeps its group, style and target.
+    Text(Span<T>),
     /// Something drawn as one, `width` cells wide: never split, and wrapped to the next line when it doesn't fit.
-    Atom(Span<'static>, u16),
+    Atom(Span<T>, u16),
 }
 
 /// Lays `pieces` out in lines at most `width` cells wide (at least one). Spaces at a wrap are dropped; spaces after
 /// a `\n` are kept, so indentation survives. Returns at least one line, possibly empty.
-pub(crate) fn wrap(pieces: Vec<Piece>, width: u16) -> Vec<Vec<Span<'static>>> {
+pub(crate) fn wrap<T: Clone>(pieces: Vec<Piece<T>>, width: u16) -> Vec<Vec<Span<T>>> {
     let mut lines = Lines {
         width: usize::from(width.max(1)),
         done: Vec::new(),
@@ -33,13 +35,13 @@ pub(crate) fn wrap(pieces: Vec<Piece>, width: u16) -> Vec<Vec<Span<'static>>> {
                 }
                 lines.push(span, cells);
             }
-            Piece::Text(text, style) => {
-                for (index, paragraph) in text.split('\n').enumerate() {
+            Piece::Text(span) => {
+                for (index, paragraph) in span.text.split('\n').enumerate() {
                     if index > 0 {
                         lines.end();
                     }
                     for token in tokens(paragraph) {
-                        lines.text(token, style);
+                        lines.text(token, &span);
                     }
                 }
             }
@@ -51,18 +53,26 @@ pub(crate) fn wrap(pieces: Vec<Piece>, width: u16) -> Vec<Vec<Span<'static>>> {
     lines.done
 }
 
-struct Lines {
+/// `like`, holding `text` instead.
+fn holding<T: Clone>(like: &Span<T>, text: String) -> Span<T> {
+    Span {
+        text,
+        ..like.clone()
+    }
+}
+
+struct Lines<T> {
     width: usize,
-    done: Vec<Vec<Span<'static>>>,
-    line: Vec<Span<'static>>,
+    done: Vec<Vec<Span<T>>>,
+    line: Vec<Span<T>>,
     /// Cells used on `line`.
     used: usize,
     /// Whether `line` started at a wrap rather than at a line break.
     wrapped: bool,
 }
 
-impl Lines {
-    fn push(&mut self, span: Span<'static>, cells: usize) {
+impl<T: Clone> Lines<T> {
+    fn push(&mut self, span: Span<T>, cells: usize) {
         self.line.push(span);
         self.used += cells;
     }
@@ -76,34 +86,32 @@ impl Lines {
 
     /// Ends the line because the next piece doesn't fit, dropping the spaces it ended with.
     fn wrap(&mut self) {
-        while self
-            .line
-            .last()
-            .is_some_and(|span| span.content.chars().all(|c| c == ' '))
-        {
+        while self.line.last().is_some_and(|span| {
+            span.picture.is_none() && !span.text.is_empty() && span.text.chars().all(|c| c == ' ')
+        }) {
             self.line.pop();
         }
         self.end();
         self.wrapped = true;
     }
 
-    fn text(&mut self, token: &str, style: Style) {
+    fn text(&mut self, token: &str, like: &Span<T>) {
         let cells = token.width();
         if token.starts_with(' ') {
             if self.used + cells > self.width {
                 self.wrap();
             } else if !(self.used == 0 && self.wrapped) {
-                self.push(Span::styled(token.to_owned(), style), cells);
+                self.push(holding(like, token.to_owned()), cells);
             }
             return;
         }
         if self.used + cells <= self.width {
-            self.push(Span::styled(token.to_owned(), style), cells);
+            self.push(holding(like, token.to_owned()), cells);
             return;
         }
         if cells <= self.width {
             self.wrap();
-            self.push(Span::styled(token.to_owned(), style), cells);
+            self.push(holding(like, token.to_owned()), cells);
             return;
         }
         // A word longer than a whole line: fill lines character by character.
@@ -113,7 +121,7 @@ impl Lines {
             let c_cells = unicode_width::UnicodeWidthChar::width(c).unwrap_or(0);
             if self.used + chunk_cells + c_cells > self.width {
                 if !chunk.is_empty() {
-                    self.push(Span::styled(std::mem::take(&mut chunk), style), chunk_cells);
+                    self.push(holding(like, std::mem::take(&mut chunk)), chunk_cells);
                     chunk_cells = 0;
                 }
                 self.wrap();
@@ -122,7 +130,7 @@ impl Lines {
             chunk_cells += c_cells;
         }
         if !chunk.is_empty() {
-            self.push(Span::styled(chunk, style), chunk_cells);
+            self.push(holding(like, chunk), chunk_cells);
         }
     }
 }
@@ -144,16 +152,18 @@ fn tokens(text: &str) -> impl Iterator<Item = &str> {
 
 #[cfg(test)]
 mod tests {
+    use wcgw_kit::hl::Group;
+
     use super::*;
 
-    fn text(text: &str) -> Piece {
-        Piece::Text(text.into(), Style::new())
+    fn text(text: &str) -> Piece<()> {
+        Piece::Text(Span::new(text, Group::NORMAL))
     }
 
-    fn rendered(lines: &[Vec<Span<'static>>]) -> Vec<String> {
+    fn rendered(lines: &[Vec<Span<()>>]) -> Vec<String> {
         lines
             .iter()
-            .map(|line| line.iter().map(|span| span.content.as_ref()).collect())
+            .map(|line| line.iter().map(|span| span.text.as_str()).collect())
             .collect()
     }
 
@@ -177,10 +187,8 @@ mod tests {
 
     #[test]
     fn atoms_wrap_whole() {
-        let lines = wrap(
-            vec![text("abcd"), Piece::Atom(Span::raw("EE"), 2), text("x")],
-            5,
-        );
+        let atom = Piece::Atom(Span::new("EE", Group::NORMAL), 2);
+        let lines = wrap(vec![text("abcd"), atom, text("x")], 5);
         assert_eq!(rendered(&lines), ["abcd", "EEx"]);
     }
 
@@ -192,6 +200,18 @@ mod tests {
 
     #[test]
     fn nothing_lays_out_as_one_empty_line() {
-        assert_eq!(rendered(&wrap(Vec::new(), 10)), [""]);
+        assert_eq!(rendered(&wrap::<()>(Vec::new(), 10)), [""]);
+    }
+
+    #[test]
+    fn pieces_keep_their_group_and_target() {
+        let link = Piece::Text(Span::new("see this", Group::UNDERLINED).with_target(7));
+        let lines = wrap(vec![link], 4);
+        assert!(
+            lines
+                .iter()
+                .flatten()
+                .all(|span| span.target == Some(7) && span.group == Group::UNDERLINED)
+        );
     }
 }

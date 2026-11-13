@@ -8,25 +8,21 @@ publish.workspace = true
 
 [dependencies]
 anyhow.workspace = true
-base64.workspace = true
-crossterm.workspace = true
 emojis.workspace = true
-futures-util.workspace = true
 jiff.workspace = true
 toml_edit.workspace = true
-nucleo-matcher.workspace = true
 ratatui.workspace = true
-ratatui-textarea.workspace = true
-slackers-gfx.workspace = true
 slackers-model.workspace = true
 slackers-slack.workspace = true
 tokio.workspace = true
 tracing.workspace = true
 tracing-subscriber.workspace = true
 unicode-width.workspace = true
+# The shared Neovim look & feel; a path into the local checkout until wcgw-kit is published (its D18).
+wcgw-kit = { path = "../../../wcgw-kit/crates/wcgw-kit" }
 
 [dev-dependencies]
-slackers-gfx = { workspace = true, features = ["test-util"] }
+wcgw-kit = { path = "../../../wcgw-kit/crates/wcgw-kit", features = ["testing"] }
 
 [lints]
 workspace = true
